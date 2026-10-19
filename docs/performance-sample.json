@@ -1,0 +1,163 @@
+{
+  "measured_at": "2026-10-19T11:07:46.144Z",
+  "executable": "target/release/qkbot.exe",
+  "platform": "win32/x64",
+  "os_release": "10.0.26200",
+  "logical_cpus": 20,
+  "configuration": {
+    "groups": 2,
+    "messages": 20,
+    "concurrent_conversations": 2,
+    "model_mock_delay_ms": 500,
+    "cooldown_seconds": 0
+  },
+  "replies": 20,
+  "model_requests": 20,
+  "elapsed_ms": 5105.32,
+  "latency_ms": {
+    "min": 503.33,
+    "median": 508.42,
+    "p95": 522.38,
+    "max": 522.42
+  },
+  "latency_samples_ms": [
+    517.05,
+    517.29,
+    503.53,
+    503.67,
+    522.38,
+    522.42,
+    506.29,
+    506.19,
+    510.75,
+    510.71,
+    514.28,
+    514.44,
+    510.59,
+    510.54,
+    506.11,
+    506.25,
+    503.44,
+    503.33,
+    504.67,
+    504.71
+  ],
+  "idle_rss_mib": 9.42,
+  "sampled_load_peak_rss_mib": 10.27,
+  "sampled_load_peak_private_mib": 2.32,
+  "cpu_seconds_delta": 0.05,
+  "observed_lifetime_peak_rss_mib": 10.27,
+  "limitations": [
+    "Only the bot child process is measured; mocks, PowerShell, QQ and Milky are excluded.",
+    "Local fixed-delay JSON replies; no real model, TLS, tools or background memory extraction workload.",
+    "Short run with empty initial long-term memory; sampled memory peaks are not a long-term capacity guarantee.",
+    "The isolated benchmark child is terminated after measurement; its temporary database is not production data."
+  ],
+  "samples": [
+    {
+      "phase": "idle",
+      "elapsed_ms": -1508.43,
+      "working_set_bytes": 9875456,
+      "private_bytes": 1949696,
+      "peak_working_set_bytes": 9875456,
+      "cpu_seconds": 0.015625
+    },
+    {
+      "phase": "idle",
+      "elapsed_ms": -887.6,
+      "working_set_bytes": 9875456,
+      "private_bytes": 1949696,
+      "peak_working_set_bytes": 9875456,
+      "cpu_seconds": 0.015625
+    },
+    {
+      "phase": "idle",
+      "elapsed_ms": -253.44,
+      "working_set_bytes": 9875456,
+      "private_bytes": 1949696,
+      "peak_working_set_bytes": 9875456,
+      "cpu_seconds": 0.015625
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 369.47,
+      "working_set_bytes": 10371072,
+      "private_bytes": 2035712,
+      "peak_working_set_bytes": 10371072,
+      "cpu_seconds": 0.03125
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 1127.5,
+      "working_set_bytes": 10571776,
+      "private_bytes": 2195456,
+      "peak_working_set_bytes": 10571776,
+      "cpu_seconds": 0.046875
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 1869.61,
+      "working_set_bytes": 10592256,
+      "private_bytes": 2215936,
+      "peak_working_set_bytes": 10592256,
+      "cpu_seconds": 0.046875
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 2482.07,
+      "working_set_bytes": 10674176,
+      "private_bytes": 2351104,
+      "peak_working_set_bytes": 10674176,
+      "cpu_seconds": 0.0625
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 3097.89,
+      "working_set_bytes": 10674176,
+      "private_bytes": 2351104,
+      "peak_working_set_bytes": 10674176,
+      "cpu_seconds": 0.0625
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 3717.71,
+      "working_set_bytes": 10747904,
+      "private_bytes": 2428928,
+      "peak_working_set_bytes": 10747904,
+      "cpu_seconds": 0.0625
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 4340.22,
+      "working_set_bytes": 10756096,
+      "private_bytes": 2428928,
+      "peak_working_set_bytes": 10756096,
+      "cpu_seconds": 0.0625
+    },
+    {
+      "phase": "load",
+      "elapsed_ms": 4950.53,
+      "working_set_bytes": 10764288,
+      "private_bytes": 2433024,
+      "peak_working_set_bytes": 10764288,
+      "cpu_seconds": 0.0625
+    },
+    {
+      "phase": "after_load",
+      "elapsed_ms": 5577.91,
+      "working_set_bytes": 10764288,
+      "private_bytes": 2433024,
+      "peak_working_set_bytes": 10764288,
+      "cpu_seconds": 0.0625
+    }
+  ],
+  "release_executable_bytes": 9570304,
+  "release_executable_sha256": "fffc9bc70c5f007c4ddd16a111b8415f7aeedd03293db75fe49d6cc8219f6c4e",
+  "earlier_run_working_set_observation": {
+    "measured_at": "2026-10-19T11:05:44.086Z",
+    "idle_rss_mib": 15.68,
+    "sampled_load_peak_rss_mib": 16.12,
+    "release_executable_sha256": "fffc9bc70c5f007c4ddd16a111b8415f7aeedd03293db75fe49d6cc8219f6c4e",
+    "note": "Same binary. Earlier run preceded the even-count latency median correction; working-set measurements were unaffected."
+  }
+}
