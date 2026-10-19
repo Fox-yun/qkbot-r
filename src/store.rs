@@ -43,8 +43,9 @@ impl Store {
                     }
                     Job::Stop(done) => {
                         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                        drop(conn);
                         let _ = done.send(());
-                        break;
+                        return;
                     }
                 }
             }

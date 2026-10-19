@@ -165,7 +165,7 @@ async function send(group, number) {
   socket.write(frame(1, JSON.stringify({
     time: Math.floor(Date.now() / 1000), self_id: botId, event_type: 'message_receive',
     data: { message_scene: 'group', peer_id: group, sender_id: 30000 + group, message_seq: number,
-      segments: [{ type: 'mention', data: { user_id: botId } }, { type: 'text', data: { text: `${id} 小葵，请简短介绍上下文与长期记忆有什么区别。` } }] },
+      segments: [{ type: 'mention', data: { user_id: botId } }, { type: 'text', data: { text: `${id} 小鱼，请简短介绍上下文与长期记忆有什么区别。` } }] },
   })));
   await within(reply, 15000, `no mock reply for ${id}`);
 }

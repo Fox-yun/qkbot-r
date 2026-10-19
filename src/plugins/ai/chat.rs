@@ -862,7 +862,7 @@ mod tests {
                 message_seq: 3,
             },
             sender_id: 4,
-            text: "@小葵".into(),
+            text: "@小鱼".into(),
             mentions: vec![],
             quote_seq: Some(5),
             received_at: 1,

@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use qkbot::{
+    admin::{self, AdminState, runtime::Runtime, settings::ConfigStore},
     config::Config,
-    host::{Host, Router},
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -16,7 +17,7 @@ async fn main() -> Result<()> {
             "--check" => check = true,
             "--help" | "-h" => {
                 println!(
-                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN"
+                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，并在终端显示管理地址和临时管理员令牌。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_ADMIN_TOKEN、QKBOT_LLBOT_TOKEN"
                 );
                 return Ok(());
             }
@@ -27,83 +28,74 @@ async fn main() -> Result<()> {
             _ => anyhow::bail!("未知参数：{arg}"),
         }
     }
-    let config = Config::load(&path)?;
-    // Relative data paths belong to the configuration directory.
-    let mut config = config;
-    if PathBuf::from(&config.app.database).is_relative() {
-        config.app.database = path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join(&config.app.database)
-            .to_string_lossy()
-            .into_owned();
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.app.log)?)
-        .with_writer(std::io::stderr)
-        .init();
     if check {
+        let config = Config::load(&path)?;
+        config.validate_runtime()?;
         let (_, _, enabled) = qkbot::plugins::assemble(&config)?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        qkbot::milky::Milky::new(config.milky.clone(), client.clone())?;
-        if config.plugins.ai.enabled {
-            qkbot::llm::Llm::new(config.llm.clone(), client)?;
-        }
         println!(
             "配置有效；启用插件：{}",
             enabled.into_iter().collect::<Vec<_>>().join(", ")
         );
         return Ok(());
     }
-    let host = Host::create(config).await?;
-    let bot = host
-        .milky
-        .login()
-        .await
-        .context("无法核对 Milky 登录账号")?;
-    tracing::info!(bot_id = bot, "qkbot started");
-    let router = Arc::new(Router::new(host.clone()));
-    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-    let milky = host.milky.clone();
-    let cancel = host.cancel.clone();
-    let events = tokio::spawn(async move {
-        milky.events(bot, tx, cancel).await;
-    });
-    let background = {
-        let router = router.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {_=router.host.cancel.cancelled()=>break,_=tick.tick()=>{if let Err(error)=router.maintenance().await{tracing::warn!(%error,"maintenance deferred");}}}
-            }
-        })
+    let store = Arc::new(ConfigStore::open(path).await?);
+    let (config, revision) = store.effective_with_revision().await?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.app.log)?)
+        .with_writer(std::io::stderr)
+        .init();
+    // Bind before opening the database. A duplicate process must not invalidate
+    // the running bot's plugin epochs merely because its panel port is occupied.
+    let listener = if config.web.enabled {
+        Some(
+            tokio::net::TcpListener::bind(&config.web.listen)
+                .await
+                .context("无法监听管理员页面地址")?,
+        )
+    } else {
+        None
     };
-    let reminders = {
-        let router = router.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {_=router.host.cancel.cancelled()=>break,_=tick.tick()=>{if let Err(error)=router.reminders().await{tracing::warn!(%error,"reminder delivery stopped");}}}
-            }
-        })
+    let token = if config.web.token.is_empty() {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    } else {
+        config.web.token.clone()
     };
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _=&mut shutdown=>break,
-            msg=rx.recv()=>match msg{Some(msg)=>{if let Err(error)=router.dispatch(msg).await{tracing::warn!(%error,"event rejected");}},None=>break},
+    if let Some(listener) = &listener {
+        tracing::info!(address = %listener.local_addr()?, "admin panel ready");
+        eprintln!("管理员页面：http://{}", listener.local_addr()?);
+        if config.web.token.is_empty() {
+            eprintln!(
+                "本次管理员令牌：{token}\n此令牌仅本次运行有效；固定令牌可用 QKBOT_ADMIN_TOKEN 设置。"
+            );
         }
     }
-    host.cancel.cancel();
-    let _ = events.await;
-    let _ = background.await;
-    let _ = reminders.await;
-    router.shutdown().await?;
+    let cancel = CancellationToken::new();
+    let (runtime, worker) = Runtime::start(config, revision, cancel.clone());
+    let admin_stop = cancel.clone();
+    let mut server = if let Some(listener) = listener {
+        let state = AdminState::new(store, runtime, &token)?;
+        tokio::spawn(async move { admin::serve(listener, state, admin_stop).await })
+    } else {
+        tokio::spawn(async move {
+            admin_stop.cancelled().await;
+            Ok(())
+        })
+    };
+    let server_result = tokio::select! {
+        _ = shutdown_signal() => None,
+        result = &mut server => Some(result),
+    };
+    cancel.cancel();
+    let result = match server_result {
+        Some(result) => result,
+        None => server.await,
+    };
+    worker.await.context("机器人控制任务异常结束")?;
+    result.context("管理员页面任务异常结束")??;
     tracing::info!("qkbot stopped");
     Ok(())
 }

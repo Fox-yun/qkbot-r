@@ -1,13 +1,24 @@
 # 复制为 config.toml；填写模型、允许的群/好友和管理员后启动。
-# 密钥建议放 QKBOT_API_KEY / QKBOT_MILKY_TOKEN 环境变量，覆盖文件配置。
+# 密钥可放 QKBOT_API_KEY / QKBOT_MILKY_TOKEN / QKBOT_ADMIN_TOKEN / QKBOT_LLBOT_TOKEN 环境变量。
+# 网页保存配置不会把环境变量中的密钥写回文件。
 
 [app]
 database = "qkbot.sqlite3"
 timezone = "Asia/Shanghai"
 log = "info"
 
+[web]
+enabled = true
+listen = "127.0.0.1:3210"     # 管理页面默认仅监听本机；修改本节需要编辑文件并重启
+token = ""                    # 非空时至少32字节；也可用 QKBOT_ADMIN_TOKEN
+
+[qq_login]
+enabled = true
+url = "http://127.0.0.1:3080" # LLBot WebUI，用于扫码登录和登录状态
+token = ""                    # LLBot WebUI密码，可用QKBOT_LLBOT_TOKEN；与Milky token分别设置
+
 [milky]
-url = "http://127.0.0.1:3000"
+url = "http://127.0.0.1:3010" # LLBot常见Milky端口；以协议端实际配置为准
 # bot_id = 123456789            # 可选：固定登录账号，防止接错协议端
 # access_token = ""
 max_response_bytes = 262144
@@ -30,7 +41,7 @@ admins = []
 
 [plugins.ai]
 enabled = true
-keywords = ["小葵"]            # 群内真实 @ 或关键词触发；好友私聊直接触发
+keywords = ["小鱼"]            # 群内真实 @ 或关键词触发；好友私聊直接触发
 read_group_background = true   # 允许的群内闲聊可作为短期背景
 learn_all_group_messages = false
 compact_after_messages = 40
@@ -55,8 +66,8 @@ once = false
 allowed_tools = ["clock_now"]  # 可加入 reminder_list/create/cancel，需开启提醒插件
 
 [plugins.ai.personas]
-"默认" = "你是群聊助手小葵。自然、简洁地用中文回答；记清谁说了什么。不确定时直说。"
-"温柔" = "你是小葵，用温柔、简洁的中文回答，不改变已知事实和权限。"
+"默认" = "你是群聊助手小鱼。自然、简洁地用中文回答；记清谁说了什么。不确定时直说。"
+"温柔" = "你是小鱼，用温柔、简洁的中文回答，不改变已知事实和权限。"
 
 [plugins.clock]
 enabled = true

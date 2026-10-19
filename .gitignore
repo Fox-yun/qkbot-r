@@ -1,6 +1,7 @@
 /target/
 /.toolchain/
 /config.toml
+.qkbot-config-*.tmp
 .env
 .env.*
 !.env.example

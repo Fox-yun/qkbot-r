@@ -1,4 +1,4 @@
-# qkbot · Rust
+# 小鱼（qkbot）· Rust
 
 面向小规模 QQ 群聊的轻量机器人：**Rust 单进程、SQLite、远程模型 API**。QQ 客户端与 Milky 协议端独立运行。
 
@@ -15,8 +15,9 @@
 - 静态源码插件：命令、事件、作用范围、初始化与退出；时钟与可选提醒作为参考实现。
 - 原生模型工具协议，工具白名单、参数验证、本人确认、事务幂等；不执行模型正文里的指令或 JSON。
 - 有界聊天 / 控制 / 数据库队列，有限并发，暂停、重置与遗忘使旧任务失效。
+- 内嵌 Web 管理页：连接状态、完整配置编辑、保存并应用、停止 / 启动；LLBot QQ 扫码登录。
 
-没有本地模型、Web 面板、主动接话、多模态、动态插件运行时或热重载。
+没有本地模型、主动接话、多模态或动态插件运行时。
 
 ## 启动
 
@@ -25,14 +26,14 @@
 ```powershell
 # 当前工作区已有工具链；其他环境可直接使用 cargo。
 .\scripts\cargo.ps1 build --release --locked
-Copy-Item config.example.toml config.toml
+.\target\release\qkbot.exe
 ```
 
-编辑 `config.toml`：
+首次运行会创建 `config.toml`，管理页面默认是 **http://127.0.0.1:3210**。使用终端显示的临时管理员令牌登录；如果需要固定令牌，在启动前设置至少 32 字符的 `QKBOT_ADMIN_TOKEN`。令牌不放在 URL 中，前端仅在本页内存中保存。
 
-1. 设置 `[milky]` 地址，建议填写 `bot_id`；有鉴权时设置 token。
-2. 设置 `[llm]` 的完整 `chat_completions_url`、`model`。
-3. 填写 `[access]` 的群号、好友 QQ 号和管理员 QQ 号。**空白名单不接收消息。**
+在页面中配置模型接口、群 / 好友白名单、触发词、上下文和记忆、插件及预算。常用字段使用表单，其余字段可在高级 JSON 编辑器中修改。**空白名单不接收消息。** 点击“保存并应用”会正常停止旧机器人，再以新配置启动；管理页面保持可用。已有会话通过聊天指令保存的差异设置继续生效，调整全局默认不会覆盖它们。
+
+也可手动编辑 `config.toml`，设置 `[milky]`、`[llm]` 和 `[access]` 后启动：
 
 ```powershell
 $env:QKBOT_API_KEY = "你的模型密钥"
@@ -45,9 +46,23 @@ Linux / macOS 使用 `cargo build --release --locked` 和 `./target/release/qkbo
 
 `--check` 只校验配置，不连接 QQ 或模型。环境变量覆盖文件中的密钥；相对数据库路径按配置文件目录解析。日志输出到 stderr，可交给服务管理器轮转。退出使用 Ctrl+C，Unix 也处理 SIGTERM。
 
+## QQ 扫码登录
+
+使用同时支持 Milky 和登录管理接口的 **LLBot（LuckyLilliaBot）**。先按 [LLBot 官方说明](https://luckylillia.com/guide/config) 安装并完成所选运行模式的前置配置 / 授权。LLBot 是独立的 QQ 协议端，Rust 程序不包含 QQ 客户端或签名服务。
+
+1. 在 LLBot 中启用 Milky HTTP / WebSocket 服务，常见地址为 `http://127.0.0.1:3010`。
+2. 在本项目管理页填入 Milky 地址和访问令牌；QQ 登录管理填入 LLBot WebUI 地址（常见为 `http://127.0.0.1:3080`）及其 **WebUI 密码**，保存配置。
+3. 在“QQ 登录”中获取二维码，用手机 QQ 扫码并确认。页面轮询登录状态，机器人自动等待并连接 Milky；二维码失效时手动刷新。
+
+管理员令牌、LLBot WebUI 密码、Milky 访问令牌和 LLBot 前置授权 `auth_token` 用途不同。这里代理二维码与登录状态，不收集 QQ 密码，也不管理签名授权。接口按 [LLBot v8.3.2 源码契约](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/src/webui/BE/routes/login.ts) 实现；其他 Milky 协议端仍能接入聊天，内嵌扫码需要提供相应管理接口适配。
+
+配置页面不会返回已有密钥；分别选择保留、替换或清空。环境变量 `QKBOT_API_KEY`、`QKBOT_MILKY_TOKEN`、`QKBOT_LLBOT_TOKEN`、`QKBOT_ADMIN_TOKEN` 优先于文件配置，页面会标明来源，环境变量值不会写回配置文件。保存配置使用同目录原子替换，并检测版本冲突；会规范化 TOML 格式，不保留原文件注释。
+
+管理端默认仅监听本机。远程访问可使用 SSH 端口转发；需要公开服务时，将它放在 HTTPS 反向代理后。`web.enabled`、监听地址、管理员令牌和日志过滤级别需要修改配置并重启整个程序；其他配置可在页面保存后应用。`web.enabled = false` 可关闭管理页。
+
 ## 配置取舍
 
-`[plugins.ai.defaults]` 是全局默认，聊天指令保存当前会话的差异设置。白名单、管理员、工具能力及部署级队列和调用配额只在配置文件中调整。配置文件修改后重启生效。
+`[plugins.ai.defaults]` 是全局默认，聊天指令保存当前会话的差异设置。白名单、管理员、工具能力及部署级队列和调用配额在管理页或配置文件中调整，保存并应用后生效。
 
 `mode` 是新群的初始模式；已有群使用 `/ai mode` 切换，避免修改默认值时意外恢复旧会话。关闭记忆写入或暂停期间的新消息不会被标记为自动学习来源。
 
@@ -125,7 +140,7 @@ Linux / macOS 使用 `cargo build --release --locked` 和 `./target/release/qkbo
 .\scripts\cargo.ps1 clippy --all-targets '--' '-D' warnings
 ```
 
-测试使用临时 SQLite、本地 HTTP / WebSocket 模拟服务，不需要真实 QQ 账号或模型密钥。覆盖身份与引用、串线、队列顺序、重置取消、摘要与事实独立进度、复杂遗忘撤销、结构化工具协议、确认权限、插件异常回滚、重启与账号恢复、幂等及未知发送状态。
+测试使用临时 SQLite、本地 HTTP / WebSocket 模拟服务，不需要真实 QQ 账号或模型密钥。覆盖身份与引用、串线、队列顺序、重置取消、摘要与事实独立进度、复杂遗忘撤销、结构化工具协议、确认权限、插件异常回滚、重启与账号恢复、幂等及未知发送状态，以及 Web 鉴权、配置密钥保护、版本冲突、运行切换和 LLBot 登录接口。
 
 真实账号与远程 API 尚需部署时验证。内存数据用于了解运行成本和排查异常，不作为功能验收门槛；更长上下文、更多记忆或插件带来的合理资源增长可以接受。
 
