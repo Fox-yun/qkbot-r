@@ -15,7 +15,11 @@ use crate::{
     types::{Scene, Scope, now},
 };
 
-use super::{runtime::Runtime, settings::ConfigStore};
+use super::{
+    memory::{Actor, GroupPersonaRequest, MemoryAdmin},
+    runtime::Runtime,
+    settings::ConfigStore,
+};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -349,6 +353,49 @@ impl ContactsService {
             enabled: request.enabled,
         })
     }
+
+    pub async fn set_group_persona(
+        &self,
+        actor: &Actor,
+        request: GroupPersonaRequest,
+    ) -> Result<serde_json::Value> {
+        let bot_id = parse_id(&request.bot_id)?;
+        let service = MemoryAdmin::new(
+            self.runtime.data().await?,
+            self.runtime.config().await.plugins.ai.clone(),
+        );
+        // Retry a completed action without reapplying it to a changed membership.
+        if let Some(result) = service.group_persona_receipt(actor, &request).await? {
+            return Ok(result);
+        }
+        let mut state = self.state.lock().await;
+        let (client, version) = self.client(&mut state).await?;
+        let contacts = client.contacts(true).await.map_err(transport_error)?;
+        if contacts.bot_id != bot_id
+            || client
+                .current_account()
+                .await
+                .map_err(|_| ContactsError::Offline)?
+                != bot_id
+        {
+            state.cached = None;
+            return Err(ContactsError::Stale.into());
+        }
+        self.unchanged(version).await?;
+        // Membership I/O may outlive an apply. Resolve the persona against the
+        // current runtime and hold its read lock through the atomic mutation.
+        let config = self.runtime.config_read().await;
+        let service = MemoryAdmin::new(self.runtime.data().await?, config.plugins.ai.clone());
+        let result = service
+            .set_group_persona(
+                actor,
+                request,
+                contacts.groups.iter().map(|group| group.id).collect(),
+            )
+            .await;
+        drop(config);
+        result
+    }
 }
 
 fn parse_id(value: &str) -> Result<i64> {
@@ -433,6 +480,9 @@ mod tests {
     }
     impl Fixture {
         async fn new() -> Self {
+            Self::with_custom_persona(None).await
+        }
+        async fn with_custom_persona(persona: Option<&str>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mock = Arc::new(Mock {
                 account: AtomicI64::new(123),
@@ -467,6 +517,13 @@ mod tests {
             config.milky.url = format!("http://{address}");
             config.milky.bot_id = None;
             config.milky.request_timeout_secs = 2;
+            if let Some(persona) = persona {
+                config
+                    .plugins
+                    .ai
+                    .personas
+                    .insert(persona.to_owned(), "仅用于并发回归的人设。".into());
+            }
             let path = directory.path().join("config.toml");
             std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
             let store = Arc::new(ConfigStore::open(path).await.unwrap());
@@ -751,6 +808,87 @@ mod tests {
             error.downcast_ref::<ContactsError>(),
             Some(&ContactsError::Stale)
         );
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn group_persona_rechecks_applied_configuration_after_slow_membership_fetch() {
+        let name = "待移除的测试人设";
+        let fixture = Fixture::with_custom_persona(Some(name)).await;
+        let permit = fixture.mock.gate.acquire().await.unwrap();
+        let service = fixture.service.clone();
+        let action = tokio::spawn(async move {
+            service
+                .set_group_persona(
+                    &Actor {
+                        admin_id: "admin-fixture".into(),
+                        session_id: "session-fixture".into(),
+                    },
+                    GroupPersonaRequest {
+                        request_id: "persona-apply-race".into(),
+                        bot_id: "123".into(),
+                        persona: name.into(),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.mock.groups.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut changed = (*fixture.runtime.config().await).clone();
+        changed.plugins.ai.personas.remove(name);
+        changed.plugins.ai.enabled = false;
+        changed.plugins.native.enabled.clear();
+        // Keep this test isolated from the media listener and all model traffic.
+        fixture
+            .runtime
+            .apply(changed, "persona-removed".into())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture
+                .runtime
+                .config()
+                .await
+                .plugins
+                .ai
+                .persona(name)
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(permit);
+        let error = tokio::time::timeout(Duration::from_secs(3), action)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("当前运行配置中没有该人设"));
+        let untouched = fixture
+            .runtime
+            .data()
+            .await
+            .unwrap()
+            .call(|db| {
+                Ok((
+                    db.query_row("SELECT count(*) FROM ai_group_personas", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    db.query_row("SELECT count(*) FROM ai_memory_operations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(untouched, (0, 0));
         fixture.finish().await;
     }
 

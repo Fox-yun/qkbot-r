@@ -11,6 +11,7 @@
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
     pendingOperation: null,
     personaTemplates: {}, personaSelected: null, toolCatalog: [], pluginCatalog: [],
+    groupPersona: { saving: false, message: "", kind: "" },
     scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
@@ -375,6 +376,9 @@
     if (defaults) fillPersonaSelect(defaults, defaults.value, state.draft);
     const conversation = settingInputs.get("persona")?.input;
     if (conversation) fillPersonaSelect(conversation, conversation.value, state.config);
+    const allGroups = $("group-persona-select");
+    fillPersonaSelect(allGroups, allGroups.value, state.config);
+    if (!allGroups.value) allGroups.setAttribute("aria-invalid", "false");
   }
   function renderPersonaLibrary() {
     const choices = personaChoices(state.draft), list = $("persona-list"); list.replaceChildren();
@@ -767,6 +771,11 @@
     $("persona-text").disabled = personaBlocked; $("persona-text").readOnly = !customPersona;
     $("persona-new").disabled = personaBlocked; $("persona-copy").disabled = personaBlocked || !personaChoices(state.draft).has(state.personaSelected);
     $("persona-delete").disabled = personaBlocked || !customPersona;
+    $("group-persona-select").disabled = unavailable || pending || state.groupPersona.saving;
+    $("apply-group-persona").disabled = unavailable || pending || state.groupPersona.saving || !personaChoices(state.config).has($("group-persona-select").value);
+    $("apply-group-persona").textContent = state.groupPersona.saving ? "正在处理…" : "应用到全部群聊";
+    $("group-persona-message").textContent = state.groupPersona.message || "点击应用时会核对 QQ 账号与群数量，再确认操作范围。";
+    $("group-persona-message").className = "hint group-persona-message" + (state.groupPersona.kind === "error" ? " inline-error" : "");
     for (const control of [inputs.get("plugins.ai.defaults.allowed_tools")?.control, settingInputs.get("allowed_tools")?.input]) if (control) updateToolPicker(control);
     updateContactControls();
   }
@@ -1155,7 +1164,7 @@
     const operation = state.pendingOperation; if (!operation) return;
     if (operation.kind === "memory") {
       const result = await api("/api/memory/operations/" + encodeURIComponent(operation.requestId));
-      if (result.status === "completed") { clearOperation(); await operation.complete(result); }
+      if (result.status === "completed") { if (operation.validate) operation.validate(result); clearOperation(); await operation.complete(result); }
       else notice("尚未查到完成记录。请稍后再次查询，不要重新提交。操作号：" + operation.requestId, "warning");
     } else if (operation.kind === "config") {
       const result = await api("/api/config");
@@ -1201,6 +1210,7 @@
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
     state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false; state.applyError = null; state.applyFailure = null;
     state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; state.pluginCatalog = []; pluginControls = null; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
+    state.groupPersona = { saving: false, message: "", kind: "" }; $("group-persona-select").replaceChildren(); $("group-persona-select").value = "";
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     $("config-fields").append($("persona-manager"), $("model-picker"));
@@ -1430,6 +1440,75 @@
   function memoryConflict(error) {
     if (error.status === 409) { state.memory.conflict = true; $("conversation-conflict").hidden = false; updateControls(); }
   }
+  function validateGroupPersonaResult(result, payload) {
+    if (!result || result.status !== "completed" || result.request_id !== payload.request_id || result.bot_id !== payload.bot_id || result.persona !== payload.persona
+      || !["affected_groups", "affected_conversations"].every((key) => Number.isSafeInteger(result[key]) && result[key] >= 0)
+      || !Array.isArray(result.scopes) || result.scopes.some((scope) => typeof scope !== "string" || !scope.startsWith(payload.bot_id + ":group:") || !contactId(scope.slice((payload.bot_id + ":group:").length)))) {
+      throw new ApiError("批量人设响应未能确认，请查询操作结果。", 200, "invalid_response");
+    }
+  }
+  async function finishGroupPersona(result) {
+    const session = state.session;
+    let message = `QQ ${result.bot_id} 的 ${result.affected_groups} 个群已使用「${result.persona}」，更新了 ${result.affected_conversations} 个已有会话。好友、全局默认、历史和记忆保持不变。`;
+    const selected = state.memory.detail || state.memory.selected;
+    if (selected?.scene === "group" && result.scopes.includes(selected.scope)) {
+      state.memory.version++; state.memory.conflict = true; state.memory.preview = null;
+      $("conversation-conflict").hidden = false; if ($("forget-dialog").open) $("forget-dialog").close();
+      if (state.memory.settingsDirty || state.memory.editorDirty) {
+        message += " 当前会话的未保存编辑已保留，请重新载入后再继续。";
+      } else {
+        try { await reloadSelected(); } catch (error) {
+          if (session !== state.session) return;
+          message += " 当前会话详情刷新失败，请重新载入：" + error.message;
+        }
+      }
+    }
+    if (session !== state.session) return;
+    try { await loadConversations(); } catch (error) {
+      if (session !== state.session) return;
+      message += " 会话列表刷新失败，请手动刷新：" + error.message;
+    }
+    if (session !== state.session) return;
+    state.groupPersona.message = message; state.groupPersona.kind = "success"; updateControls(); notice(message);
+  }
+  async function applyGroupPersona() {
+    if (!state.authenticated || !state.config || state.pendingOperation || state.groupPersona.saving) return;
+    const persona = $("group-persona-select").value;
+    requirePersona(state.config, persona, "群聊人设");
+    const session = state.session;
+    state.groupPersona.saving = true; state.groupPersona.kind = "";
+    state.groupPersona.message = "正在核对当前 QQ 账号和全部群列表……"; updateControls();
+    try {
+      const contacts = await api("/api/qq/contacts?force=true");
+      validateContacts(contacts);
+      if (session !== state.session) return;
+      if (!contacts.groups.length) { state.groupPersona.message = "当前登录 QQ 没有已加入的群，无需修改。"; return; }
+      if (!window.confirm(`将 QQ ${contacts.bot_id} 当前已加入的全部 ${contacts.groups.length} 个群设为「${persona}」？\n包括按成员隔离的会话及这些群以后新建的会话；好友、全局默认、历史和记忆保持不变。`)) {
+        state.groupPersona.message = "已取消，没有修改群聊人设。"; return;
+      }
+      const payload = { request_id: requestId(), bot_id: contacts.bot_id, persona };
+      const validate = (result) => validateGroupPersonaResult(result, payload);
+      const complete = async (result) => { if (session === state.session && state.authenticated) await finishGroupPersona(result); };
+      state.groupPersona.message = `正在为 QQ ${payload.bot_id} 的全部群应用「${persona}」……`; updateControls();
+      let result;
+      try {
+        result = await api("/api/ai/groups/persona", "POST", payload); validate(result);
+      } catch (error) {
+        if (session !== state.session) return;
+        if (uncertain(error)) {
+          state.groupPersona.message = "批量修改结果待确认，请使用上方「查询操作结果」；不会重复提交。";
+          trackOperation({ kind: "memory", label: "全部群聊人设操作", requestId: payload.request_id, validate, complete }); return;
+        }
+        throw error;
+      }
+      await complete(result);
+    } catch (error) {
+      if (session !== state.session) return;
+      state.groupPersona.message = error.message || "群聊人设操作未完成。"; state.groupPersona.kind = "error"; throw error;
+    } finally {
+      if (session === state.session) { state.groupPersona.saving = false; updateControls(); }
+    }
+  }
   async function finishMemory(result, completed) {
     if (typeof completed === "function") completed(result);
     state.memory.settingsDirty = false; state.memory.checked.clear(); state.memory.preview = null;
@@ -1553,6 +1632,12 @@
   document.querySelector(".brand").addEventListener("click", (event) => { event.preventDefault(); showView("overview"); });
   $("config-form").addEventListener("submit", (event) => event.preventDefault());
   $("persona-list").addEventListener("change", () => { state.personaSelected = $("persona-list").value; $("persona-error").textContent = ""; renderPersonaPreview(); });
+  $("group-persona-select").addEventListener("change", () => {
+    $("group-persona-select").setAttribute("aria-invalid", String(!personaChoices(state.config).has($("group-persona-select").value)));
+    if (!state.pendingOperation && !state.groupPersona.saving) { state.groupPersona.message = ""; state.groupPersona.kind = ""; }
+    updateControls();
+  });
+  $("apply-group-persona").addEventListener("click", () => { void runAction(applyGroupPersona); });
   $("persona-text").addEventListener("input", () => {
     if (state.busy || state.jsonDirty || state.pendingOperation || !Object.hasOwn(state.draft?.plugins?.ai?.personas || {}, state.personaSelected)) return;
     Object.defineProperty(state.draft.plugins.ai.personas, state.personaSelected, { value: $("persona-text").value, enumerable: true, writable: true, configurable: true });

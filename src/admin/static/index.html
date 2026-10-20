@@ -76,6 +76,11 @@
 
       <section id="view-memory" class="view" aria-labelledby="memory-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">MEMORY & CONTEXT</p><h1 id="memory-title">记忆与上下文</h1><p class="muted">先选择会话范围，再查看资料和管理对话。这里的内容只显示在管理台。</p></div></div>
+        <article class="card group-persona-card" aria-labelledby="group-persona-title">
+          <div class="group-persona-copy"><h2 id="group-persona-title">全部群聊人设</h2><p class="hint">为当前登录 QQ 已加入的全部群统一选择人设，包含按成员隔离的会话及这些群以后新建的会话。好友、全局默认、历史和记忆保持不变；之后新加入的群仍用默认人设。</p><p class="hint">选项来自已保存人设；自定义修改需先保存并应用全局配置。本操作不受下方会话筛选影响。</p></div>
+          <div class="group-persona-actions"><label for="group-persona-select">选择群聊人设</label><select id="group-persona-select" aria-describedby="group-persona-message"><option value="">请选择人设</option></select><button id="apply-group-persona" class="button primary" type="button">应用到全部群聊</button></div>
+          <p id="group-persona-message" class="hint group-persona-message" role="status" aria-live="polite">点击应用时会核对 QQ 账号与群数量，再确认操作范围。</p>
+        </article>
         <div class="memory-layout">
           <aside class="card scope-panel"><div class="card-top"><h2>选择会话</h2><button id="refresh-conversations" class="text-button accent" type="button" data-action>刷新</button></div>
             <form id="conversation-filter" class="compact-form"><label for="scope-bot">机器人 QQ 号</label><input id="scope-bot" inputmode="numeric" placeholder="全部机器人"><div class="field-grid"><div><label for="scope-scene">会话类型</label><select id="scope-scene"><option value="">全部</option><option value="group">群聊</option><option value="friend">私聊</option></select></div><div><label for="scope-mode">隔离范围</label><select id="scope-mode"><option value="">全部</option><option value="group">群共享</option><option value="user">按成员</option></select></div></div><label for="scope-peer">群号 / 私聊 QQ 号</label><input id="scope-peer" inputmode="numeric" placeholder="全部会话"><label for="scope-owner">隔离成员 QQ 号</label><input id="scope-owner" inputmode="numeric" placeholder="全部成员"><button class="button secondary wide" type="submit" data-action>筛选会话</button></form>

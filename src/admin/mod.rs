@@ -98,6 +98,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/memory/records/{id}", get(memory_detail))
         .route("/api/memory/records/{id}/source", get(memory_source))
         .route("/api/memory/mutate", post(mutate))
+        .route("/api/ai/groups/persona", post(group_persona))
         .route("/api/memory/forget/preview", post(forget_preview))
         .route("/api/memory/forget/confirm", post(forget_confirm))
         .route("/api/memory/operations/{id}", get(operation))
@@ -522,6 +523,22 @@ async fn mutate(
             })
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("管理操作异常，请查询操作结果"))),
+    )
+}
+async fn group_persona(
+    State(s): State<Arc<AdminState>>,
+    Extension(a): Extension<TrustedSession>,
+    Json(request): Json<memory::GroupPersonaRequest>,
+) -> Response {
+    result(
+        s.mutations
+            .clone()
+            .spawn(async move {
+                let changed = s.contacts.set_group_persona(&actor(a), request).await;
+                finish_mutation(&s, changed).await
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("批量人设操作异常，请查询操作结果"))),
     )
 }
 async fn forget_preview(

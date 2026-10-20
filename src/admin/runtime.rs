@@ -152,6 +152,11 @@ impl Runtime {
         self.config.read().await.clone()
     }
 
+    /// Keep configuration-dependent mutations consistent until their database commit.
+    pub(crate) async fn config_read(&self) -> tokio::sync::RwLockReadGuard<'_, Arc<Config>> {
+        self.config.read().await
+    }
+
     pub async fn cancel_scopes(&self, scopes: &[String]) {
         let Ok(store) = self.data().await else { return };
         let scopes = scopes.to_vec();

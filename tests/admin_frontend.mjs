@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, fetchModels, renderModels, invalidateModels, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -377,6 +377,151 @@ test("default and conversation personas select merged templates with custom prec
   assert.equal(h.app.readSettings().persona, "模板甲");
   h.ids.get("persona-list").value = "模板甲"; await h.ids.get("persona-list").emit("change");
   assert.equal(h.ids.get("persona-text").value, "内置模板正文"); assert.equal(h.ids.get("persona-text").readOnly, true);
+});
+
+const groupPersonaResult = (payload) => ({ ...payload, status: "completed", affected_groups: 2, affected_conversations: 3, scopes: [payload.bot_id + ":group:1000", payload.bot_id + ":group:1001"] });
+const emptyConversations = { items: [], page: 1, total_pages: 1, total: 0 };
+
+test("all-group persona choices use saved entries, start unselected and retain removed selections explicitly", async () => {
+  const h = harness(); await h.login(); const picker = h.ids.get("group-persona-select");
+  assert.equal(picker.value, ""); assert.equal(h.ids.get("apply-group-persona").disabled, true);
+  assert.deepEqual(picker.children.map((option) => option.value), ["", "默认", "模板甲"]);
+  h.app.state.draft.plugins.ai.personas["未保存"] = "草稿正文"; h.app.refreshPersonaSelectors();
+  assert.equal(picker.children.some((option) => option.value === "未保存"), false);
+  picker.value = "模板甲"; await picker.emit("change");
+  h.app.refreshPersonaSelectors(); assert.equal(picker.value, "模板甲");
+  const updated = h.snapshot(); updated.persona_templates = { "模板乙": "新模板" };
+  h.setHandler(async () => ({ body: updated })); await h.app.loadConfig();
+  assert.equal(picker.value, "模板甲"); assert.equal(picker.attrs["aria-invalid"], "true");
+  assert.equal(h.ids.get("apply-group-persona").disabled, true);
+  await assert.rejects(h.app.applyGroupPersona(), /已失效/u);
+  assert.equal(h.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("all-group application binds fresh account and sends one CSRF mutation without changing defaults or friend drafts", async () => {
+  const h = harness(); await h.login(); const picker = h.ids.get("group-persona-select");
+  picker.value = "模板甲";
+  h.app.state.draft.plugins.ai.defaults.persona = "草稿默认"; h.app.state.dirty = true;
+  h.app.state.status = { bot_id: 999 }; h.app.state.contacts.botId = "999";
+  const friend = { ...h.conversation("123:friend:20:0"), bot_id: 123, scene: "friend", scope: "123:friend:20" };
+  h.app.state.memory.selected = friend; h.app.state.memory.detail = friend; h.app.state.memory.settingsDirty = true;
+  h.app.renderSettings(); const input = h.app.settingInputs.get("input_budget").input; input.value = "12000";
+  h.ids.get("scope-scene").value = "friend"; h.ids.get("scope-peer").value = "20";
+  let confirmation = "", payload;
+  h.window.confirm = (text) => { confirmation = text; return true; };
+  h.setHandler(async (path, options) => {
+    if (path === "/api/qq/contacts?force=true") return { body: contacts("123", 2) };
+    if (path === "/api/ai/groups/persona") { payload = JSON.parse(options.body); return { body: groupPersonaResult(payload) }; }
+    return { body: emptyConversations };
+  });
+  await h.app.runAction(h.app.applyGroupPersona);
+  assert.match(confirmation, /QQ 123.*全部 2 个群/u); assert.match(confirmation, /好友、全局默认、历史和记忆保持不变/u);
+  assert.equal(payload.bot_id, "123"); assert.equal(payload.persona, "模板甲"); assert.match(payload.request_id, /^[0-9a-f-]{36}$/u);
+  const mutation = h.calls.find((call) => call.path === "/api/ai/groups/persona");
+  assert.equal(mutation.options.headers["X-CSRF-Token"], "csrf-test"); assert.deepEqual(Object.keys(payload).sort(), ["bot_id", "persona", "request_id"]);
+  assert.equal(h.app.state.config.plugins.ai.defaults.persona, "默认"); assert.equal(h.app.state.draft.plugins.ai.defaults.persona, "草稿默认");
+  assert.equal(h.app.state.dirty, true); assert.equal(h.app.state.memory.detail, friend);
+  assert.equal(h.app.settingInputs.get("input_budget").input, input); assert.equal(input.value, "12000");
+  assert.equal(h.app.state.memory.settingsDirty, true); assert.equal(h.app.state.memory.conflict, false);
+  assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 1);
+  assert.match(h.ids.get("group-persona-message").textContent, /2 个群.*3 个已有会话/u);
+});
+
+test("all-group success reloads affected group versions but preserves unsaved group edits", async () => {
+  for (const dirty of [false, true]) {
+    const h = harness(); await h.login(); h.ids.get("group-persona-select").value = "模板甲";
+    const group = { ...h.conversation("123:group:1000:0"), bot_id: 123, peer_id: 1000, scope: "123:group:1000" };
+    h.app.state.memory.selected = group; h.app.state.memory.detail = group; h.app.renderSettings();
+    const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000";
+    h.app.state.memory.settingsDirty = dirty; h.app.state.memory.editorDirty = dirty;
+    h.ids.get("edit-memory-text").value = "未保存记忆正文";
+    const refreshed = { ...group, epoch: group.epoch + 1, memory_revision: group.memory_revision + 1, settings: { ...group.settings, persona: "模板甲" }, summary: "原摘要", context_count: 9 };
+    h.setHandler(async (path, options) => {
+      if (path.startsWith("/api/qq/contacts")) return { body: contacts("123", 2) };
+      if (path === "/api/ai/groups/persona") return { body: groupPersonaResult(JSON.parse(options.body)) };
+      return { body: path.includes("/conversations/") ? refreshed : emptyConversations };
+    });
+    await h.app.runAction(h.app.applyGroupPersona);
+    if (dirty) {
+      assert.equal(h.app.state.memory.detail, group); assert.equal(h.app.state.memory.conflict, true);
+      assert.equal(h.app.settingInputs.get("input_budget").input, budget); assert.equal(budget.value, "12000");
+      assert.equal(h.ids.get("edit-memory-text").value, "未保存记忆正文");
+      assert.equal(h.ids.get("save-conversation-settings").disabled, true); assert.equal(h.ids.get("save-memory").disabled, true);
+      assert.match(h.ids.get("group-persona-message").textContent, /未保存编辑已保留/u);
+      assert.equal(h.calls.some((call) => call.path.includes("/conversations/")), false);
+    } else {
+      assert.equal(h.app.state.memory.detail.epoch, refreshed.epoch); assert.equal(h.app.state.memory.detail.summary, "原摘要");
+      assert.equal(h.app.state.memory.detail.context_count, 9); assert.equal(h.app.state.memory.conflict, false);
+      assert.equal(h.app.settingInputs.get("persona").input.value, "模板甲");
+    }
+  }
+});
+
+test("all-group application does not write on empty groups, unavailable contacts or dismissed confirmation", async () => {
+  for (const scenario of ["empty", "offline", "invalid", "cancel"]) {
+    const h = harness(); await h.login(); h.ids.get("group-persona-select").value = "模板甲";
+    h.window.confirm = () => false;
+    h.setHandler(async () => scenario === "offline" ? { status: 502, body: { error: "QQ 未连接", code: "contacts_offline" } }
+      : { body: scenario === "invalid" ? { ...contacts(), bot_id: "bad" } : contacts("123", scenario === "empty" ? 0 : 2) });
+    await h.app.runAction(h.app.applyGroupPersona);
+    assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 0, scenario);
+    assert.equal(h.app.state.groupPersona.saving, false); assert.equal(h.app.state.pendingOperation, null);
+    assert.doesNotMatch(h.ids.get("group-persona-message").textContent, /个群已使用/u);
+  }
+});
+
+test("all-group account or unapplied-persona rejection preserves selection and offers no false success", async () => {
+  for (const response of [
+    { status: 409, body: { error: "账号已变化，请刷新后重试", code: "contacts_stale" } },
+    { status: 400, body: { error: "当前运行配置中没有该人设，请先应用全局配置" } },
+  ]) {
+    const h = harness(); await h.login(); h.ids.get("group-persona-select").value = "模板甲";
+    h.setHandler(async (path) => path.startsWith("/api/qq/contacts") ? { body: contacts("123", 2) } : response);
+    await h.app.runAction(h.app.applyGroupPersona);
+    assert.equal(h.ids.get("group-persona-select").value, "模板甲"); assert.equal(h.app.state.pendingOperation, null);
+    assert.equal(h.app.state.groupPersona.kind, "error"); assert.equal(h.ids.get("group-persona-message").textContent, response.body.error);
+    assert.equal(h.app.state.config.plugins.ai.defaults.persona, "默认");
+  }
+});
+
+test("uncertain all-group writes query their exact receipt without resubmitting or accepting another operation", async () => {
+  for (const failure of ["network", "invalid", "mismatch"]) {
+    const h = harness(); await h.login(); h.ids.get("group-persona-select").value = "模板甲";
+    let payload;
+    h.setHandler(async (path, options) => {
+      if (path.startsWith("/api/qq/contacts")) return { body: contacts("123", 2) };
+      payload = JSON.parse(options.body);
+      return failure === "network" ? { error: new Error("lost response") } : failure === "invalid" ? { raw: "bad-json" }
+        : { body: { ...groupPersonaResult(payload), bot_id: "999" } };
+    });
+    await h.app.runAction(h.app.applyGroupPersona);
+    assert.equal(h.app.state.pendingOperation.requestId, payload.request_id); assert.equal(h.ids.get("apply-group-persona").disabled, true);
+    await h.app.applyGroupPersona(); assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 1);
+    h.setHandler(async () => ({ body: { ...groupPersonaResult(payload), request_id: "other-operation" } }));
+    await assert.rejects(h.app.checkOperation(), /未能确认/u); assert.equal(h.app.state.pendingOperation.requestId, payload.request_id);
+    h.setHandler(async (path) => ({ body: path.startsWith("/api/memory/operations/") ? groupPersonaResult(payload) : emptyConversations }));
+    await h.app.checkOperation();
+    assert.equal(h.app.state.pendingOperation, null); assert.match(h.ids.get("group-persona-message").textContent, /2 个群已使用/u);
+    assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 1);
+  }
+});
+
+test("all-group in-flight work is single-flight and late results cannot enter a new login session", async () => {
+  for (const stage of ["contacts", "mutation"]) {
+    const h = harness(); await h.login(); h.ids.get("group-persona-select").value = "模板甲";
+    let resolve, payload;
+    h.setHandler((path, options) => {
+      if (path.startsWith("/api/qq/contacts") && stage === "mutation") return Promise.resolve({ body: contacts("123", 2) });
+      if (options.body) payload = JSON.parse(options.body);
+      return new Promise((done) => { resolve = done; });
+    });
+    const old = h.app.applyGroupPersona(); for (let i = 0; i < 10 && !resolve; i++) await Promise.resolve();
+    assert.ok(resolve); const before = h.calls.length; await h.app.applyGroupPersona(); assert.equal(h.calls.length, before);
+    h.app.clearSession(); await h.login();
+    resolve({ body: stage === "contacts" ? contacts("123", 2) : groupPersonaResult(payload) }); await old;
+    assert.equal(h.app.state.pendingOperation, null); assert.equal(h.app.state.groupPersona.message, "");
+    assert.equal(h.ids.get("group-persona-select").value, ""); assert.equal(h.app.state.groupPersona.saving, false);
+  }
 });
 
 test("persona edits and new copies remain draft-only and survive switching and option refresh", async () => {

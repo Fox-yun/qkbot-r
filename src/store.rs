@@ -67,6 +67,13 @@ impl Store {
         store.migrate("host", 1, HOST_SCHEMA).await?;
         store.migrate("host", 2, MESSAGE_DISPLAY_NAMES).await?;
         store
+            .migrate(
+                "group_personas",
+                1,
+                "CREATE TABLE ai_group_personas(scope TEXT PRIMARY KEY, persona TEXT NOT NULL);",
+            )
+            .await?;
+        store
             .migrate("catalog", 1, crate::catalog::MIGRATION)
             .await?;
         store

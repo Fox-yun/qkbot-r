@@ -96,6 +96,13 @@ pub struct MutationRequest {
     pub memory_revision: i64,
     pub action: Action,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupPersonaRequest {
+    pub request_id: String,
+    pub bot_id: String,
+    pub persona: String,
+}
 fn yes() -> bool {
     true
 }
@@ -173,6 +180,94 @@ struct ForgetPlan {
 impl MemoryAdmin {
     pub fn new(store: Store, config: AiConfig) -> Self {
         Self { store, config }
+    }
+
+    pub(crate) async fn group_persona_receipt(
+        &self,
+        actor: &Actor,
+        request: &GroupPersonaRequest,
+    ) -> Result<Option<Value>> {
+        actor.validate()?;
+        validate_request_id(&request.request_id)?;
+        let hash = request_hash(request)?;
+        let actor = actor.clone();
+        let id = request.request_id.clone();
+        self.store
+            .call(move |db| receipt(db, &actor, &id, Some(&hash)))
+            .await
+    }
+
+    /// The caller supplies freshly verified membership for the requested account.
+    /// A scope seed covers future member-isolated conversations without changing
+    /// global defaults or adding another layer to every context resolution.
+    pub(crate) async fn set_group_persona(
+        &self,
+        actor: &Actor,
+        request: GroupPersonaRequest,
+        group_ids: Vec<i64>,
+    ) -> Result<Value> {
+        actor.validate()?;
+        validate_request_id(&request.request_id)?;
+        let bot_id = request.bot_id.parse::<i64>()?;
+        ensure!(
+            bot_id > 0 && request.bot_id == bot_id.to_string(),
+            "invalid bot_id"
+        );
+        ensure!(
+            group_ids.iter().all(|id| *id > 0),
+            "invalid group identifier"
+        );
+        let mut scopes: Vec<_> = group_ids
+            .iter()
+            .map(|id| format!("{bot_id}:group:{id}"))
+            .collect();
+        scopes.sort();
+        scopes.dedup();
+        // Finish already-started sends before changing epochs; new sends then
+        // observe the committed generation. Stable ordering avoids lock cycles.
+        let mut gates = Vec::with_capacity(scopes.len());
+        for scope in &scopes {
+            gates.push(self.store.scope_gate(scope)?.write_owned().await);
+        }
+        let actor = actor.clone();
+        let config = self.config.clone();
+        self.store.call(move |db| {
+            let hash = request_hash(&request)?;
+            let tx = db.transaction()?;
+            if let Some(result) = receipt(&tx, &actor, &request.request_id, Some(&hash))? {
+                return Ok(result);
+            }
+            ensure!(config.persona(&request.persona).is_some(),
+                "当前运行配置中没有该人设；如刚保存了自定义人设，请先应用全局配置");
+            let mut affected_conversations = 0;
+            for scope in &scopes {
+                tx.execute("INSERT INTO ai_group_personas(scope,persona) VALUES(?1,?2) ON CONFLICT(scope) DO UPDATE SET persona=excluded.persona",
+                    params![scope,request.persona])?;
+                let rows = {
+                    let mut statement = tx.prepare("SELECT id,settings FROM ai_conversations WHERE scope=?1 ORDER BY id")?;
+                    statement.query_map([scope], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for (id, raw) in rows {
+                    let mut settings: Value = serde_json::from_str(&raw)?;
+                    let object = settings.as_object_mut().context("会话设置格式无效")?;
+                    if object.get("persona").and_then(Value::as_str) == Some(&request.persona) {
+                        continue;
+                    }
+                    object.insert("persona".into(), json!(request.persona));
+                    let version = conversation_version(&tx, &id)?;
+                    tx.execute("UPDATE ai_conversations SET settings=?1 WHERE id=?2", params![settings.to_string(),id])?;
+                    bump_context(&tx, &version, true, false)?;
+                    affected_conversations += 1;
+                }
+            }
+            let result = json!({"request_id":request.request_id,"status":"completed",
+                "bot_id":request.bot_id,"persona":request.persona,
+                "affected_groups":scopes.len(),"affected_conversations":affected_conversations,"scopes":scopes});
+            save_receipt(&tx,&actor,&request.request_id,&hash,&result)?;
+            tx.commit()?;
+            Ok(result)
+        }).await
     }
 
     pub async fn conversations(&self, actor: &Actor, query: ConversationQuery) -> Result<Value> {
@@ -289,7 +384,8 @@ impl MemoryAdmin {
                     ensure!(settings.mode==mode,"change conversation mode through the mode operation");
                     let defaults=serde_json::to_value(&config.defaults)?;
                     let mut value=serde_json::to_value(settings)?;
-                    value.as_object_mut().unwrap().retain(|k,v|k!="mode" && defaults.get(k)!=Some(v));
+                    let seeded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ai_group_personas WHERE scope=?1)",[&cv.scope],|r|r.get(0))?;
+                    value.as_object_mut().unwrap().retain(|k,v|k!="mode" && ((k=="persona" && seeded) || defaults.get(k)!=Some(v)));
                     tx.execute("UPDATE ai_conversations SET settings=?1 WHERE id=?2",params![value.to_string(),cv.id])?;
                     bump_context(&tx,&cv,true,false)?;
                 }
@@ -644,6 +740,198 @@ mod tests {
             memory_revision: cv["memory_revision"].as_i64().unwrap(),
             ids,
         }
+    }
+    fn group_persona_request(id: &str, persona: &str) -> GroupPersonaRequest {
+        GroupPersonaRequest {
+            request_id: id.into(),
+            bot_id: "1".into(),
+            persona: persona.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn group_persona_batch_preserves_context_isolation_and_is_idempotent() {
+        let (_dir, store, service, actor) = fixture().await;
+        let seeded = service
+            .mutate(&actor, create("seed-group-memory", 1, 0))
+            .await
+            .unwrap();
+        let memory_id = seeded["ids"][0].as_i64().unwrap();
+        store.call(move |db| {
+            db.execute_batch("INSERT INTO ai_conversations(id,scope,mode,owner_id) VALUES
+                ('friend','1:friend:10','user',10),('left-group','1:group:30','group',NULL);
+                UPDATE ai_conversations SET settings='{\"output_budget\":321,\"memory_read\":false}',
+                summary='保留摘要',compacted_until=1,memory_processed_until=1 WHERE id='group';
+                INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position)
+                VALUES('old-reset-message','1:group:10','group',1,7,'user','旧世代不恢复',1,0);")?;
+            db.execute("INSERT INTO ai_memory_provenance(memory_id,source_key,quote) VALUES(?1,'1:group:10:1','喜欢红茶')",[memory_id])?;
+            Ok(())
+        }).await.unwrap();
+        let request = group_persona_request("all-groups", "温柔学长");
+        let changed = service
+            .set_group_persona(&actor, request.clone(), vec![10, 20, 40, 10])
+            .await
+            .unwrap();
+        assert_eq!(changed["affected_groups"], 3);
+        assert_eq!(changed["affected_conversations"], 2);
+        assert_eq!(
+            service.operation(&actor, "all-groups").await.unwrap(),
+            changed
+        );
+        assert_eq!(
+            service
+                .set_group_persona(&actor, request.clone(), vec![10, 20, 40])
+                .await
+                .unwrap(),
+            changed
+        );
+        let detail = service.conversation(&actor, "group").await.unwrap();
+        assert_eq!(detail["epoch"], 3);
+        assert_eq!(detail["settings"]["persona"], "温柔学长");
+        assert_eq!(detail["settings"]["output_budget"], 321);
+        assert_eq!(detail["settings"]["memory_read"], false);
+        assert_eq!(detail["summary"], "保留摘要");
+        assert_eq!(detail["context_count"], 1);
+        assert_eq!(detail["memory_count"], 1);
+        assert_eq!(
+            service.conversation(&actor, "private").await.unwrap()["settings"]["persona"],
+            "温柔学长"
+        );
+        for id in ["friend", "other", "left-group"] {
+            let detail = service.conversation(&actor, id).await.unwrap();
+            assert_eq!(detail["epoch"], 1);
+            assert_eq!(
+                detail["settings"]["persona"],
+                service.config.defaults.persona
+            );
+        }
+        store.call(move |db| {
+            assert!(crate::host::check_guard(db,&ContextGuard{conversation_id:"group".into(),epoch:2}).is_err());
+            let row:(i64,i64,i64)=db.query_row("SELECT compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='group'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(row,(1,1,2));
+            let old_epoch:i64=db.query_row("SELECT epoch FROM messages WHERE key='old-reset-message'",[],|r|r.get(0))?;
+            assert_eq!(old_epoch,1);
+            assert_eq!(db.query_row("SELECT quote FROM ai_memory_provenance WHERE memory_id=?1",[memory_id],|r|r.get::<_,String>(0))?,"喜欢红茶");
+            assert_eq!(db.query_row("SELECT count(*) FROM ai_memory_search WHERE memory_id=?1",[memory_id],|r|r.get::<_,i64>(0))?,1);
+            assert_eq!(db.query_row("SELECT persona FROM ai_group_personas WHERE scope='1:group:40'",[],|r|r.get::<_,String>(0))?,"温柔学长");
+            Ok(())
+        }).await.unwrap();
+        let mut conflicting = request;
+        conflicting.persona = "理性搭档".into();
+        assert!(
+            service
+                .set_group_persona(&actor, conflicting, vec![10])
+                .await
+                .unwrap_err()
+                .is::<AdminError>()
+        );
+        // Saving a different setting must not erase a batch choice that happens
+        // to equal the global default.
+        service
+            .set_group_persona(
+                &actor,
+                group_persona_request("default-groups", &service.config.defaults.persona),
+                vec![10],
+            )
+            .await
+            .unwrap();
+        let detail = service.conversation(&actor, "group").await.unwrap();
+        let mut settings: AiSettings = serde_json::from_value(detail["settings"].clone()).unwrap();
+        settings.output_budget = 456;
+        service
+            .mutate(
+                &actor,
+                MutationRequest {
+                    request_id: "save-other-setting".into(),
+                    conversation_id: "group".into(),
+                    epoch: detail["epoch"].as_i64().unwrap(),
+                    memory_revision: detail["memory_revision"].as_i64().unwrap(),
+                    action: Action::Settings { settings },
+                },
+            )
+            .await
+            .unwrap();
+        let raw = store
+            .call(|db| {
+                Ok(db.query_row(
+                    "SELECT settings FROM ai_conversations WHERE id='group'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["persona"],
+            service.config.defaults.persona
+        );
+    }
+
+    #[tokio::test]
+    async fn group_persona_validation_and_mid_batch_errors_roll_back_every_change() {
+        let (_dir, store, service, actor) = fixture().await;
+        assert!(
+            service
+                .set_group_persona(
+                    &actor,
+                    group_persona_request("unknown-persona", "missing"),
+                    vec![10, 20]
+                )
+                .await
+                .is_err()
+        );
+        store
+            .call(|db| {
+                db.execute(
+                    "UPDATE ai_conversations SET settings='[]' WHERE id='private'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            service
+                .set_group_persona(
+                    &actor,
+                    group_persona_request("rollback-groups", "温柔学长"),
+                    vec![10, 20]
+                )
+                .await
+                .is_err()
+        );
+        store
+            .call(|db| {
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM ai_group_personas", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM ai_memory_operations", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT settings,epoch FROM ai_conversations WHERE id='group'",
+                        [],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    )?,
+                    ("{}".into(), 1)
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT epoch FROM messages WHERE key='1:group:10:1'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
     #[tokio::test]
     async fn manual_writes_are_idempotent_locked_and_have_no_fabricated_sources() {
