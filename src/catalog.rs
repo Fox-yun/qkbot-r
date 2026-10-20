@@ -409,7 +409,201 @@ pub async fn set_enabled(store: &Store, scope: Scope, plugin: String, enabled: b
     }).await
 }
 
+// Help text and images share one structured document. Do not split the text
+// fallback into menu lines: doing so numbers descriptions as new features.
+fn help_document(
+    config: &Config,
+    db: &Connection,
+    message: &crate::types::Incoming,
+) -> Result<crate::plugins::render::HelpDocument> {
+    use crate::plugins::render::{HelpCard, HelpDocument};
+    let args: Vec<_> = message.text.split_whitespace().skip(1).collect();
+    let show_hidden = args.iter().any(|s| matches!(*s, "-H" | "--show-hidden"));
+    ensure!(
+        !show_hidden
+            || config
+                .plugins
+                .native
+                .superusers
+                .contains(&message.sender_id),
+        "只有机器人超级管理员可以查看隐藏功能"
+    );
+    let queries: Vec<_> = args
+        .into_iter()
+        .filter(|s| !matches!(*s, "-H" | "--show-hidden"))
+        .collect();
+    let scope = &message.key.scope;
+    let mut entries = Vec::new();
+    for feature in features(config) {
+        let scope_enabled = allowed_revision(db, &scope.key(), &feature.id)?.is_some();
+        let group_applicable = !feature.group_only || scope.scene == crate::types::Scene::Group;
+        if !show_hidden && !(feature.enabled && scope_enabled && group_applicable) {
+            continue;
+        }
+        let mut badges = Vec::new();
+        if !feature.enabled {
+            badges.push("已关闭".to_owned());
+        }
+        if !scope_enabled {
+            badges.push("本会话关闭".to_owned());
+        }
+        if feature.group_only {
+            badges.push(
+                if group_applicable {
+                    "群聊"
+                } else {
+                    "仅限群聊"
+                }
+                .to_owned(),
+            );
+        }
+        entries.push((feature, badges));
+    }
+    let mut document = HelpDocument {
+        title: "小鱼 · 功能帮助".into(),
+        subtitle: if show_hidden {
+            format!("管理员视图 · {} 项功能，含未启用项", entries.len())
+        } else {
+            format!("当前会话可用 · {} 项功能", entries.len())
+        },
+        cards: Vec::new(),
+        footer: Vec::new(),
+        detail: !queries.is_empty(),
+    };
+    if let Some(query) = queries.first() {
+        let found = if query.bytes().all(|c| c.is_ascii_digit()) {
+            query
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| entries.get(i).map(|entry| (i, entry)))
+        } else {
+            entries.iter().enumerate().find(|(_, (f, _))| {
+                format!("{} {} {}", f.id, f.name, f.commands.join(" "))
+                    .to_lowercase()
+                    .contains(&query.to_lowercase())
+            })
+        };
+        let Some((index, (feature, badges))) = found else {
+            document.subtitle = "未找到对应功能。发送 /帮助 查看当前列表。".into();
+            return Ok(document);
+        };
+        document.title = format!("{} · 使用指南", feature.name);
+        document.subtitle = "功能详情 · 查看说明与完整命令入口".into();
+        document.cards.push(HelpCard {
+            number: Some(index + 1),
+            title: feature.name.clone(),
+            description: feature.description.clone(),
+            commands: feature
+                .commands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {c}", i + 1))
+                .collect(),
+            badges: badges.clone(),
+        });
+        if let Some(function) = queries.get(1) {
+            let command = if function.bytes().all(|c| c.is_ascii_digit()) {
+                function
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| feature.commands.get(i))
+            } else {
+                feature.commands.iter().find(|c| c.contains(*function))
+            };
+            document.footer.push(
+                command
+                    .map(|c| format!("入口：{c}；发送该命令查看用法。"))
+                    .unwrap_or_else(|| "没有找到该命令入口。".into()),
+            );
+        }
+        document
+            .footer
+            .push("/帮助 返回目录；/帮助 功能序号 命令序号 查看入口。".into());
+    } else {
+        for (index, (feature, badges)) in entries.into_iter().enumerate() {
+            document.cards.push(HelpCard {
+                number: Some(index + 1),
+                title: feature.name,
+                description: feature.description,
+                commands: feature.commands.into_iter().take(2).collect(),
+                badges,
+            });
+        }
+        document
+            .footer
+            .push("/帮助 序号或名称 查看详情；可再加命令序号。".into());
+        document
+            .footer
+            .push("卡片展示常用入口；详情中可查看全部命令。".into());
+        let mut shortcuts = Vec::new();
+        for (id, enabled, usage) in [
+            ("clock", config.plugins.clock.enabled, "/clock 查看时间"),
+            (
+                "reminder",
+                config.plugins.reminder.enabled,
+                "/remind 管理提醒",
+            ),
+        ] {
+            if enabled && allowed_revision(db, &scope.key(), id)?.is_some() {
+                shortcuts.push(usage);
+            }
+        }
+        if !shortcuts.is_empty() {
+            document.footer.push(shortcuts.join("    ·    "));
+        }
+        if config.plugins.ai.enabled && allowed_revision(db, &scope.key(), "ai")?.is_some() {
+            document.footer.push(
+                match scope.scene {
+                    crate::types::Scene::Group => "聊天：@机器人，或发送带触发词的消息。",
+                    crate::types::Scene::Friend => "聊天：直接发送消息即可。",
+                }
+                .into(),
+            );
+        }
+    }
+    Ok(document)
+}
+
+fn help_text(document: &crate::plugins::render::HelpDocument) -> String {
+    let mut blocks = vec![document.title.clone(), document.subtitle.clone()];
+    for card in &document.cards {
+        let number = card.number.map(|n| format!("{n}. ")).unwrap_or_default();
+        let badges = if card.badges.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", card.badges.join(" · "))
+        };
+        let mut block = format!("{number}{}{badges}\n{}", card.title, card.description);
+        if !card.commands.is_empty() {
+            block.push_str("\n命令：");
+            block.push_str(
+                &card
+                    .commands
+                    .join(if document.detail { "\n" } else { "、" }),
+            );
+        }
+        blocks.push(block);
+    }
+    blocks.extend(document.footer.iter().cloned());
+    blocks.join("\n\n")
+}
+
 pub struct HelpPlugin;
+impl HelpPlugin {
+    async fn document(
+        &self,
+        host: &crate::host::Host,
+        message: &crate::types::Incoming,
+    ) -> Result<crate::plugins::render::HelpDocument> {
+        let config = host.config.clone();
+        let message = message.clone();
+        host.store
+            .call(move |db| help_document(&config, db, &message))
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl crate::plugin::Plugin for HelpPlugin {
     fn spec(&self) -> crate::plugin::PluginSpec {
@@ -425,120 +619,278 @@ impl crate::plugin::Plugin for HelpPlugin {
         host: &crate::host::Host,
         message: &crate::types::Incoming,
     ) -> Result<String> {
-        let args: Vec<_> = message
-            .text
-            .split_whitespace()
-            .skip(1)
-            .map(str::to_owned)
-            .collect();
-        let show_hidden = args.iter().any(|s| s == "-H" || s == "--show-hidden");
-        ensure!(
-            !show_hidden
-                || host
-                    .config
-                    .plugins
-                    .native
-                    .superusers
-                    .contains(&message.sender_id),
-            "只有机器人超级管理员可以查看隐藏功能"
-        );
-        let queries: Vec<_> = args
-            .into_iter()
-            .filter(|s| s != "-H" && s != "--show-hidden")
-            .collect();
-        let scope = message.key.scope.clone();
-        let entries = features(&host.config);
-        let clock = host.config.plugins.clock.enabled;
-        let reminder = host.config.plugins.reminder.enabled;
-        host.store
-            .call(move |db| {
-                let entries: Vec<_> = entries
-                    .into_iter()
-                    .filter(|f| {
-                        show_hidden
-                            || (f.enabled
-                                && (!f.group_only || scope.scene == crate::types::Scene::Group)
-                                && allowed_revision(db, &scope.key(), &f.id)
-                                    .ok()
-                                    .flatten()
-                                    .is_some())
-                    })
-                    .collect();
-                let mut lines = vec!["小鱼 · 功能帮助".to_owned()];
-                if let Some(query) = queries.first() {
-                    let found = query
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|n| n.checked_sub(1))
-                        .and_then(|i| entries.get(i))
-                        .or_else(|| {
-                            entries.iter().find(|f| {
-                                format!("{} {} {}", f.id, f.name, f.commands.join(" "))
-                                    .to_lowercase()
-                                    .contains(&query.to_lowercase())
-                            })
-                        });
-                    let Some(feature) = found else {
-                        return Ok("未找到对应功能。发送 /帮助 查看当前列表。".into());
-                    };
-                    lines.push(format!(
-                        "{}\n{}\n命令：{}",
-                        feature.name,
-                        feature.description,
-                        feature.commands.join("、")
-                    ));
-                    if let Some(function) = queries.get(1) {
-                        let command = function
-                            .parse::<usize>()
-                            .ok()
-                            .and_then(|n| n.checked_sub(1))
-                            .and_then(|i| feature.commands.get(i))
-                            .or_else(|| feature.commands.iter().find(|c| c.contains(function)));
-                        lines.push(
-                            command
-                                .map(|c| format!("入口：{c}；发送该命令查看用法。"))
-                                .unwrap_or_else(|| "没有找到该命令入口。".into()),
-                        );
-                    }
-                } else {
-                    for (i, f) in entries.iter().enumerate() {
-                        lines.push(format!(
-                            "{}. {}{}\n{}",
-                            i + 1,
-                            f.name,
-                            if f.enabled { "" } else { "（已关闭）" },
-                            f.description
-                        ));
-                    }
-                    if clock {
-                        lines.push("/clock 查看时间".into());
-                    }
-                    if reminder {
-                        lines.push("/remind 管理提醒".into());
-                    }
-                    lines.push("/帮助 序号或名称 查看详情；可再加命令序号。".into());
-                }
-                Ok(lines.join("\n\n"))
-            })
-            .await
+        Ok(help_text(&self.document(host, message).await?))
     }
     async fn reply(
         &self,
         host: &crate::host::Host,
         message: &crate::types::Incoming,
     ) -> Result<crate::types::OutgoingMessage> {
-        let text = self.command(host, message).await?;
-        let lines = text
-            .lines()
-            .filter(|s| !s.is_empty() && *s != "小鱼 · 功能帮助")
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        match crate::plugins::render::lines(host, "小鱼 · 功能帮助", &lines).await {
+        let document = self.document(host, message).await?;
+        let text = help_text(&document);
+        match crate::plugins::render::help(host, document).await {
             Ok(image) => Ok(image),
             Err(error) => {
                 tracing::debug!(%error,"image help unavailable; preserving text help");
                 Ok(crate::types::OutgoingMessage::text(text))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use crate::{
+        plugin::Plugin,
+        types::{Incoming, MessageKey, Scene},
+    };
+
+    fn database() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE scope_plugin_access(
+                scope TEXT NOT NULL, plugin TEXT NOT NULL, enabled INTEGER NOT NULL,
+                revision INTEGER NOT NULL, PRIMARY KEY(scope,plugin));",
+        )
+        .unwrap();
+        db
+    }
+    fn incoming(text: &str) -> Incoming {
+        Incoming {
+            key: MessageKey {
+                scope: Scope {
+                    bot_id: 123,
+                    scene: Scene::Group,
+                    peer_id: 456,
+                },
+                message_seq: 1,
+            },
+            sender_id: 789,
+            sender_nickname: None,
+            sender_card: None,
+            text: text.into(),
+            mentions: Vec::new(),
+            quote_seq: None,
+            received_at: crate::types::now(),
+            raw_message: serde_json::Value::Null,
+            notification: None,
+        }
+    }
+    fn disable(db: &Connection, message: &Incoming, plugin: &str) {
+        db.execute(
+            "INSERT INTO scope_plugin_access VALUES (?1,?2,0,1)",
+            params![message.key.scope.key(), plugin],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn help_numbers_identify_whole_features_and_registered_commands() {
+        let db = database();
+        let config = Config::default();
+        let mut message = incoming("/帮助");
+        disable(&db, &message, "wordle");
+        let menu = help_document(&config, &db, &message).unwrap();
+        assert!(!menu.detail);
+        assert!(!menu.cards.iter().any(|c| c.title == "Wordle"));
+        for (index, card) in menu.cards.iter().enumerate() {
+            assert_eq!(card.number, Some(index + 1));
+            assert!(!card.title.starts_with(&format!("{}. ", index + 1)));
+            assert!(!card.description.is_empty());
+            message.text = format!("/帮助 {}", index + 1);
+            let detail = help_document(&config, &db, &message).unwrap();
+            assert_eq!(detail.cards.len(), 1);
+            assert_eq!(detail.cards[0].title, card.title);
+            assert_eq!(detail.cards[0].description, card.description);
+            assert_eq!(detail.cards[0].number, card.number);
+        }
+        message.text = "/菜单 鹿管签到".into();
+        let detail = help_document(&config, &db, &message).unwrap();
+        let feature = features(&config)
+            .into_iter()
+            .find(|f| f.id == "checkin")
+            .unwrap();
+        assert!(feature.commands.len() > 2);
+        assert_eq!(
+            detail.cards[0].commands,
+            feature
+                .commands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {c}", i + 1))
+                .collect::<Vec<_>>()
+        );
+        message.text = "/help /鹿 4".into();
+        let command = help_document(&config, &db, &message).unwrap();
+        assert!(command.footer[0].contains(&feature.commands[3]));
+        assert!(help_text(&detail).contains("命令：1. /checkin"));
+        assert_eq!(
+            HelpPlugin.spec().commands,
+            &["/help", "/帮助", "/菜单", "帮助", "菜单"]
+        );
+    }
+
+    #[test]
+    fn help_visibility_is_account_and_scope_local_and_hidden_requires_superuser() {
+        let db = database();
+        let mut config = Config::default();
+        config.plugins.reminder.enabled = true;
+        config.plugins.native.superusers = vec![789];
+        let mut message = incoming("/帮助");
+        for plugin in ["wordle", "clock", "reminder"] {
+            disable(&db, &message, plugin);
+        }
+        let menu = help_document(&config, &db, &message).unwrap();
+        assert!(!menu.cards.iter().any(|c| c.title == "Wordle"));
+        assert!(
+            !menu
+                .footer
+                .iter()
+                .any(|f| f.contains("/clock") || f.contains("/remind"))
+        );
+        for scope in [
+            Scope {
+                bot_id: 999,
+                ..message.key.scope.clone()
+            },
+            Scope {
+                peer_id: 999,
+                ..message.key.scope.clone()
+            },
+            Scope {
+                scene: Scene::Friend,
+                ..message.key.scope.clone()
+            },
+        ] {
+            let mut other = message.clone();
+            other.key.scope = scope;
+            let menu = help_document(&config, &db, &other).unwrap();
+            assert!(menu.cards.iter().any(|c| c.title == "Wordle"));
+            assert!(menu.footer.iter().any(|f| f.contains("/clock")));
+            if other.key.scope.scene == Scene::Friend {
+                assert!(!menu.cards.iter().any(|c| c.title == "鹿管签到"));
+            }
+        }
+        message.text = "/帮助 -H".into();
+        message.sender_id = 555;
+        assert!(help_document(&config, &db, &message).is_err());
+        message.sender_id = 789;
+        let hidden = help_document(&config, &db, &message).unwrap();
+        assert!(
+            hidden
+                .cards
+                .iter()
+                .find(|c| c.title == "Wordle")
+                .unwrap()
+                .badges
+                .contains(&"本会话关闭".into())
+        );
+        assert!(
+            hidden
+                .cards
+                .iter()
+                .find(|c| c.title == "戳一戳")
+                .unwrap()
+                .badges
+                .contains(&"已关闭".into())
+        );
+        message.key.scope.scene = Scene::Friend;
+        message.text = "/帮助 鹿管签到 --show-hidden".into();
+        let hidden = help_document(&config, &db, &message).unwrap();
+        assert!(hidden.cards[0].badges.contains(&"仅限群聊".into()));
+    }
+
+    #[test]
+    fn help_numeric_errors_do_not_fall_through_to_substring_matches() {
+        let db = database();
+        let mut config = Config::default();
+        config.nonebot.enabled = true;
+        config.nonebot.plugins = vec![crate::config::ExternalPluginConfig {
+            id: "nb_tool0".into(),
+            name: "扩展0".into(),
+            commands: vec!["/tool0".into(), "/tool999".into()],
+            enabled: true,
+            ..Default::default()
+        }];
+        for number in ["0", "999", "99999999999999999999999999999999999999"] {
+            let message = incoming(&format!("/帮助 {number}"));
+            let document = help_document(&config, &db, &message).unwrap();
+            assert!(document.cards.is_empty());
+            assert!(help_text(&document).contains("未找到对应功能"));
+            let message = incoming(&format!("/帮助 nb_tool0 {number}"));
+            let document = help_document(&config, &db, &message).unwrap();
+            assert_eq!(document.cards.len(), 1);
+            assert_eq!(document.footer[0], "没有找到该命令入口。");
+        }
+        let message = incoming("/帮助 NB_TOOL0 tool999");
+        let document = help_document(&config, &db, &message).unwrap();
+        assert!(document.footer[0].contains("入口：/tool999"));
+    }
+
+    #[tokio::test]
+    async fn help_missing_font_preserves_complete_text_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.plugins.ai.enabled = false;
+        config.plugins.native.enabled = vec!["help".into(), "checkin".into()];
+        config.plugins.native.image_font_path = temp
+            .path()
+            .join("missing-font.ttf")
+            .to_string_lossy()
+            .into();
+        config.app.database = temp.path().join("test.sqlite3").to_string_lossy().into();
+        config.nonebot.media_dir = temp.path().join("media").to_string_lossy().into();
+        let host = crate::host::Host::create(config).await.unwrap();
+        let message = incoming("/帮助 鹿管签到");
+        let expected = HelpPlugin.command(&host, &message).await.unwrap();
+        let reply = HelpPlugin.reply(&host, &message).await.unwrap();
+        assert_eq!(reply, crate::types::OutgoingMessage::text(expected.clone()));
+        assert!(expected.contains("/禁鹿"));
+        assert!(expected.contains("/鹿帮助"));
+        host.cancel.cancel();
+        host.store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn help_reply_publishes_png_pages_from_real_catalog() {
+        let font = std::env::var("QKBOT_TEST_FONT").ok().or_else(|| {
+            [
+                "C:/Windows/Fonts/msyh.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            ]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .map(str::to_owned)
+        });
+        let Some(font) = font else {
+            eprintln!("help image integration skipped: no CJK font");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.plugins.ai.enabled = false;
+        config.plugins.native.image_font_path = font;
+        config.app.database = temp.path().join("test.sqlite3").to_string_lossy().into();
+        config.nonebot.media_dir = temp.path().join("media").to_string_lossy().into();
+        let host = crate::host::Host::create(config).await.unwrap();
+        let reply = HelpPlugin.reply(&host, &incoming("/帮助")).await.unwrap();
+        assert!(!reply.segments.is_empty());
+        assert!(reply.segments.iter().all(|segment| matches!(segment,
+            crate::types::OutgoingSegment::Image { uri, .. } if uri.contains("/native-media/")
+        )));
+        let files = std::fs::read_dir(temp.path().join("media/native/temporary"))
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(files.len(), reply.segments.len());
+        for file in files {
+            let bytes = std::fs::read(file.path()).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!(image.width(), 1080);
+            assert!(image.height() <= 2200);
+        }
+        host.cancel.cancel();
+        host.store.stop().await.unwrap();
     }
 }

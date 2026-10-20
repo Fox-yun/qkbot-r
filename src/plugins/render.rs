@@ -1,4 +1,7 @@
 //! Small CPU renderer: no browser process, HTML engine, or permanently loaded glyph atlas.
+mod help;
+pub use help::{HelpCard, HelpDocument, help};
+
 use super::native::NativeView;
 use crate::{host::Host, types::OutgoingMessage};
 use ab_glyph::{Font as _, FontArc, FontVec, point};
@@ -224,12 +227,12 @@ impl Canvas {
         color: [u8; 3],
         width: u32,
     ) -> u32 {
-        let mut left = x as f32;
+        let mut left = 0.;
         let mut top = y;
         let line = (size * 1.45).ceil() as u32;
         for ch in text.chars().take(10_000) {
             if ch == '\n' {
-                left = x as f32;
+                left = 0.;
                 top += line;
                 continue;
             }
@@ -238,14 +241,14 @@ impl Canvas {
             }
             let glyph = self.glyphs.borrow_mut().get(&self.font, ch, size);
             let metrics = glyph.metrics;
-            if left + metrics.advance_width > (x + width) as f32 {
-                left = x as f32;
+            if left + metrics.advance_width > width as f32 {
+                left = 0.;
                 top += line;
             }
             if top + line > self.height {
                 break;
             }
-            let base_x = left as i32 + metrics.xmin;
+            let base_x = x as i32 + left as i32 + metrics.xmin;
             let base_y = top as i32 + size as i32 - metrics.height as i32 - metrics.ymin;
             for gy in 0..metrics.height {
                 for gx in 0..metrics.width {
@@ -592,6 +595,26 @@ mod tests {
             Err(error) => {
                 eprintln!("render samples skipped: {error}");
                 None
+            }
+        }
+    }
+    #[test]
+    fn text_height_matches_render_at_fractional_wrap_boundaries() {
+        let Some(font) = available_font() else { return };
+        let mut canvas = Canvas::new(1100, 4000, font.clone()).unwrap();
+        // Quantize an accumulated advance to an integer width, then test both
+        // sides of that boundary at different absolute drawing coordinates.
+        for ch in ['W', 'i', '中', '0'] {
+            for size in [17., 21., 24.5] {
+                let text = ch.to_string().repeat(30);
+                let boundary = (advance(&font, ch, size) * 10.).round() as u32;
+                for width in [boundary.saturating_sub(1), boundary, boundary + 1] {
+                    let expected = canvas.text_height(&text, size, width);
+                    for x in [0, 50, 311] {
+                        let bottom = canvas.text(&text, x, 17, size, [0; 3], width);
+                        assert_eq!(bottom - 17, expected, "{ch} / {size} / {width} / {x}");
+                    }
+                }
             }
         }
     }
