@@ -206,6 +206,48 @@ pub struct BatchUpdate {
     pub changes: Vec<MemoryChange>,
 }
 
+/// Some compatible model providers wrap otherwise valid JSON in Markdown.
+/// Only remove one complete outer fence; the JSON and schema remain strict.
+pub(crate) fn parse_batch_update(content: &str) -> Result<BatchUpdate> {
+    let content = content.trim();
+    let json = if let Some(fenced) = content.strip_prefix("```") {
+        let (language, remainder) = fenced
+            .split_once('\n')
+            .context("memory response code block has no opening line break")?;
+        ensure!(
+            language.trim().is_empty() || language.trim().eq_ignore_ascii_case("json"),
+            "memory response code block must contain JSON"
+        );
+        let (body, closing) = remainder
+            .rsplit_once('\n')
+            .context("memory response code block is not closed")?;
+        ensure!(
+            closing.trim() == "```",
+            "memory response code block must end at its closing fence"
+        );
+        body
+    } else {
+        content
+    };
+    // Deserialize directly into the DTO. An intermediate Value would silently
+    // discard duplicate object fields before the schema could reject them.
+    serde_json::from_str(json).map_err(|error| {
+        let category = match error.classify() {
+            serde_json::error::Category::Io => "io",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "schema",
+            serde_json::error::Category::Eof => "incomplete",
+        };
+        // Provider text and unknown field names can contain private content.
+        // Report only a fixed category and numeric location.
+        anyhow::anyhow!(
+            "invalid memory response JSON: {category} at line {}, column {}",
+            error.line(),
+            error.column()
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemoryChange {
@@ -1296,6 +1338,113 @@ pub fn build_context(mut input: ContextInput, max_input_tokens: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_parser_accepts_plain_json_or_one_complete_json_fence() {
+        let json = r#"{"summary":"用户7喜欢白茶","changes":[{"op":"upsert","id":null,"subject_id":7,"kind":"preference","text":"喜欢白茶","evidence":[{"source_key":"1:group:2:3","quote":"喜欢白茶"}],"ttl_days":null}]}"#;
+        for input in [
+            json.to_owned(),
+            format!(" \n{json}\r\n "),
+            format!("```json\n{json}\n```"),
+            format!("```JSON\r\n{json}\r\n```\r\n"),
+            format!("```\n{json}\n```"),
+            format!(" \n```Json \r\n\n{json}\n\r\n``` \n"),
+        ] {
+            let parsed = parse_batch_update(&input).unwrap();
+            assert_eq!(parsed.summary, "用户7喜欢白茶");
+            assert_eq!(parsed.changes.len(), 1);
+            assert!(matches!(
+                &parsed.changes[0],
+                MemoryChange::Upsert { subject_id: 7, evidence, .. }
+                    if evidence[0].source_key == "1:group:2:3" && evidence[0].quote == "喜欢白茶"
+            ));
+        }
+        // JSON string contents are data, even if they mention Markdown fences.
+        let parsed = parse_batch_update(
+            "```json\n{\"summary\":\"提到 ```json 和 ``` 的原文\",\"changes\":[]}\n```",
+        )
+        .unwrap();
+        assert_eq!(parsed.summary, "提到 ```json 和 ``` 的原文");
+        // Preserve the existing optional changes field rather than changing DTO semantics.
+        assert!(
+            parse_batch_update(r#"{"summary":""}"#)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_parser_rejects_partial_multiple_or_explained_json() {
+        for input in [
+            "",
+            "```json",
+            "```json\n{\"summary\":\"\"}",
+            "```json {\"summary\":\"\"}```",
+            "```yaml\n{\"summary\":\"\"}\n```",
+            "```json extra\n{\"summary\":\"\"}\n```",
+            "说明：{\"summary\":\"\"}",
+            "{\"summary\":\"\"}\n以上是摘要。",
+            "说明：\n```json\n{\"summary\":\"\"}\n```",
+            "```json\n{\"summary\":\"\"}\n```\n以上是摘要。",
+            "```json\n{\"summary\":\"\"}\n```\n```json\n{\"summary\":\"\"}\n```",
+            "{\"summary\":\"\"}{\"summary\":\"\"}",
+            "```json\n{\"summary\":\"\"}{\"summary\":\"\"}\n```",
+            "{\"summary\":\"truncated",
+            "```json\n{\"summary\":\"truncated\n```",
+            "```json\n{\"summary\":\"\",}\n```",
+        ] {
+            assert!(
+                parse_batch_update(input).is_err(),
+                "unexpected accepted format"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_parser_preserves_schema_and_duplicate_field_rejection() {
+        for json in [
+            "[]",
+            "null",
+            r#"{"changes":[]}"#,
+            r#"{"summary":null,"changes":[]}"#,
+            r#"{"summary":"","changes":null}"#,
+            r#"{"summary":"","changes":{} }"#,
+            r#"{"summary":"","changes":[],"unexpected":"value"}"#,
+            r#"{"summary":"","summary":"duplicate","changes":[]}"#,
+            r#"{"summary":"","changes":[],"changes":[]}"#,
+            r#"{"summary":"","changes":[{"op":"forget","id":1}]}"#,
+            r#"{"summary":"","changes":[{"op":"upsert","subject_id":"7","kind":"fact","text":"事实","evidence":[]}]}"#,
+            r#"{"summary":"","changes":[{"op":"upsert","subject_id":7,"subject_id":8,"kind":"fact","text":"事实","evidence":[]}]}"#,
+            r#"{"summary":"","changes":[{"op":"upsert","subject_id":7,"kind":"unknown","text":"事实","evidence":[]}]}"#,
+            r#"{"summary":"","changes":[{"op":"upsert","subject_id":7,"kind":"fact","text":"事实","evidence":[{"source_key":"source","quote":"事实","extra":true}]}]}"#,
+            r#"{"summary":"","changes":[{"op":"upsert","subject_id":7,"kind":"fact","text":"事实","evidence":[{"source_key":"source","quote":"事实","quote":"重复"}]}]}"#,
+        ] {
+            assert!(
+                parse_batch_update(json).is_err(),
+                "schema unexpectedly accepted"
+            );
+            assert!(
+                parse_batch_update(&format!("```json\n{json}\n```")).is_err(),
+                "fencing must not weaken validation"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_parser_errors_do_not_echo_provider_content() {
+        let marker = "private-provider-content";
+        for input in [
+            format!(r#"{{"summary":"","{marker}":"sensitive"}}"#),
+            format!(r#"{{"summary":"","changes":[{{"op":"{marker}"}}]}}"#),
+            format!("```{marker}\n{{\"summary\":\"\"}}\n```"),
+        ] {
+            let error = parse_batch_update(&input).unwrap_err().to_string();
+            assert!(!error.contains(marker));
+            assert!(!error.contains("sensitive"));
+        }
+    }
+
     fn commit_batch(db: &mut Connection, batch: MemoryBatch, update: BatchUpdate) -> Result<()> {
         commit_batch_with_limit(db, batch, update, 256)
     }

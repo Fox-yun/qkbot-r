@@ -1,6 +1,9 @@
 use super::{
     Conversation,
-    memory::{BatchUpdate, ContextInput, SummaryRepair, build_context, validate_summary},
+    memory::{
+        BatchUpdate, ContextInput, SummaryRepair, build_context, parse_batch_update,
+        validate_summary,
+    },
 };
 use crate::{
     host::Host,
@@ -698,11 +701,15 @@ impl Chat {
         else {
             return Ok(MaintenanceOutcome::Unavailable);
         };
-        let update: BatchUpdate = serde_json::from_str(
+        let update = parse_batch_update(
             response.message["content"]
                 .as_str()
                 .context("memory_response_text_missing")?,
         )
+        .inspect_err(|error| {
+            // The parser exposes only fixed classifications and positions.
+            tracing::warn!(parse_error=%error, "memory response format rejected");
+        })
         .context("decode_memory_response")?;
         if self
             .background_valid(&background, bot_id)
@@ -779,11 +786,14 @@ impl Chat {
             let Some(response) = self.background_response(input, background, bot_id).await? else {
                 return Ok(MaintenanceOutcome::Unavailable);
             };
-            let value: BatchUpdate = serde_json::from_str(
+            let value = parse_batch_update(
                 response.message["content"]
                     .as_str()
                     .context("repair_response_text_missing")?,
-            )?;
+            )
+            .inspect_err(|error| {
+                tracing::warn!(parse_error=%error, "summary repair response format rejected");
+            })?;
             ensure!(
                 value.changes.is_empty(),
                 "summary_repair_must_not_change_facts"
