@@ -2,756 +2,907 @@
   {
     "kind": "drink",
     "name": "书亦烧仙草",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E4%B9%A6%E4%BA%A6%E7%83%A7%E4%BB%99%E8%8D%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E4%B9%A6%E4%BA%A6%E7%83%A7%E4%BB%99%E8%8D%89.jpg",
+    "sha256": "9f5769992e32d4594d640b0604be7fb6c8f716aaa18e82b0e9bf4fc87265c832"
   },
   {
     "kind": "drink",
     "name": "冰摇桃桃乌龙茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E6%A1%83%E6%A1%83%E4%B9%8C%E9%BE%99%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E6%A1%83%E6%A1%83%E4%B9%8C%E9%BE%99%E8%8C%B6.jpg",
+    "sha256": "76fe14cec0aeefc583dfe045e8b33a6f239637e96aa26977c1f446f0299a6532"
   },
   {
     "kind": "drink",
     "name": "冰摇红莓黑加仑茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E7%BA%A2%E8%8E%93%E9%BB%91%E5%8A%A0%E4%BB%91%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E7%BA%A2%E8%8E%93%E9%BB%91%E5%8A%A0%E4%BB%91%E8%8C%B6.jpg",
+    "sha256": "469efaf84437bb728ee18153c5b265afcb8fe3d556dc08dc6ce20490998dcff8"
   },
   {
     "kind": "drink",
     "name": "冰摇芒果花草茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E8%8A%92%E6%9E%9C%E8%8A%B1%E8%8D%89%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%91%87%E8%8A%92%E6%9E%9C%E8%8A%B1%E8%8D%89%E8%8C%B6.jpg",
+    "sha256": "3d063aa39979c5d77aae9e97b43cfc648392b858d004cb4919f08553a10a8144"
   },
   {
     "kind": "drink",
     "name": "冰淇淋红茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%B7%87%E6%B7%8B%E7%BA%A2%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E6%B7%87%E6%B7%8B%E7%BA%A2%E8%8C%B6.jpg",
+    "sha256": "febb3d2237081ff80f4fcccbc8cb71e7e721bca552e73522af7117cbc7986baf"
   },
   {
     "kind": "drink",
     "name": "冰鲜柠檬水",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E9%B2%9C%E6%9F%A0%E6%AA%AC%E6%B0%B4.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B0%E9%B2%9C%E6%9F%A0%E6%AA%AC%E6%B0%B4.jpg",
+    "sha256": "0d8858272e6f7611a164123e2ea55d266a75f45f75084317f014e95918afd383"
   },
   {
     "kind": "drink",
     "name": "冷萃浮乐朵",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B7%E8%90%83%E6%B5%AE%E4%B9%90%E6%9C%B5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%86%B7%E8%90%83%E6%B5%AE%E4%B9%90%E6%9C%B5.jpg",
+    "sha256": "f5e7597c5d0674766185a5cdec8f447528e61111d99785fe9fbde4781a7179ef"
   },
   {
     "kind": "drink",
     "name": "凉白开",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%87%89%E7%99%BD%E5%BC%80.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%87%89%E7%99%BD%E5%BC%80.jpg",
+    "sha256": "19b2de2f09f483dd8f1ff75832eb439537eb168cdfd62424bfff632e32442d3a"
   },
   {
     "kind": "drink",
     "name": "卡布奇诺",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8D%A1%E5%B8%83%E5%A5%87%E8%AF%BA.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8D%A1%E5%B8%83%E5%A5%87%E8%AF%BA.jpg",
+    "sha256": "fd3374cfec57a96529cda23c5bc4f626e43ba2ad11019f7ab6f6698db57303af"
   },
   {
     "kind": "drink",
     "name": "双拼奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8F%8C%E6%8B%BC%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8F%8C%E6%8B%BC%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "47f55e3c16215f48a2156235587abbcff116fc5bf4fe29a17f25ed4d49bb404d"
   },
   {
     "kind": "drink",
     "name": "可口可乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E4%B9%90.jpg",
+    "sha256": "3ca7229decd01c89e86d3c1f677148b4c2da26a0059174acb954420c1fe03f0b"
   },
   {
     "kind": "drink",
     "name": "吃土摇摇奶昔",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%90%83%E5%9C%9F%E6%91%87%E6%91%87%E5%A5%B6%E6%98%94.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%90%83%E5%9C%9F%E6%91%87%E6%91%87%E5%A5%B6%E6%98%94.jpg",
+    "sha256": "0d6b276306797f17b10803cb948324e0ec1988d653a917f31c70af11f96898d1"
   },
   {
     "kind": "drink",
     "name": "喜茶轻芒芒甘露",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%96%9C%E8%8C%B6%E8%BD%BB%E8%8A%92%E8%8A%92%E7%94%98%E9%9C%B2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%96%9C%E8%8C%B6%E8%BD%BB%E8%8A%92%E8%8A%92%E7%94%98%E9%9C%B2.jpg",
+    "sha256": "1ecd554d586ca4ccea4b036ef3be2ae06366094c547cc23ed57efffdbec590bc"
   },
   {
     "kind": "drink",
     "name": "四季春燕麦奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E7%87%95%E9%BA%A6%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E7%87%95%E9%BA%A6%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "f15cbdc73202bbb85eddddce5dd68f8b74efb3e0f4c3d735bbf54f5b3bcb47b2"
   },
   {
     "kind": "drink",
     "name": "四季春珍珠奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "18276ffde8db15c782c2c03e8c2e9217a90efb16a2f8dbdd6e402c22b966f03b"
   },
   {
     "kind": "drink",
     "name": "四季春茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%9B%9B%E5%AD%A3%E6%98%A5%E8%8C%B6.jpg",
+    "sha256": "0959f8ba3d8484e3ec68ff5a07b49051ae20b05ae2aedfa5e64b0b4870dd4bc2"
   },
   {
     "kind": "drink",
     "name": "奥利奥味雪王大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%A5%A5%E5%88%A9%E5%A5%A5%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%A5%A5%E5%88%A9%E5%A5%A5%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "12b25231fe5c2601dabdd665da397b9ca11dc7ef0519f8680c41f230ab8cdcaa"
   },
   {
     "kind": "drink",
     "name": "奥利奥大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%A5%A5%E5%88%A9%E5%A5%A5%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E5%A5%A5%E5%88%A9%E5%A5%A5%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "a873339ce1ffd7fb3bf9ac8a72385305779b473d7ee230c73fd74526e077c889"
   },
   {
     "kind": "drink",
     "name": "抹茶星冰乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8A%B9%E8%8C%B6%E6%98%9F%E5%86%B0%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8A%B9%E8%8C%B6%E6%98%9F%E5%86%B0%E4%B9%90.jpg",
+    "sha256": "95b0421f2e87dc03f582a20cf3f5d3fccb94a460767402b7b14cce46c614252f"
   },
   {
     "kind": "drink",
     "name": "抹茶红豆拿铁",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8A%B9%E8%8C%B6%E7%BA%A2%E8%B1%86%E6%8B%BF%E9%93%81.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8A%B9%E8%8C%B6%E7%BA%A2%E8%B1%86%E6%8B%BF%E9%93%81.jpg",
+    "sha256": "76ef5fcf56585c76e50e2437766550e99dd7925cf4124211d258a34fc07b0cf6"
   },
   {
     "kind": "drink",
     "name": "招牌芋圆奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8B%9B%E7%89%8C%E8%8A%8B%E5%9C%86%E5%A5%B6%E8%8C%B6.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%8B%9B%E7%89%8C%E8%8A%8B%E5%9C%86%E5%A5%B6%E8%8C%B6.png",
+    "sha256": "f01aba9dd82bc45c7f7b2f892e35d3396151a40673e6095577d0c9b3e629f247"
   },
   {
     "kind": "drink",
     "name": "摩卡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1.jpg",
+    "sha256": "305b933fb36d009ddb7818747647dad5e03052923b630f320498272b5421c1e5"
   },
   {
     "kind": "drink",
     "name": "摩卡可可碎片星冰乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1%E5%8F%AF%E5%8F%AF%E7%A2%8E%E7%89%87%E6%98%9F%E5%86%B0%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1%E5%8F%AF%E5%8F%AF%E7%A2%8E%E7%89%87%E6%98%9F%E5%86%B0%E4%B9%90.jpg",
+    "sha256": "d54430f3d174563910e21076bcccca8cbde3496c1e267fca92019720937f7235"
   },
   {
     "kind": "drink",
     "name": "摩卡星冰乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1%E6%98%9F%E5%86%B0%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%91%A9%E5%8D%A1%E6%98%9F%E5%86%B0%E4%B9%90.jpg",
+    "sha256": "68c251057668ff507a8b8598071ba24eac87ae6abcf9cc2488de6148f50a86c9"
   },
   {
     "kind": "drink",
     "name": "晨露抹茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%99%A8%E9%9C%B2%E6%8A%B9%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%99%A8%E9%9C%B2%E6%8A%B9%E8%8C%B6.jpg",
+    "sha256": "7a01e934eca5287bf7592c1f5a98acc37a77e546b36c552abbc4a18cd32ce48d"
   },
   {
     "kind": "drink",
     "name": "杨枝甘露",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9D%A8%E6%9E%9D%E7%94%98%E9%9C%B2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9D%A8%E6%9E%9D%E7%94%98%E9%9C%B2.jpg",
+    "sha256": "b4fffbc418ced9baab50aa95ba37603d200ba4b3742c34d24ddeb8dd6835016a"
   },
   {
     "kind": "drink",
     "name": "杨枝甘露烧仙草",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9D%A8%E6%9E%9D%E7%94%98%E9%9C%B2%E7%83%A7%E4%BB%99%E8%8D%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9D%A8%E6%9E%9D%E7%94%98%E9%9C%B2%E7%83%A7%E4%BB%99%E8%8D%89.jpg",
+    "sha256": "903355c8925267d9c00221c73b4f31e83600370429b393d5e427ab9a7e3cfd7c"
   },
   {
     "kind": "drink",
     "name": "柠檬红茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9F%A0%E6%AA%AC%E7%BA%A2%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9F%A0%E6%AA%AC%E7%BA%A2%E8%8C%B6.jpg",
+    "sha256": "fb99788781f70fd2745bda80cc5c2cabe9e5055ff88dad297e0b97b8fe1be7e4"
   },
   {
     "kind": "drink",
     "name": "柠檬芦荟茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9F%A0%E6%AA%AC%E8%8A%A6%E8%8D%9F%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%9F%A0%E6%AA%AC%E8%8A%A6%E8%8D%9F%E8%8C%B6.jpg",
+    "sha256": "125574448700bbec027bf3f77ec50c0890562d2f290b3293dfffb7f6c1ad62f0"
   },
   {
     "kind": "drink",
     "name": "桂花酒酿",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%82%E8%8A%B1%E9%85%92%E9%85%BF.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%82%E8%8A%B1%E9%85%92%E9%85%BF.png",
+    "sha256": "27d5638268c82ccbd0d25c0d6543a408de90b2afcd0c20608202ff8117188b3a"
   },
   {
     "kind": "drink",
     "name": "桃气乌龙奶芙",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%83%E6%B0%94%E4%B9%8C%E9%BE%99%E5%A5%B6%E8%8A%99.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%83%E6%B0%94%E4%B9%8C%E9%BE%99%E5%A5%B6%E8%8A%99.jpg",
+    "sha256": "17efdeb13c4a185ba0b29371ad06276715f2df6cef3ec6712abf2afb605b3f28"
   },
   {
     "kind": "drink",
     "name": "桃气乌龙豆乳",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%83%E6%B0%94%E4%B9%8C%E9%BE%99%E8%B1%86%E4%B9%B3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A1%83%E6%B0%94%E4%B9%8C%E9%BE%99%E8%B1%86%E4%B9%B3.jpg",
+    "sha256": "93707509d6cfe326bd81f6c59ba3eca0da53524a22f52e520d1f2c3b22cd6f4b"
   },
   {
     "kind": "drink",
     "name": "梨光清润路芭茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A2%A8%E5%85%89%E6%B8%85%E6%B6%A6%E8%B7%AF%E8%8A%AD%E8%8C%B6.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A2%A8%E5%85%89%E6%B8%85%E6%B6%A6%E8%B7%AF%E8%8A%AD%E8%8C%B6.png",
+    "sha256": "f404e049084cb7a92f6d220d1e20b40d73f1c2fa9da11550ea9823dfd1c07ec0"
   },
   {
     "kind": "drink",
     "name": "棒打鲜橙",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A3%92%E6%89%93%E9%B2%9C%E6%A9%99.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A3%92%E6%89%93%E9%B2%9C%E6%A9%99.jpg",
+    "sha256": "29da4214e78d4f2fe3bc79d36d1017f135ecc2d7fde1eb7d70db935bb01202e1"
   },
   {
     "kind": "drink",
     "name": "椰乳芋泥茫茫",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A4%B0%E4%B9%B3%E8%8A%8B%E6%B3%A5%E8%8C%AB%E8%8C%AB.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A4%B0%E4%B9%B3%E8%8A%8B%E6%B3%A5%E8%8C%AB%E8%8C%AB.jpg",
+    "sha256": "bcab310ee88c3ccaa0e7d6f30e66c5bcfb3375c78f3fb436b89ad8010b1406c1"
   },
   {
     "kind": "drink",
     "name": "榛果风味拿铁",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A6%9B%E6%9E%9C%E9%A3%8E%E5%91%B3%E6%8B%BF%E9%93%81.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A6%9B%E6%9E%9C%E9%A3%8E%E5%91%B3%E6%8B%BF%E9%93%81.jpg",
+    "sha256": "1b8109df6ea29476eb0e9a4cb86c8f4cf45b520045be31f756685c157cc94167"
   },
   {
     "kind": "drink",
     "name": "橙柚派对",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A9%99%E6%9F%9A%E6%B4%BE%E5%AF%B9.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%A9%99%E6%9F%9A%E6%B4%BE%E5%AF%B9.jpg",
+    "sha256": "ccbc112a6a369265b83f211438fcff1a6870a4d8e328585bdd0dcbd098dee3e8"
   },
   {
     "kind": "drink",
     "name": "气炫冰山美式",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%B0%94%E7%82%AB%E5%86%B0%E5%B1%B1%E7%BE%8E%E5%BC%8F.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%B0%94%E7%82%AB%E5%86%B0%E5%B1%B1%E7%BE%8E%E5%BC%8F.jpg",
+    "sha256": "ababa6222d42fb147f872fccc14a1994813115ceea4a9720ccdde85f7363b365"
   },
   {
     "kind": "drink",
     "name": "浓缩咖啡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%B5%93%E7%BC%A9%E5%92%96%E5%95%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%B5%93%E7%BC%A9%E5%92%96%E5%95%A1.jpg",
+    "sha256": "b994fe5c2fa81693e8edc08b5dd1deb68d01ed55e89fed9df382053663321bc1"
   },
   {
     "kind": "drink",
     "name": "满杯橙海粒",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%BB%A1%E6%9D%AF%E6%A9%99%E6%B5%B7%E7%B2%92.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E6%BB%A1%E6%9D%AF%E6%A9%99%E6%B5%B7%E7%B2%92.jpg",
+    "sha256": "9c0e9bfdcf05b19d5e1e905d5fb1a92f602a8fbb578d9129e66bfa6968790ebf"
   },
   {
     "kind": "drink",
     "name": "烤奶珍珠奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%83%A4%E5%A5%B6%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%83%A4%E5%A5%B6%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "cda3d4ba0224ac501018b11a5f486668327ac882f2da48709c7310dba10360d0"
   },
   {
     "kind": "drink",
     "name": "焦糖浓缩咖啡星冰乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E6%B5%93%E7%BC%A9%E5%92%96%E5%95%A1%E6%98%9F%E5%86%B0%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E6%B5%93%E7%BC%A9%E5%92%96%E5%95%A1%E6%98%9F%E5%86%B0%E4%B9%90.jpg",
+    "sha256": "e11d3d45f45a1143bb8af5285906011da411c06d561562dccfc6a2c052e42b53"
   },
   {
     "kind": "drink",
     "name": "焦糖玛奇朵",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E7%8E%9B%E5%A5%87%E6%9C%B5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E7%8E%9B%E5%A5%87%E6%9C%B5.jpg",
+    "sha256": "de8e93794a1547919016b99bd94fa69b8e69d5107c537d0ad49abc7ab0490349"
   },
   {
     "kind": "drink",
     "name": "焦糖珍珠",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E7%8F%8D%E7%8F%A0.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%84%A6%E7%B3%96%E7%8F%8D%E7%8F%A0.jpg",
+    "sha256": "817c3b2e9275a6b25a5e6915d91c564b288fbf176c4763eeddecd18104ba6892"
   },
   {
     "kind": "drink",
     "name": "牛魔王黑砖奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%89%9B%E9%AD%94%E7%8E%8B%E9%BB%91%E7%A0%96%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%89%9B%E9%AD%94%E7%8E%8B%E9%BB%91%E7%A0%96%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "1162b5a93aab73b81a565077e16cc377e547ddf6d88ed6353ccef91d96bc371a"
   },
   {
     "kind": "drink",
     "name": "珍珠奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "422582b1f371bab2c85852534bb3f066a154dab613e9fa9bc4ae5176130d069d"
   },
   {
     "kind": "drink",
     "name": "百事可乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E4%BA%8B%E5%8F%AF%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E4%BA%8B%E5%8F%AF%E4%B9%90.jpg",
+    "sha256": "a9b806ebebca616750be40bf02fbfa9436851bbcb377f2e05211f867777e7b0f"
   },
   {
     "kind": "drink",
     "name": "百香凤梨",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E9%A6%99%E5%87%A4%E6%A2%A8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E9%A6%99%E5%87%A4%E6%A2%A8.jpg",
+    "sha256": "2accbc88f66644d95ff8bd4616674709611456478fe4fc3f1b6cc99eba364230"
   },
   {
     "kind": "drink",
     "name": "百香金菠萝",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E9%A6%99%E9%87%91%E8%8F%A0%E8%90%9D.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%99%BE%E9%A6%99%E9%87%91%E8%8F%A0%E8%90%9D.png",
+    "sha256": "effd78618031eb534f254b2afd87a003362b7c462e34f46a3b6225f6e35748e3"
   },
   {
     "kind": "drink",
     "name": "皇家九号奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%9A%87%E5%AE%B6%E4%B9%9D%E5%8F%B7%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%9A%87%E5%AE%B6%E4%B9%9D%E5%8F%B7%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "04c32fb6b0a0e137e7a4af2720edfb7270259b9838a1928265f07058b51a73de"
   },
   {
     "kind": "drink",
     "name": "红茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BA%A2%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BA%A2%E8%8C%B6.jpg",
+    "sha256": "a0db7cdcdde1aeb6a9cd8e0081148a0a04cb614114acfb71f96d397ce1affb95"
   },
   {
     "kind": "drink",
     "name": "红豆奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BA%A2%E8%B1%86%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BA%A2%E8%B1%86%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "bd24d9cca19cd315e49997d01268db20f977a1099be9b9a5079eac68134dd364"
   },
   {
     "kind": "drink",
     "name": "绿茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BB%BF%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BB%BF%E8%8C%B6.jpg",
+    "sha256": "ef05d45e4d15e4567f6f3017e502ea2d004f938d0eb5e2b8e628ee587ebc846c"
   },
   {
     "kind": "drink",
     "name": "美式咖啡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BE%8E%E5%BC%8F%E5%92%96%E5%95%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E7%BE%8E%E5%BC%8F%E5%92%96%E5%95%A1.jpg",
+    "sha256": "f2e1495f1360fc2b218e64cf55bd48953ae6e1900e34a3dad532fc8f2a466e5a"
   },
   {
     "kind": "drink",
     "name": "芋泥厚厚牛乳",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%8B%E6%B3%A5%E5%8E%9A%E5%8E%9A%E7%89%9B%E4%B9%B3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%8B%E6%B3%A5%E5%8E%9A%E5%8E%9A%E7%89%9B%E4%B9%B3.jpg",
+    "sha256": "746b7d97f34f08f6c65ebff0f2a54c874290c758547cab30efa0d9044277b377"
   },
   {
     "kind": "drink",
     "name": "芒果西番莲果茶星冰乐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%92%E6%9E%9C%E8%A5%BF%E7%95%AA%E8%8E%B2%E6%9E%9C%E8%8C%B6%E6%98%9F%E5%86%B0%E4%B9%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%92%E6%9E%9C%E8%A5%BF%E7%95%AA%E8%8E%B2%E6%9E%9C%E8%8C%B6%E6%98%9F%E5%86%B0%E4%B9%90.jpg",
+    "sha256": "c7bfe31bf96dbd8b4d345939617b3d0bc6a8f2e2c5ab09347fb6ac84c8bc27b1"
   },
   {
     "kind": "drink",
     "name": "芝士四季春",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%9B%9B%E5%AD%A3%E6%98%A5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%9B%9B%E5%AD%A3%E6%98%A5.jpg",
+    "sha256": "c69069f6abd33eddda3d2386722e7f5a81f62280f272b1e7cedca9850b58aa10"
   },
   {
     "kind": "drink",
     "name": "芝士奶盖四季春",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%A5%B6%E7%9B%96%E5%9B%9B%E5%AD%A3%E6%98%A5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%A5%B6%E7%9B%96%E5%9B%9B%E5%AD%A3%E6%98%A5.jpg",
+    "sha256": "c4d73f9e16baae92352f6d18d180267cf07de69006dc5a14a3f46b2467aea83c"
   },
   {
     "kind": "drink",
     "name": "芝士奶盖绿茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%A5%B6%E7%9B%96%E7%BB%BF%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E5%A5%B6%E7%9B%96%E7%BB%BF%E8%8C%B6.jpg",
+    "sha256": "8f0ebfa3013cd196002dafa94eafe6eb8f499748dac3138c2d1f2b0d913b4ce2"
   },
   {
     "kind": "drink",
     "name": "芝士抹茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E6%8A%B9%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E6%8A%B9%E8%8C%B6.jpg",
+    "sha256": "d8d985de5e2c6a041e21f2addbd0d9d26859bdf833278e6ad326058b010cc7fc"
   },
   {
     "kind": "drink",
     "name": "芝士鲜红茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E9%B2%9C%E7%BA%A2%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E9%B2%9C%E7%BA%A2%E8%8C%B6.jpg",
+    "sha256": "2c2fb7f16e47412a7ab3fdcd153f8353f3ee31adfd7884ce4462be802717cb81"
   },
   {
     "kind": "drink",
     "name": "芝士鲜绿茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E9%B2%9C%E7%BB%BF%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8A%9D%E5%A3%AB%E9%B2%9C%E7%BB%BF%E8%8C%B6.jpg",
+    "sha256": "81428d93794f1e3e7446220bab0b176b02a2668306a5907f027ec705ffd530d1"
   },
   {
     "kind": "drink",
     "name": "草莓味雪王大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8D%89%E8%8E%93%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8D%89%E8%8E%93%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "9420a106b5645ea510b65f13d5caad88af37dd864b35fd78bf7e4b421faa04c6"
   },
   {
     "kind": "drink",
     "name": "草莓雪王大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8D%89%E8%8E%93%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%8D%89%E8%8E%93%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "2edc20ce7bd18b9b3cacdd852ddaf28dccfe147788d4969296eb5064e7d89dab"
   },
   {
     "kind": "drink",
     "name": "葡萄柚绿茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%91%A1%E8%90%84%E6%9F%9A%E7%BB%BF%E8%8C%B6.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%91%A1%E8%90%84%E6%9F%9A%E7%BB%BF%E8%8C%B6.png",
+    "sha256": "852e0c46d1d0de219d9a2162e5bef5863b64268994f88a919f0dc53f65cee043"
   },
   {
     "kind": "drink",
     "name": "蓝莓味雪王大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E5%91%B3%E9%9B%AA%E7%8E%8B%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "c4b88453d13d913328c0ec11c3b924e3657507a14e860425f5ef8de277991a06"
   },
   {
     "kind": "drink",
     "name": "蓝莓大圣代",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E5%A4%A7%E5%9C%A3%E4%BB%A3.jpg",
+    "sha256": "a7367255a6422d311786a0e17d23bcc596c859bfd322bd1146d158995c7f9a4f"
   },
   {
     "kind": "drink",
     "name": "蓝莓摇摇奶昔",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E6%91%87%E6%91%87%E5%A5%B6%E6%98%94.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E6%91%87%E6%91%87%E5%A5%B6%E6%98%94.jpg",
+    "sha256": "30f65e818688cc64a11bc994167815570cefede893e39590d53d8ddd3d4038fb"
   },
   {
     "kind": "drink",
     "name": "蓝莓果粒茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E6%9E%9C%E7%B2%92%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%93%9D%E8%8E%93%E6%9E%9C%E7%B2%92%E8%8C%B6.jpg",
+    "sha256": "17b513cc409ab88bd700e1eed2c68aedf6fa5d83903a962afcf64e37c410e22b"
   },
   {
     "kind": "drink",
     "name": "蜂蜜柚子茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%9C%82%E8%9C%9C%E6%9F%9A%E5%AD%90%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%9C%82%E8%9C%9C%E6%9F%9A%E5%AD%90%E8%8C%B6.jpg",
+    "sha256": "eb62ae082e07f663b469b3536a5d8182d4153933f01dffaa5c89de3fa2f79a06"
   },
   {
     "kind": "drink",
     "name": "西北风",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%A5%BF%E5%8C%97%E9%A3%8E.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%A5%BF%E5%8C%97%E9%A3%8E.png",
+    "sha256": "91fb8b8e30ab6a15da90a8858d7740bcb73acee156dd35c50c044e46616a06ae"
   },
   {
     "kind": "drink",
     "name": "豆乳绵绵奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%B1%86%E4%B9%B3%E7%BB%B5%E7%BB%B5%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E8%B1%86%E4%B9%B3%E7%BB%B5%E7%BB%B5%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "8adef373044bfb699517ca7c59d169fe29cdf4ba497b7b48dd485a3c598a4e44"
   },
   {
     "kind": "drink",
     "name": "酒香沁乌龙",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%85%92%E9%A6%99%E6%B2%81%E4%B9%8C%E9%BE%99.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%85%92%E9%A6%99%E6%B2%81%E4%B9%8C%E9%BE%99.jpg",
+    "sha256": "cf263ff97ddea6c1dd2e4a3c20252649a7eb7e4163f3bc0b54f95d3690047c96"
   },
   {
     "kind": "drink",
     "name": "酸柠浮冷萃",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%85%B8%E6%9F%A0%E6%B5%AE%E5%86%B7%E8%90%83.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%85%B8%E6%9F%A0%E6%B5%AE%E5%86%B7%E8%90%83.jpg",
+    "sha256": "00a231767fc8c37272abd19f81722e115b2b1d56fa5bac68e74cd00657ccc60f"
   },
   {
     "kind": "drink",
     "name": "醋意桃桃",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%86%8B%E6%84%8F%E6%A1%83%E6%A1%83.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%86%8B%E6%84%8F%E6%A1%83%E6%A1%83.jpg",
+    "sha256": "93f4d333cc01ada06a8c94d31f1c55c35d2f41fb1e186d48a343337478491388"
   },
   {
     "kind": "drink",
     "name": "阿馥奇朵",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%98%BF%E9%A6%A5%E5%A5%87%E6%9C%B5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%98%BF%E9%A6%A5%E5%A5%87%E6%9C%B5.jpg",
+    "sha256": "c40b97c2bccbc384071482537d46a4a34333418bcae4651b25d0b23b445142f4"
   },
   {
     "kind": "drink",
     "name": "香草风味拿铁",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A6%99%E8%8D%89%E9%A3%8E%E5%91%B3%E6%8B%BF%E9%93%81.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A6%99%E8%8D%89%E9%A3%8E%E5%91%B3%E6%8B%BF%E9%93%81.jpg",
+    "sha256": "0d3e2a52d19852a521eb4806b0f788fa16175085f73a497145817ba0a1950330"
   },
   {
     "kind": "drink",
     "name": "馥芮白",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A6%A5%E8%8A%AE%E7%99%BD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A6%A5%E8%8A%AE%E7%99%BD.jpg",
+    "sha256": "11b97f9905632335d331cf1f081248c72a74990c4e08edc38c3944add70cf090"
   },
   {
     "kind": "drink",
     "name": "马来西亚白咖啡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A9%AC%E6%9D%A5%E8%A5%BF%E4%BA%9A%E7%99%BD%E5%92%96%E5%95%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%A9%AC%E6%9D%A5%E8%A5%BF%E4%BA%9A%E7%99%BD%E5%92%96%E5%95%A1.jpg",
+    "sha256": "c7295f636657011353b5e1db9cc67f583ef28cca50ac0b3a29ae6f1aadaf7588"
   },
   {
     "kind": "drink",
     "name": "鲜橙葡萄柚",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B2%9C%E6%A9%99%E8%91%A1%E8%90%84%E6%9F%9A.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B2%9C%E6%A9%99%E8%91%A1%E8%90%84%E6%9F%9A.jpg",
+    "sha256": "83a89b032d09cf7a1221edcfdb2008e340629d5ee361e33a1b275c7d61fb7fa5"
   },
   {
     "kind": "drink",
     "name": "鲜芒果绿茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B2%9C%E8%8A%92%E6%9E%9C%E7%BB%BF%E8%8C%B6.png"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B2%9C%E8%8A%92%E6%9E%9C%E7%BB%BF%E8%8C%B6.png",
+    "sha256": "767ce2589e273e121756e8b0bb08f12096b05b1eaf692e2ce96b6ba536c02f28"
   },
   {
     "kind": "drink",
     "name": "鹿丸可可鲜奶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B9%BF%E4%B8%B8%E5%8F%AF%E5%8F%AF%E9%B2%9C%E5%A5%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%B9%BF%E4%B8%B8%E5%8F%AF%E5%8F%AF%E9%B2%9C%E5%A5%B6.jpg",
+    "sha256": "8f8326e7dd900040c6ae6cb914db38e3ddd09a19ca08d310ed387dafd4e1e7c0"
   },
   {
     "kind": "drink",
     "name": "麦芽雪冷萃",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BA%A6%E8%8A%BD%E9%9B%AA%E5%86%B7%E8%90%83.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BA%A6%E8%8A%BD%E9%9B%AA%E5%86%B7%E8%90%83.jpg",
+    "sha256": "3c5ff58618eb69469a5fb39c59b43fe803d03510f5f6ae4031aea5f3ac247445"
   },
   {
     "kind": "drink",
     "name": "黑巧橙香乌龙",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BB%91%E5%B7%A7%E6%A9%99%E9%A6%99%E4%B9%8C%E9%BE%99.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BB%91%E5%B7%A7%E6%A9%99%E9%A6%99%E4%B9%8C%E9%BE%99.jpg",
+    "sha256": "9a85cbe66be17b30ae22651a151acc058a50f928e6eb3e53d0379a6924a64894"
   },
   {
     "kind": "drink",
     "name": "黑糖珍珠奶茶",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BB%91%E7%B3%96%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/drink_pic/%E9%BB%91%E7%B3%96%E7%8F%8D%E7%8F%A0%E5%A5%B6%E8%8C%B6.jpg",
+    "sha256": "3e1ee93e100cfddcb5d9134e718471aaa9f9ae21bb1df07eb56401f68861b869"
   },
   {
     "kind": "eat",
     "name": "凉皮",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%87%89%E7%9A%AE.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%87%89%E7%9A%AE.jpg",
+    "sha256": "aa40cf1d579e4f70e0e17f85dafe3d42dbf2185cddf5c8807cc177caf4dea199"
   },
   {
     "kind": "eat",
     "name": "卤粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%8D%A4%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%8D%A4%E7%B2%89.jpg",
+    "sha256": "849c0a60de404b88aa292ffcb6cb6bf6e769f2603abc6fc4894db1b13b092e6f"
   },
   {
     "kind": "eat",
     "name": "台湾卤肉饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%8F%B0%E6%B9%BE%E5%8D%A4%E8%82%89%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%8F%B0%E6%B9%BE%E5%8D%A4%E8%82%89%E9%A5%AD.jpg",
+    "sha256": "d570556861052ed67a86bb245e95e5ed6a433f878e8f73b6bd9cd2b5587ee681"
   },
   {
     "kind": "eat",
     "name": "咖喱饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%92%96%E5%96%B1%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%92%96%E5%96%B1%E9%A5%AD.jpg",
+    "sha256": "3a1358491d50199f584597bfeb55903b5fb7238b325c83e1ba09b656a00826a3"
   },
   {
     "kind": "eat",
     "name": "咸肉菜饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%92%B8%E8%82%89%E8%8F%9C%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%92%B8%E8%82%89%E8%8F%9C%E9%A5%AD.jpg",
+    "sha256": "68b710f626817e857f6d9f48f262957f6f4e36a24cabe26af2ba222775982d24"
   },
   {
     "kind": "eat",
     "name": "嫩牛五方",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%AB%A9%E7%89%9B%E4%BA%94%E6%96%B9.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%AB%A9%E7%89%9B%E4%BA%94%E6%96%B9.jpg",
+    "sha256": "5094a42782529b5b09e01e3a40ff0c4da7d48a3d137e24e917eeec7c2652ae86"
   },
   {
     "kind": "eat",
     "name": "寿司",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%AF%BF%E5%8F%B8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E5%AF%BF%E5%8F%B8.jpg",
+    "sha256": "90d5b72b343b1427c6ce30d1b9caf82eec0ad59b7ac16592a4316f2cb2132858"
   },
   {
     "kind": "eat",
     "name": "新疆炒米粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%96%B0%E7%96%86%E7%82%92%E7%B1%B3%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%96%B0%E7%96%86%E7%82%92%E7%B1%B3%E7%B2%89.jpg",
+    "sha256": "c8292ca4380095f03272ff2c77c0619e86990953e058fb32374ea3da42306319"
   },
   {
     "kind": "eat",
     "name": "日式拉面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%97%A5%E5%BC%8F%E6%8B%89%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%97%A5%E5%BC%8F%E6%8B%89%E9%9D%A2.jpg",
+    "sha256": "628dce87b62517fcb65a98fa96b1bfb16949dd22a75f248c88dfe85121b9ea07"
   },
   {
     "kind": "eat",
     "name": "日式烧肉饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%97%A5%E5%BC%8F%E7%83%A7%E8%82%89%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%97%A5%E5%BC%8F%E7%83%A7%E8%82%89%E9%A5%AD.jpg",
+    "sha256": "1828c14839236a3755bbc80d69ea0837d23449c721aaf7fdbdbda0dc608fd585"
   },
   {
     "kind": "eat",
     "name": "杀猪粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%9D%80%E7%8C%AA%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%9D%80%E7%8C%AA%E7%B2%89.jpg",
+    "sha256": "dff956b86c89eb63d3341c2579db25319e2329adb08260574ddb2f8dcd2a8be3"
   },
   {
     "kind": "eat",
     "name": "板栗焖饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%9D%BF%E6%A0%97%E7%84%96%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%9D%BF%E6%A0%97%E7%84%96%E9%A5%AD.jpg",
+    "sha256": "a1b6b18a1415fc56f9243c1924ce24d4dba5af75a59aca824787406d9b8c3090"
   },
   {
     "kind": "eat",
     "name": "桥头排骨",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%A1%A5%E5%A4%B4%E6%8E%92%E9%AA%A8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%A1%A5%E5%A4%B4%E6%8E%92%E9%AA%A8.jpg",
+    "sha256": "e53351c1499b7601d096bbf7cfec1de2b9c37d615c751a03523fd2d060e15eb7"
   },
   {
     "kind": "eat",
     "name": "水煮肉片",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B0%B4%E7%85%AE%E8%82%89%E7%89%87.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B0%B4%E7%85%AE%E8%82%89%E7%89%87.jpg",
+    "sha256": "017c1094e2f6388b07e31d9ae18a579e89c545ed4050e46fe549e634e89c223a"
   },
   {
     "kind": "eat",
     "name": "水饺",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B0%B4%E9%A5%BA.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B0%B4%E9%A5%BA.jpg",
+    "sha256": "e92a5a0d55de42d3fe70952f587b32eab8dae2412dc341f4bfcf9106a1f8a9f2"
   },
   {
     "kind": "eat",
     "name": "汉堡薯条",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B1%89%E5%A0%A1%E8%96%AF%E6%9D%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B1%89%E5%A0%A1%E8%96%AF%E6%9D%A1.jpg",
+    "sha256": "445ba060d4c949f695374088f5b5b5348385965b2a82a767aced1087fe452728"
   },
   {
     "kind": "eat",
     "name": "油炸烧烤",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B2%B9%E7%82%B8%E7%83%A7%E7%83%A4.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B2%B9%E7%82%B8%E7%83%A7%E7%83%A4.jpg",
+    "sha256": "c2883b0048b539cbb3dc9f1983e04d920ce0ea9efef1e3241792e3b565623817"
   },
   {
     "kind": "eat",
     "name": "泡面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B3%A1%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B3%A1%E9%9D%A2.jpg",
+    "sha256": "2d4400ad8e6385cd91c2b0037498328d62bc039fcab7b2d55de059853a66b336"
   },
   {
     "kind": "eat",
     "name": "浏阳蒸菜",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B5%8F%E9%98%B3%E8%92%B8%E8%8F%9C.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B5%8F%E9%98%B3%E8%92%B8%E8%8F%9C.jpg",
+    "sha256": "696cdd974b9d4a2564f102b698a2639486d45c7f34a9495dfdff580f7531d3b2"
   },
   {
     "kind": "eat",
     "name": "海南椰子鸡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B5%B7%E5%8D%97%E6%A4%B0%E5%AD%90%E9%B8%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%B5%B7%E5%8D%97%E6%A4%B0%E5%AD%90%E9%B8%A1.jpg",
+    "sha256": "90d0b0be1274112f34cbc37c613b0193b58636d6d2ceb8a127b7d6c2314dd191"
   },
   {
     "kind": "eat",
     "name": "潮汕砂锅粥",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%BD%AE%E6%B1%95%E7%A0%82%E9%94%85%E7%B2%A5.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E6%BD%AE%E6%B1%95%E7%A0%82%E9%94%85%E7%B2%A5.jpg",
+    "sha256": "31d2523212175d0e622cee9a3d7e656f8ec773d7255bd9f90a2a01fe9190265b"
   },
   {
     "kind": "eat",
     "name": "火腿鹿茸菇炒荷兰豆",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E8%85%BF%E9%B9%BF%E8%8C%B8%E8%8F%87%E7%82%92%E8%8D%B7%E5%85%B0%E8%B1%86.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E8%85%BF%E9%B9%BF%E8%8C%B8%E8%8F%87%E7%82%92%E8%8D%B7%E5%85%B0%E8%B1%86.jpg",
+    "sha256": "b647dadcc77c44cc14798d754ed46e2c0bae764ee1601ca9283a8a174f2149a2"
   },
   {
     "kind": "eat",
     "name": "火锅",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E9%94%85.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E9%94%85.jpg",
+    "sha256": "b04d7ee92c2a9da051fa85a24769b3336b538b1e8b128563bd9d36cca666b5f2"
   },
   {
     "kind": "eat",
     "name": "火锅鸡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E9%94%85%E9%B8%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%81%AB%E9%94%85%E9%B8%A1.jpg",
+    "sha256": "8ab4de2ff2d088a0cb39dfb010713fe9be1af0d18c2d567e18617367ee532bfe"
   },
   {
     "kind": "eat",
     "name": "炒粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%82%92%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%82%92%E7%B2%89.jpg",
+    "sha256": "8441e043932530a3f331d7af6d9a7c38fca4ee7b43bd2231fa2e7b1faeeadd4b"
   },
   {
     "kind": "eat",
     "name": "炒饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%82%92%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%82%92%E9%A5%AD.jpg",
+    "sha256": "f90a1ae8722d1bc627d18c6874be66cea4cf386a7b8cf910d5c57ac2a4dd20e5"
   },
   {
     "kind": "eat",
     "name": "烤冷面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A4%E5%86%B7%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A4%E5%86%B7%E9%9D%A2.jpg",
+    "sha256": "7f0a7a7558281fd6dd52760068e0556374267c9e6731a93f536175ce36388254"
   },
   {
     "kind": "eat",
     "name": "烤肉拌饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A4%E8%82%89%E6%8B%8C%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A4%E8%82%89%E6%8B%8C%E9%A5%AD.jpg",
+    "sha256": "86bc8abe37f0068747b6bd21b5c79a2806bbf2bf991e1f6b5b26643ee2fe48b2"
   },
   {
     "kind": "eat",
     "name": "烧腊饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A7%E8%85%8A%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%83%A7%E8%85%8A%E9%A5%AD.jpg",
+    "sha256": "f22822b615c3c86c6ccd696d6dcd85a210c1bb22a0b4b37227f5a0b90b6d8cb0"
   },
   {
     "kind": "eat",
     "name": "煎饺",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%85%8E%E9%A5%BA.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%85%8E%E9%A5%BA.jpg",
+    "sha256": "6b79ae2b0305324274b7a69a2c8a72299f54d7193c8f2db02be302f1913f0cf2"
   },
   {
     "kind": "eat",
     "name": "煎饼果子",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%85%8E%E9%A5%BC%E6%9E%9C%E5%AD%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%85%8E%E9%A5%BC%E6%9E%9C%E5%AD%90.jpg",
+    "sha256": "674081e0996ac7160f1a9adc90b15816dc2fec04c8f11a7a019aa294177e4cf0"
   },
   {
     "kind": "eat",
     "name": "牛丼饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E4%B8%BC%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E4%B8%BC%E9%A5%AD.jpg",
+    "sha256": "eee06b0d9351b439ae665907f80286165791726e1dd25cd1047e63e74c876db2"
   },
   {
     "kind": "eat",
     "name": "牛肉焗米粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E7%84%97%E7%B1%B3%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E7%84%97%E7%B1%B3%E7%B2%89.jpg",
+    "sha256": "a1c8d0d22b1c9e5c39a7975e5345bf98ead21b00dea0489018f00df9049d1b07"
   },
   {
     "kind": "eat",
     "name": "牛肉粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E7%B2%89.jpg",
+    "sha256": "d86ef08107d52cae9eab3d7e9230ac7cc77dcce8c4bd171f08346149cac283ab"
   },
   {
     "kind": "eat",
     "name": "牛肉面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%89%9B%E8%82%89%E9%9D%A2.jpg",
+    "sha256": "4a6936b41acc1ed94b3fafe1b7d7151d359990820f0ca024dc719690c6520311"
   },
   {
     "kind": "eat",
     "name": "猪肚鸡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%8C%AA%E8%82%9A%E9%B8%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%8C%AA%E8%82%9A%E9%B8%A1.jpg",
+    "sha256": "f0556345e59ce8c5e05b2f0a5c9594fc0a20273a2b96ca1200466e6243e22f54"
   },
   {
     "kind": "eat",
     "name": "猪脚饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%8C%AA%E8%84%9A%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%8C%AA%E8%84%9A%E9%A5%AD.jpg",
+    "sha256": "cf4d59565e96757df0eaf8cab05d985a51cf16d9deb841dc416061019083da13"
   },
   {
     "kind": "eat",
     "name": "白萝卜焖牛排骨",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%99%BD%E8%90%9D%E5%8D%9C%E7%84%96%E7%89%9B%E6%8E%92%E9%AA%A8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%99%BD%E8%90%9D%E5%8D%9C%E7%84%96%E7%89%9B%E6%8E%92%E9%AA%A8.jpg",
+    "sha256": "00c4ffa6cafac2c1db4a36f2b58fd3f054a4445ea895aa93aee479d8116af530"
   },
   {
     "kind": "eat",
     "name": "盖码饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%9B%96%E7%A0%81%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E7%9B%96%E7%A0%81%E9%A5%AD.jpg",
+    "sha256": "87e868e4e5a1b89ad306a748c0596fddca99a13fbd578e3d72c3526655724f10"
   },
   {
     "kind": "eat",
     "name": "肉夹馍",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%89%E5%A4%B9%E9%A6%8D.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%89%E5%A4%B9%E9%A6%8D.jpg",
+    "sha256": "40bf8bbb57caee9a332843085d7eb435b799984f363bf3e5b646b17f40fcd775"
   },
   {
     "kind": "eat",
     "name": "肉汁拌饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%89%E6%B1%81%E6%8B%8C%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%89%E6%B1%81%E6%8B%8C%E9%A5%AD.jpg",
+    "sha256": "78605ea1a98455f859ef1922acd980ea861b7a3fbac6988148cbcb7a285a5cc5"
   },
   {
     "kind": "eat",
     "name": "肠粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%A0%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%82%A0%E7%B2%89.jpg",
+    "sha256": "ee72f96a05441583fb1acdf7380680aee3d19b44389afa3e2260a216d94b2991"
   },
   {
     "kind": "eat",
     "name": "臭豆腐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%87%AD%E8%B1%86%E8%85%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%87%AD%E8%B1%86%E8%85%90.jpg",
+    "sha256": "8fc394d69cef00baba9027ded47254250813d82bb2a8a38cd714017539bcd628"
   },
   {
     "kind": "eat",
     "name": "茴香肉包",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%8C%B4%E9%A6%99%E8%82%89%E5%8C%85.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%8C%B4%E9%A6%99%E8%82%89%E5%8C%85.jpg",
+    "sha256": "acdc4aa58f46067ea69a2d39e969b0d75cabb387a9da1e198286dae1d2738942"
   },
   {
     "kind": "eat",
     "name": "葱油拌面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%91%B1%E6%B2%B9%E6%8B%8C%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%91%B1%E6%B2%B9%E6%8B%8C%E9%9D%A2.jpg",
+    "sha256": "082e36a8c6e7f8603eaff2e083489660c7287c0073280f0faee36c0399e5bcfe"
   },
   {
     "kind": "eat",
     "name": "葱花饼",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%91%B1%E8%8A%B1%E9%A5%BC.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%91%B1%E8%8A%B1%E9%A5%BC.jpg",
+    "sha256": "c2a6369739b443de60579b653696c1ff6c19c301fac8216d3aec4bd909008ddd"
   },
   {
     "kind": "eat",
     "name": "蒸饺",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%92%B8%E9%A5%BA.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%92%B8%E9%A5%BA.jpg",
+    "sha256": "db5110666472dbb3f54c4ccb35876222eb44bc7132bc8ba68fdc67c4ed267b2f"
   },
   {
     "kind": "eat",
     "name": "蛋包饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E5%8C%85%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E5%8C%85%E9%A5%AD.jpg",
+    "sha256": "5e91130a1f1fb84c98741f3a2b9e5b75bef7743b6584de76bbbf5a0833cd4ae2"
   },
   {
     "kind": "eat",
     "name": "蛋挞",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E6%8C%9E.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E6%8C%9E.jpg",
+    "sha256": "93eb39ba4c75f53989461bce77b65c8f3dcb58635b6f9532761ecfb83c618d12"
   },
   {
     "kind": "eat",
     "name": "蛋炒饭",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E7%82%92%E9%A5%AD.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9B%8B%E7%82%92%E9%A5%AD.jpg",
+    "sha256": "ca2cbc84deb3fc59d4470bb16307655b3a78205ff51b60c239d2ba2ebc1ae873"
   },
   {
     "kind": "eat",
     "name": "螺蛳粉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9E%BA%E8%9B%B3%E7%B2%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%9E%BA%E8%9B%B3%E7%B2%89.jpg",
+    "sha256": "3590a0061c8a24bc9ba4fde4b4bb89fefa531a3728b9cecaae71a11fb1409aba"
   },
   {
     "kind": "eat",
     "name": "辣椒炒肉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%BE%A3%E6%A4%92%E7%82%92%E8%82%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%BE%A3%E6%A4%92%E7%82%92%E8%82%89.jpg",
+    "sha256": "fdadafae4d592e5cb93aadb29e00029b399bfd2ea4b7ec0fd282f071ab405691"
   },
   {
     "kind": "eat",
     "name": "过桥米线",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%BF%87%E6%A1%A5%E7%B1%B3%E7%BA%BF.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E8%BF%87%E6%A1%A5%E7%B1%B3%E7%BA%BF.jpg",
+    "sha256": "d9154473dbd60fc88f1c0f3bdbabe77108f2873f0fc3435478267f4e64b0f4d2"
   },
   {
     "kind": "eat",
     "name": "酸菜鱼",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%85%B8%E8%8F%9C%E9%B1%BC.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%85%B8%E8%8F%9C%E9%B1%BC.jpg",
+    "sha256": "6043b421d48156d4f12ba92214321dc447dcc69a3308ea167dba4a8ae0de2742"
   },
   {
     "kind": "eat",
     "name": "重庆小面",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%87%8D%E5%BA%86%E5%B0%8F%E9%9D%A2.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%87%8D%E5%BA%86%E5%B0%8F%E9%9D%A2.jpg",
+    "sha256": "60ae9ae774e71c77c18379a8b141ee974b183df894d458e6d72ad156d0da8416"
   },
   {
     "kind": "eat",
     "name": "锅盔",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%94%85%E7%9B%94.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%94%85%E7%9B%94.jpg",
+    "sha256": "86f958ce74cd5e29170b825e00d06782437a89f65d657bfec328ea1775479321"
   },
   {
     "kind": "eat",
     "name": "韩式炸鸡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E7%82%B8%E9%B8%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E7%82%B8%E9%B8%A1.jpg",
+    "sha256": "76176558fa135ab6a5e2da499d241b5b8633c12c25f5770fc69904123ba4c203"
   },
   {
     "kind": "eat",
     "name": "韩式烤肉",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E7%83%A4%E8%82%89.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E7%83%A4%E8%82%89.jpg",
+    "sha256": "a600a683cfaec26b2a79fcef5d4e49600b72a9d083cc289ead9f28f818c0dabb"
   },
   {
     "kind": "eat",
     "name": "韩式部队火锅",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E9%83%A8%E9%98%9F%E7%81%AB%E9%94%85.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%9F%A9%E5%BC%8F%E9%83%A8%E9%98%9F%E7%81%AB%E9%94%85.jpg",
+    "sha256": "cf24321f512295d81a1bafdf3348a9e293fd59ae053eb4a9e0bac41ed5fa45f6"
   },
   {
     "kind": "eat",
     "name": "馄饨",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%A6%84%E9%A5%A8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%A6%84%E9%A5%A8.jpg",
+    "sha256": "e547873c5a3c393ac997d073e1067d965ddfe73e25ed4ce3a5fdc2ac173630a4"
   },
   {
     "kind": "eat",
     "name": "鲜肉馄饨",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%B2%9C%E8%82%89%E9%A6%84%E9%A5%A8.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%B2%9C%E8%82%89%E9%A6%84%E9%A5%A8.jpg",
+    "sha256": "4c0e5ec6f6daf3bab3cc7869a7e96b391c2b8b0e074d6231a9162e311d6399e8"
   },
   {
     "kind": "eat",
     "name": "鸭血粉丝",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%B8%AD%E8%A1%80%E7%B2%89%E4%B8%9D.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%B8%AD%E8%A1%80%E7%B2%89%E4%B8%9D.jpg",
+    "sha256": "0c5c9578c74c547da10b37232f01a4e5044160ec7936d03715c0a1cb9b2e2427"
   },
   {
     "kind": "eat",
     "name": "麻婆豆腐",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E5%A9%86%E8%B1%86%E8%85%90.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E5%A9%86%E8%B1%86%E8%85%90.jpg",
+    "sha256": "4ecbe6420936ea870a2318e11964891a800307b7ad75423438f9309072f0d7ea"
   },
   {
     "kind": "eat",
     "name": "麻辣烫",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E8%BE%A3%E7%83%AB.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E8%BE%A3%E7%83%AB.jpg",
+    "sha256": "d7ed96b02dbffdc33a1ec8d37d600477307ac9bfb300b77522ca6d74316e6737"
   },
   {
     "kind": "eat",
     "name": "麻辣香锅",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E8%BE%A3%E9%A6%99%E9%94%85.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BA%BB%E8%BE%A3%E9%A6%99%E9%94%85.jpg",
+    "sha256": "742f4a5d085eb35632426e023fd1f3f242ce184b9e4d098b4bec2756e8e12e91"
   },
   {
     "kind": "eat",
     "name": "黄焖鸡",
-    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BB%84%E7%84%96%E9%B8%A1.jpg"
+    "url": "https://raw.githubusercontent.com/Cvandia/nonebot-plugin-whateat-pic/df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/eat_pic/%E9%BB%84%E7%84%96%E9%B8%A1.jpg",
+    "sha256": "27af6c216acc4654aa8c57262601911867656710a43ee8b890d56033a2315af9"
   }
 ]

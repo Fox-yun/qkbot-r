@@ -37,12 +37,13 @@ COPY assets/native/README.md assets/native/sources.json /usr/share/qkbot/sources
 COPY assets/native/wordle/LICENSE assets/native/wordle/LICENSE-pyspellchecker /usr/share/qkbot/sources/wordle/
 COPY assets/native/kfc/LICENSE /usr/share/qkbot/sources/kfc/
 COPY assets/native/meal/LICENSE /usr/share/qkbot/sources/meal/
+COPY assets/native/meal/images/ /usr/share/qkbot/meal-images/
 RUN chmod 0755 /usr/local/bin/qkbot-entrypoint
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="小鱼 qkbot-r" \
       org.opencontainers.image.source="https://github.com/Fox-yun/qkbot-r" \
       org.opencontainers.image.revision="${VCS_REF}"
-ENV HOME=/data TZ=Asia/Shanghai
+ENV HOME=/data TZ=Asia/Shanghai QKBOT_MEAL_IMAGES_DIR=/usr/share/qkbot/meal-images
 USER 10001:10001
 WORKDIR /data
 VOLUME ["/data"]

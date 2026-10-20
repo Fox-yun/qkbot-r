@@ -166,6 +166,18 @@ def main() -> int:
         utility("sh", "-ceu", "test -r /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
         checked("real entrypoint seeded config; volume writable as UID 10001; CJK font readable")
 
+        meals = json.loads((root / "assets/native/meal/menu.json").read_text(encoding="utf-8"))
+        hashes = {item["sha256"] for item in meals}
+        assert len(meals) == len(hashes) == 151
+        assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in hashes)
+        asset_dir = utility("printenv", "QKBOT_MEAL_IMAGES_DIR").decode().strip()
+        assert asset_dir == "/usr/share/qkbot/meal-images"
+        paths = sorted(f"{asset_dir}/{digest}" for digest in hashes)
+        actual = utility("sha256sum", *paths).decode().splitlines()
+        assert len(actual) == len(paths)
+        assert all(line.split() == [Path(path).name, path] for line, path in zip(actual, paths))
+        checked("all 151 bundled meal images pass SHA256 verification with network disabled")
+
         web_port, bridge_port = reserve_port(), reserve_port()
         stub_port = server.server_port
         setup_code = f"synthetic-setup-{identity}"

@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,6 +21,82 @@ use std::{
 use tokio::sync::Semaphore;
 
 const FILE_LIMIT: usize = 8 * 1024 * 1024;
+const MEAL_MANIFEST: &str = include_str!("../assets/native/meal/menu.json");
+
+#[derive(serde::Deserialize)]
+struct BundledMeal {
+    url: String,
+    #[serde(default)]
+    sha256: String,
+}
+
+fn bundled_meal_hash(manifest: &str, source_url: &str) -> Result<String> {
+    let entries: Vec<BundledMeal> = serde_json::from_str(manifest).context("内置餐图清单无效")?;
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.url == source_url)
+        .context("图片不在内置餐图清单中")?;
+    ensure!(
+        entry.sha256.len() == 64
+            && entry
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "内置餐图清单缺少有效校验值，请更新完整资源包"
+    );
+    Ok(entry.sha256)
+}
+
+fn meal_images_directory(
+    override_dir: Option<OsString>,
+    working_dir: &std::path::Path,
+    executable: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = override_dir {
+        ensure!(!path.is_empty(), "QKBOT_MEAL_IMAGES_DIR 不能为空");
+        let path = PathBuf::from(path);
+        ensure!(path.is_dir(), "QKBOT_MEAL_IMAGES_DIR 指定的餐图目录不存在");
+        return Ok(path);
+    }
+    let mut candidates = vec![working_dir.join("assets/native/meal/images")];
+    if let Some(parent) = executable.and_then(std::path::Path::parent) {
+        candidates.push(parent.join("assets/native/meal/images"));
+    }
+    candidates.push(PathBuf::from("/usr/share/qkbot/meal-images"));
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .context("内置餐图资源目录不存在，请安装完整资源包或设置 QKBOT_MEAL_IMAGES_DIR")
+}
+
+async fn checked_meal_image(
+    directory: &std::path::Path,
+    sha256: &str,
+) -> Result<(PathBuf, &'static str, usize)> {
+    // The path component comes exclusively from the embedded manifest.
+    validate_id(sha256)?;
+    let path = directory.join(sha256);
+    let file = tokio::fs::File::open(&path)
+        .await
+        .context("内置餐图文件缺失，请更新完整资源包")?;
+    let metadata = file.metadata().await?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= FILE_LIMIT as u64,
+        "内置餐图为空或超过8 MiB"
+    );
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(FILE_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(bytes.len() <= FILE_LIMIT, "内置餐图超过8 MiB");
+    let mime = image_mime(&bytes).context("内置餐图格式无效")?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == sha256,
+        "内置餐图校验失败，请更新完整资源包"
+    );
+    Ok((path, mime, bytes.len()))
+}
 #[derive(Clone, PartialEq, Eq)]
 struct Owner {
     scope: Scope,
@@ -368,6 +445,27 @@ impl MediaStore {
         )
         .await
     }
+    /// Publish only pinned, packaged original menu images. These immutable
+    /// assets do not enter the administrator's imported-image quota.
+    pub async fn bundled_meal(
+        &self,
+        host: &Host,
+        message: &Incoming,
+        source_url: &str,
+    ) -> Result<String> {
+        source(host, message, "meal").await?;
+        let hash = bundled_meal_hash(MEAL_MANIFEST, source_url)?;
+        let directory = meal_images_directory(
+            std::env::var_os("QKBOT_MEAL_IMAGES_DIR"),
+            &std::env::current_dir()?,
+            std::env::current_exe().ok().as_deref(),
+        )?;
+        let _permit = self.io.acquire().await?;
+        let (path, mime, size) = checked_meal_image(&directory, &hash).await?;
+        // Disable, account switch or host reload may happen during disk I/O.
+        source(host, message, "meal").await?;
+        self.register(host, path, mime, None, size).await
+    }
     pub async fn cleanup(&self, host: &Host) {
         let expired: Vec<_> = {
             let mut entries = self.entries.lock().unwrap();
@@ -513,6 +611,127 @@ mod tests {
     use crate::{config::Config, types::Scene};
     use std::sync::atomic::{AtomicI64, Ordering};
 
+    #[test]
+    fn bundled_meal_urls_are_exact_manifest_entries_not_paths_or_redirects() {
+        let entries: Vec<BundledMeal> = serde_json::from_str(MEAL_MANIFEST).unwrap();
+        let first = &entries[0];
+        assert_eq!(
+            bundled_meal_hash(MEAL_MANIFEST, &first.url).unwrap(),
+            first.sha256
+        );
+        for invalid in [
+            "file:///etc/passwd".to_owned(),
+            "../../config.toml".to_owned(),
+            format!("{}?other=1", first.url),
+            first
+                .url
+                .replace("raw.githubusercontent.com", "example.test"),
+        ] {
+            assert!(bundled_meal_hash(MEAL_MANIFEST, &invalid).is_err());
+        }
+        let invalid = serde_json::json!([{"url":"fixture","sha256":"../../private"}]);
+        assert!(bundled_meal_hash(&invalid.to_string(), "fixture").is_err());
+    }
+
+    #[test]
+    fn bundled_meal_directory_override_never_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let working = temp.path().join("working");
+        let cwd_images = working.join("assets/native/meal/images");
+        std::fs::create_dir_all(&cwd_images).unwrap();
+        let executable = temp.path().join("app/qkbot");
+        let executable_images = executable
+            .parent()
+            .unwrap()
+            .join("assets/native/meal/images");
+        std::fs::create_dir_all(&executable_images).unwrap();
+        assert_eq!(
+            meal_images_directory(None, &working, Some(&executable)).unwrap(),
+            cwd_images
+        );
+        assert_eq!(
+            meal_images_directory(None, &temp.path().join("other"), Some(&executable)).unwrap(),
+            executable_images
+        );
+        assert_eq!(
+            meal_images_directory(Some(executable_images.clone().into()), &working, None).unwrap(),
+            executable_images
+        );
+        assert!(
+            meal_images_directory(Some(temp.path().join("missing").into()), &working, None)
+                .is_err()
+        );
+        assert!(meal_images_directory(Some(OsString::new()), &working, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn bundled_meal_assets_are_complete_decodable_and_content_addressed() {
+        let entries: Vec<BundledMeal> = serde_json::from_str(MEAL_MANIFEST).unwrap();
+        assert_eq!(entries.len(), 151);
+        let images = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/native/meal/images");
+        for entry in entries {
+            let hash = bundled_meal_hash(MEAL_MANIFEST, &entry.url).unwrap();
+            let (path, _, size) = checked_meal_image(&images, &hash).await.unwrap();
+            assert!(size > 0 && size <= FILE_LIMIT);
+            let bytes = std::fs::read(path).unwrap();
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .unwrap();
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            reader.limits(limits);
+            let decoded = reader.decode().unwrap();
+            assert!(decoded.width() > 0 && decoded.height() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_meal_missing_corrupt_wrong_format_and_oversize_files_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries: Vec<BundledMeal> = serde_json::from_str(MEAL_MANIFEST).unwrap();
+        let hash = &entries[0].sha256;
+        assert!(
+            checked_meal_image(temp.path(), hash)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("缺失")
+        );
+        std::fs::write(temp.path().join(hash), b"\xff\xd8\xffwrong content").unwrap();
+        assert!(
+            checked_meal_image(temp.path(), hash)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("校验")
+        );
+        let invalid = b"<html>upstream error</html>";
+        let invalid_hash = format!("{:x}", Sha256::digest(invalid));
+        std::fs::write(temp.path().join(&invalid_hash), invalid).unwrap();
+        assert!(
+            checked_meal_image(temp.path(), &invalid_hash)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("格式")
+        );
+        let large = std::fs::File::create(temp.path().join(hash)).unwrap();
+        large.set_len(FILE_LIMIT as u64 + 1).unwrap();
+        drop(large);
+        assert!(
+            checked_meal_image(temp.path(), hash)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("8 MiB")
+        );
+        assert!(
+            checked_meal_image(temp.path(), "../config.toml")
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn generated_capability_requires_binding_and_survives_neither_toggle_nor_account_change()
     {
@@ -534,7 +753,7 @@ mod tests {
         });
         let mut config = Config::default();
         config.plugins.ai.enabled = false;
-        config.plugins.native.enabled.clear();
+        config.plugins.native.enabled = vec!["meal".into()];
         config.app.database = directory
             .path()
             .join("fixture.sqlite")
@@ -560,6 +779,110 @@ mod tests {
             scene: Scene::Group,
             peer_id: 456,
         };
+        let incoming = Incoming {
+            key: crate::types::MessageKey {
+                scope: scope.clone(),
+                message_seq: 1,
+            },
+            sender_id: 789,
+            sender_nickname: None,
+            sender_card: None,
+            text: "/吃什么".into(),
+            mentions: Vec::new(),
+            quote_seq: None,
+            received_at: now(),
+            raw_message: serde_json::Value::Null,
+            notification: None,
+        };
+        let saved = incoming.clone();
+        let position = host.store.call(move |db| {
+            db.execute(
+                "INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,command_plugin,plugin_revision,access_revision)
+                 VALUES(?1,?2,'fixture',1,789,'user','/吃什么',?3,'meal',0,0)",
+                rusqlite::params![saved.key.key(),saved.key.scope.key(),now()],
+            )?;
+            Ok(db.last_insert_rowid())
+        }).await.unwrap();
+        let entries: Vec<BundledMeal> = serde_json::from_str(MEAL_MANIFEST).unwrap();
+        assert!(
+            host.media
+                .bundled_meal(&host, &incoming, "file:///private")
+                .await
+                .is_err()
+        );
+        use crate::plugin::Plugin;
+        let bundled_body = crate::plugins::native::MealPlugin
+            .reply(&host, &incoming)
+            .await
+            .unwrap();
+        assert!(
+            bundled_body.segments.iter().any(
+                |segment| matches!(segment, OutgoingSegment::Text { text } if !text.is_empty())
+            )
+        );
+        let images: Vec<_> = bundled_body
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                OutgoingSegment::Image { uri, .. } => Some(uri),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1);
+        let bundled_uri = images[0];
+        assert!(
+            bundled_uri.starts_with(&format!(
+                "http://{}/native-media/",
+                host.config.nonebot.listen
+            )),
+            "the real meal reply must use packaged local media, never an upstream URL"
+        );
+        let bundled_id = bundled_uri.rsplit('/').next().unwrap().to_owned();
+        let bundled_path = host.media.entries.lock().unwrap()[&bundled_id].path.clone();
+        let get_bundled =
+            |headers: HeaderMap| download(State(host.clone()), Path(bundled_id.clone()), headers);
+        assert_eq!(
+            get_bundled(headers.clone()).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        host.media
+            .bind(&host, &scope, "meal", position, &bundled_body)
+            .await
+            .unwrap();
+        let response = get_bundled(headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), FILE_LIMIT)
+            .await
+            .unwrap();
+        let downloaded_hash = format!("{:x}", Sha256::digest(&body));
+        assert!(entries.iter().any(|entry| entry.sha256 == downloaded_hash));
+        assert!(!directory.path().join("media/native/saved").exists());
+        crate::catalog::set_enabled(&host.store, scope.clone(), "meal".into(), false)
+            .await
+            .unwrap();
+        assert!(
+            host.media
+                .bundled_meal(&host, &incoming, &entries[0].url)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            get_bundled(headers.clone()).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        crate::catalog::set_enabled(&host.store, scope.clone(), "meal".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_bundled(headers.clone()).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            host.media
+                .bundled_meal(&host, &incoming, &entries[0].url)
+                .await
+                .is_err()
+        );
         let message = OutgoingMessage {
             segments: vec![OutgoingSegment::Image {
                 uri: uri.clone(),
@@ -619,6 +942,10 @@ mod tests {
         host.cancel.cancel();
         host.media.cleanup(&host).await;
         assert!(!path.exists());
+        assert!(
+            bundled_path.is_file(),
+            "cleanup must preserve packaged read-only assets"
+        );
         host.store.stop().await.unwrap();
         cancel.cancel();
         peer.await.unwrap();

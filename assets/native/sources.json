@@ -89,5 +89,17 @@
     "source": "MinatoAquaCrews/nonebot_plugin_crazy_thursday@4734a3a2682d60e8643b4caaed8cd90e8eb664ac/post.json",
     "sha256": "6db97e8cd39ab1a2bb44c7300eb148a97cde744b4160590997c4954dee95200a",
     "entries": 196
+  },
+  {
+    "source": "Cvandia/nonebot-plugin-whateat-pic@df38a4fb3452a9fd8752c71a7af0c6979e894d48/res/{eat_pic,drink_pic}",
+    "archive_url": "https://codeload.github.com/Cvandia/nonebot-plugin-whateat-pic/zip/df38a4fb3452a9fd8752c71a7af0c6979e894d48",
+    "archive_sha256": "94392d55ea5dc1c412a205adbb30dc1eb9836dbaa194b0b527a87a7a987237bb",
+    "entries": 151,
+    "eat_entries": 66,
+    "drink_entries": 85,
+    "image_bytes": 11275270,
+    "output": "assets/native/meal/menu.json",
+    "output_sha256": "fc6173ce424fecf6b0b2e0ea8a1387c33d3a91f21894f30a234d0b94f8e377d4",
+    "transformation": "Keep original image bytes; store images by SHA256 under assets/native/meal/images; retain names and pinned URLs as stable menu identifiers"
   }
 ]

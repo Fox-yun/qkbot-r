@@ -148,7 +148,10 @@ impl Reply {
             let uri = if self.local_image {
                 host.media.url(host, message, "meal", &image).await?
             } else {
-                image
+                // Existing menu rows retain their upstream URL as the stable
+                // identifier. QQ receives a guarded local URL for the bundled
+                // image, so a blocked external image host cannot break meals.
+                host.media.bundled_meal(host, message, &image).await?
             };
             segments.push(OutgoingSegment::Image {
                 uri,
@@ -1063,6 +1066,16 @@ const MEAL_COMMANDS: &[&str] = &[
     "/查看菜品",
     "/添加菜单",
     "/删除菜单",
+    "/早上吃什么",
+    "/早饭吃什么",
+    "/早餐吃什么",
+    "/中午吃什么",
+    "/午饭吃什么",
+    "/午餐吃什么",
+    "/晚上吃什么",
+    "/晚饭吃什么",
+    "/晚餐吃什么",
+    "/今晚吃什么",
 ];
 #[derive(Debug, Clone, Deserialize)]
 struct MealEntry {
@@ -1100,30 +1113,41 @@ fn read_pending(
 fn meal_command(text: &str) -> Option<&'static str> {
     let (cmd, _) = command(text);
     match cmd {
-        "meal" | "吃什么" | "今天吃什么" => Some("eat"),
-        "今天喝什么" => Some("drink"),
+        "meal" => Some("eat"),
         "全部菜单" | "查看菜单" | "查看菜品" => Some("view"),
         "添加菜单" => Some("add"),
         "删除菜单" => Some("delete"),
         _ => {
-            let value = text.trim().trim_start_matches('/');
-            let suffix = if value.ends_with("吃什么")
-                || value.ends_with("吃啥")
-                || value.ends_with("吃点啥")
-            {
-                "eat"
-            } else if value.ends_with("喝什么")
-                || value.ends_with("喝啥")
-                || value.ends_with("喝点啥")
-            {
-                "drink"
+            // Explicit slash commands retain ownership of invalid arguments so
+            // the handler can show its usage. Bare requests must match in full:
+            // ordinary conversation beginning with "今天吃什么" is not a command.
+            let value = if text.trim_start().starts_with('/') {
+                cmd
             } else {
-                return None;
+                text.trim()
             };
-            // Upstream's meal-time shortcuts, without consuming arbitrary prose.
-            let verb = if suffix == "eat" { '吃' } else { '喝' };
-            let prefix = value.split(verb).next().unwrap_or_default();
-            meal_time_prefix(prefix).then_some(suffix)
+            match value {
+                "吃什么" | "今天吃什么" => return Some("eat"),
+                "今天喝什么" => return Some("drink"),
+                _ => {}
+            }
+            // Match the entire anchored upstream shortcut. Splitting at the
+            // first verb would also claim prose such as "早上吃完再想吃什么".
+            for (suffix, operation) in [
+                ("吃什么", "eat"),
+                ("吃啥", "eat"),
+                ("吃点啥", "eat"),
+                ("喝什么", "drink"),
+                ("喝啥", "drink"),
+                ("喝点啥", "drink"),
+            ] {
+                if let Some(prefix) = value.strip_suffix(suffix)
+                    && meal_time_prefix(prefix)
+                {
+                    return Some(operation);
+                }
+            }
+            None
         }
     }
 }
@@ -1146,7 +1170,9 @@ fn meal_time_prefix(prefix: &str) -> bool {
             days.push(&prefix[first.len_utf8()..]);
         }
         for prefix in days {
-            if ends.contains(&prefix) {
+            // Also accept the common lunch names absent from the upstream
+            // regex's optional 早/中/晚 branch.
+            if ends.contains(&prefix) || matches!(prefix, "午饭" | "午餐") {
                 return true;
             }
             if let Some(first) = prefix.chars().next()
@@ -2011,9 +2037,8 @@ mod tests {
         store.stop().await.unwrap();
     }
 
-    #[test]
-    fn command_claims_only_intended_patterns() {
-        let mut message = Incoming {
+    fn meal_message(text: &str) -> Incoming {
+        Incoming {
             key: MessageKey {
                 scope: Scope {
                     bot_id: 1,
@@ -2025,13 +2050,154 @@ mod tests {
             sender_id: 7,
             sender_nickname: None,
             sender_card: None,
-            text: "今天喝什么".into(),
+            text: text.into(),
             mentions: vec![],
             quote_seq: None,
             received_at: 1,
             raw_message: serde_json::Value::Null,
             notification: None,
-        };
+        }
+    }
+
+    const COMMON_MEAL_REQUESTS: &[&str] = &[
+        "早上吃什么",
+        "早饭吃什么",
+        "早餐吃什么",
+        "中午吃什么",
+        "午饭吃什么",
+        "午餐吃什么",
+        "晚上吃什么",
+        "晚饭吃什么",
+        "晚餐吃什么",
+        "今晚吃什么",
+        "今天吃什么",
+    ];
+
+    #[test]
+    fn meal_common_requests_support_slash_and_bare_forms_and_registered_help() {
+        for request in COMMON_MEAL_REQUESTS {
+            let registered = format!("/{request}");
+            assert!(MealPlugin.spec().commands.contains(&registered.as_str()));
+            for text in [request.to_string(), registered, format!(" \t{request}\n")] {
+                assert_eq!(meal_command(&text), Some("eat"), "{text}");
+                assert!(MealPlugin.claims(&meal_message(&text)), "{text}");
+            }
+        }
+        for prefix in ["午饭", "午餐", "今天午饭", "明天午餐", "后日午饭"] {
+            for (verb, operation) in [("吃", "eat"), ("喝", "drink")] {
+                for ending in ["什么", "啥", "点啥"] {
+                    assert_eq!(
+                        meal_command(&format!("{prefix}{verb}{ending}")),
+                        Some(operation)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn meal_shortcuts_do_not_claim_prose_but_keep_explicit_command_arguments() {
+        for text in [
+            "你觉得今天吃什么比较好",
+            "请告诉我今天早上吃什么",
+            "今天吃什么 我们一起讨论一下",
+            "今天喝什么 我还没想好",
+            "早上吃完再想吃什么",
+            "午饭吃过了晚上吃什么",
+            "晚上喝完再想喝什么",
+            "晚上吃什么比较好",
+            "早餐吃什么都可以",
+            "我想知道今晚吃什么",
+        ] {
+            assert_eq!(meal_command(text), None, "{text}");
+            assert!(!MealPlugin.claims(&meal_message(text)), "{text}");
+        }
+        for (text, operation) in [
+            ("/meal", "eat"),
+            ("吃什么", "eat"),
+            ("今天喝什么", "drink"),
+            ("/今天吃什么 多余参数", "eat"),
+            ("/午餐吃什么 多余参数", "eat"),
+            ("全部菜单 菜品", "view"),
+            ("/查看菜单 饮品", "view"),
+            ("添加菜单 豆浆 饮品", "add"),
+            ("/删除菜单 豆浆 饮品", "delete"),
+        ] {
+            assert_eq!(meal_command(text), Some(operation), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn meal_shortcuts_share_image_business_and_keep_disabled_command_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.plugins.ai.enabled = false;
+        config.plugins.native.enabled = vec!["meal".into()];
+        config.plugins.native.meal_cooldown_secs = 0;
+        config.app.database = temp.path().join("meal.db").to_string_lossy().into();
+        config.nonebot.media_dir = temp.path().join("media").to_string_lossy().into();
+        let host = Host::create(config).await.unwrap();
+        let mut disabled = host.plugins.clone();
+        disabled
+            .validate(&["host".to_owned()].into_iter().collect())
+            .unwrap();
+        let mut sequence = 0;
+        for request in COMMON_MEAL_REQUESTS {
+            for text in [request.to_string(), format!("/{request}")] {
+                sequence += 1;
+                let mut message = meal_message(&text);
+                message.key.message_seq = sequence;
+                let (owner, handler) = host.plugins.select(&host, &message).await.unwrap().unwrap();
+                assert_eq!(owner, "meal");
+                assert!(handler.is_some());
+                let (owner, handler) = disabled.select(&host, &message).await.unwrap().unwrap();
+                assert_eq!(owner, "meal");
+                assert!(
+                    handler.is_none(),
+                    "disabled commands must not fall through to AI"
+                );
+                invocation(&host.store, "meal", "1:group:2", 7, sequence).await;
+                let reply = MealPlugin.run(&host, &message).await.unwrap();
+                let resource = reply
+                    .image
+                    .expect("every meal request still selects a real image");
+                let is_food = host.store.call(move |db| {
+                    Ok(db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM meal_menu WHERE bot_id=1 AND kind='eat' AND resource=?1 AND deleted=0)",
+                        [resource],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                }).await.unwrap();
+                assert!(is_food);
+            }
+        }
+        let ordinary = meal_message("午饭吃过了晚上吃什么");
+        assert!(
+            host.plugins
+                .select(&host, &ordinary)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let usage = host
+            .store
+            .call(|db| {
+                Ok(db.query_row(
+                    "SELECT SUM(count) FROM meal_usage WHERE bot_id=1 AND user_id=7",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(usage, sequence);
+        host.cancel.cancel();
+        host.store.stop().await.unwrap();
+    }
+
+    #[test]
+    fn command_claims_only_intended_patterns() {
+        let mut message = meal_message("今天喝什么");
         assert!(MealPlugin.claims(&message));
         message.text = "你觉得今天吃什么比较好".into();
         assert!(!MealPlugin.claims(&message));
