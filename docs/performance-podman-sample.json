@@ -1,0 +1,4907 @@
+{
+  "schema_version": 2,
+  "measured_at": "2026-10-20T10:19:04.829Z",
+  "build": {
+    "executable": "/usr/local/bin/qkbot",
+    "bytes": 18111856,
+    "sha256": "9801ab267bf59c898725a5080c79c20c757835bebc344b06efc3b028e18821bc"
+  },
+  "container": {
+    "image": "localhost/qkbot-r:podman-test",
+    "id": "3a08accf4b00f48e38bd53f79fcaf62373e60bb244242c8871c431d423db60f0",
+    "image_bytes": 198869722,
+    "source_revision": "256dff38365dcb13be28e3d7537368198becd2af",
+    "runtime_version": "podman version 5.4.2",
+    "network": "host",
+    "user_namespace": "keep-id:uid=10001,gid=10001",
+    "binary": "/usr/local/bin/qkbot",
+    "binary_sha256": "9801ab267bf59c898725a5080c79c20c757835bebc344b06efc3b028e18821bc",
+    "binary_bytes": 18111856
+  },
+  "environment": {
+    "platform": "linux/x64",
+    "os_release": "6.12.107+deb13-amd64",
+    "cpu_model": "AMD EPYC 7K83 64-Core Processor",
+    "logical_cpus": 2,
+    "host_total_memory_bytes": 2035896320,
+    "node": "v24.21.0",
+    "resident_metric": "Linux /proc VmRSS",
+    "private_metric": "not measured",
+    "sampler_interval_ms": 250,
+    "sampler_note": "250 ms sleep plus one sampler command/read; actual sample timestamps retained"
+  },
+  "configuration": {
+    "native_plugins": [
+      "help",
+      "checkin",
+      "wordle",
+      "kfc",
+      "meal",
+      "daily_partner",
+      "mc_status",
+      "sticker_save",
+      "mock_chat_image",
+      "mock_forward",
+      "nudge",
+      "mute_roulette"
+    ],
+    "loaded_plugins": [
+      "ai",
+      "checkin",
+      "clock",
+      "daily_partner",
+      "help",
+      "host",
+      "kfc",
+      "mc_status",
+      "meal",
+      "mock_chat_image",
+      "mock_forward",
+      "mute_roulette",
+      "nudge",
+      "reminder",
+      "sticker_save",
+      "wordle"
+    ],
+    "ai": true,
+    "clock": true,
+    "reminder": true,
+    "web": true,
+    "nonebot_external": false,
+    "groups": 2,
+    "model_mock_delay_ms": 500,
+    "cooldown_seconds": 0,
+    "input_budget": 6000,
+    "output_budget": 800,
+    "recent_messages": 4,
+    "compact_after_messages": 8,
+    "compact_idle_secs": 30,
+    "memory_input_budget": 6000,
+    "memory_output_budget": 1600,
+    "initial_database": "empty"
+  },
+  "startup_to_mock_ws_ms": 7363.72,
+  "phases": [
+    {
+      "name": "idle_before_admin_setup",
+      "elapsed_ms": 2500.89,
+      "cpu_seconds": 0,
+      "cpu_equivalent_one_core_percent": 0,
+      "resident_mib_median": 15.05,
+      "sampled_peak_resident_mib": 15.05,
+      "sampled_peak_private_mib": null,
+      "replies": 0,
+      "model_requests": 0,
+      "images": 0,
+      "latency_ms": null
+    },
+    {
+      "name": "admin_password_setup",
+      "elapsed_ms": 136.7,
+      "cpu_seconds": 0.02,
+      "cpu_equivalent_one_core_percent": 14.51,
+      "resident_mib_median": 15.05,
+      "sampled_peak_resident_mib": 15.16,
+      "sampled_peak_private_mib": null,
+      "replies": 0,
+      "model_requests": 0,
+      "images": 0,
+      "latency_ms": null
+    },
+    {
+      "name": "idle_after_admin_setup",
+      "elapsed_ms": 2500.16,
+      "cpu_seconds": 0,
+      "cpu_equivalent_one_core_percent": 0,
+      "resident_mib_median": 15.16,
+      "sampled_peak_resident_mib": 15.16,
+      "sampled_peak_private_mib": null,
+      "replies": 0,
+      "model_requests": 0,
+      "images": 0,
+      "latency_ms": null
+    },
+    {
+      "name": "chat_20_two_groups",
+      "elapsed_ms": 5060.21,
+      "cpu_seconds": 0.06,
+      "cpu_equivalent_one_core_percent": 1.19,
+      "resident_mib_median": 16.33,
+      "sampled_peak_resident_mib": 16.33,
+      "sampled_peak_private_mib": null,
+      "replies": 20,
+      "model_requests": 20,
+      "images": 0,
+      "latency_ms": {
+        "min": 504.27,
+        "median": 505.5,
+        "p95": 508.79,
+        "max": 509.64
+      }
+    },
+    {
+      "name": "clock_tool_two_groups",
+      "elapsed_ms": 1008.23,
+      "cpu_seconds": 0.01,
+      "cpu_equivalent_one_core_percent": 0.99,
+      "resident_mib_median": 16.33,
+      "sampled_peak_resident_mib": 16.34,
+      "sampled_peak_private_mib": null,
+      "replies": 2,
+      "model_requests": 4,
+      "images": 0,
+      "latency_ms": {
+        "min": 1006.5,
+        "median": 1007.24,
+        "p95": 1007.98,
+        "max": 1007.98
+      }
+    },
+    {
+      "name": "reminder_create_list_cancel",
+      "elapsed_ms": 5.73,
+      "cpu_seconds": 0,
+      "cpu_equivalent_one_core_percent": 0,
+      "resident_mib_median": 16.34,
+      "sampled_peak_resident_mib": 16.34,
+      "sampled_peak_private_mib": null,
+      "replies": 3,
+      "model_requests": 0,
+      "images": 0,
+      "latency_ms": {
+        "min": 1.69,
+        "median": 1.71,
+        "p95": 1.83,
+        "max": 1.83
+      }
+    },
+    {
+      "name": "wordle_first_image",
+      "elapsed_ms": 12.43,
+      "cpu_seconds": 0.02,
+      "cpu_equivalent_one_core_percent": 152.44,
+      "resident_mib_median": 29,
+      "sampled_peak_resident_mib": 41.65,
+      "sampled_peak_private_mib": null,
+      "replies": 1,
+      "model_requests": 0,
+      "images": 1,
+      "latency_ms": {
+        "min": 12.26,
+        "median": 12.26,
+        "p95": 12.26,
+        "max": 12.26
+      }
+    },
+    {
+      "name": "wordle_guess_warm",
+      "elapsed_ms": 49.96,
+      "cpu_seconds": 0,
+      "cpu_equivalent_one_core_percent": 0,
+      "resident_mib_median": 42.26,
+      "sampled_peak_resident_mib": 42.86,
+      "sampled_peak_private_mib": null,
+      "replies": 2,
+      "model_requests": 0,
+      "images": 1,
+      "latency_ms": {
+        "min": 1.81,
+        "median": 24.86,
+        "p95": 47.9,
+        "max": 47.9
+      }
+    },
+    {
+      "name": "calendar_warm",
+      "elapsed_ms": 45.1,
+      "cpu_seconds": 0.01,
+      "cpu_equivalent_one_core_percent": 21.76,
+      "resident_mib_median": 42.92,
+      "sampled_peak_resident_mib": 42.92,
+      "sampled_peak_private_mib": null,
+      "replies": 1,
+      "model_requests": 0,
+      "images": 1,
+      "latency_ms": {
+        "min": 44.9,
+        "median": 44.9,
+        "p95": 44.9,
+        "max": 44.9
+      }
+    },
+    {
+      "name": "meal_menu_warm",
+      "elapsed_ms": 58.68,
+      "cpu_seconds": 0.01,
+      "cpu_equivalent_one_core_percent": 16.82,
+      "resident_mib_median": 48.18,
+      "sampled_peak_resident_mib": 53.44,
+      "sampled_peak_private_mib": null,
+      "replies": 1,
+      "model_requests": 0,
+      "images": 1,
+      "latency_ms": {
+        "min": 58.47,
+        "median": 58.47,
+        "p95": 58.47,
+        "max": 58.47
+      }
+    },
+    {
+      "name": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 108895.96,
+      "cpu_seconds": 0.06,
+      "cpu_equivalent_one_core_percent": 0.06,
+      "resident_mib_median": 53.74,
+      "sampled_peak_resident_mib": 53.76,
+      "sampled_peak_private_mib": null,
+      "replies": 0,
+      "model_requests": 2,
+      "images": 0,
+      "latency_ms": null
+    },
+    {
+      "name": "memory_recall_two_groups",
+      "elapsed_ms": 505.62,
+      "cpu_seconds": 0.01,
+      "cpu_equivalent_one_core_percent": 1.98,
+      "resident_mib_median": 53.95,
+      "sampled_peak_resident_mib": 53.95,
+      "sampled_peak_private_mib": null,
+      "replies": 2,
+      "model_requests": 2,
+      "images": 0,
+      "latency_ms": {
+        "min": 504.18,
+        "median": 504.74,
+        "p95": 505.3,
+        "max": 505.3
+      }
+    },
+    {
+      "name": "idle_after_all_features",
+      "elapsed_ms": 3000.95,
+      "cpu_seconds": 0,
+      "cpu_equivalent_one_core_percent": 0,
+      "resident_mib_median": 53.95,
+      "sampled_peak_resident_mib": 53.95,
+      "sampled_peak_private_mib": null,
+      "replies": 0,
+      "model_requests": 0,
+      "images": 0,
+      "latency_ms": null
+    }
+  ],
+  "receipts": [
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 508.79,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 509.64,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.45,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 505.61,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 504.65,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 505.24,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.16,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 505.31,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.55,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 504.27,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.96,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 506.42,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 506.29,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 506.33,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 504.29,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 505.4,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.68,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 504.48,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20001,
+      "label": "chat",
+      "latency_ms": 505.14,
+      "image_count": 0
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "group": 20002,
+      "label": "chat",
+      "latency_ms": 505.57,
+      "image_count": 0
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "group": 20001,
+      "label": "clock tool",
+      "latency_ms": 1006.5,
+      "image_count": 0
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "group": 20002,
+      "label": "clock tool",
+      "latency_ms": 1007.98,
+      "image_count": 0
+    },
+    {
+      "phase": "reminder_create_list_cancel",
+      "group": 20001,
+      "label": "reminder create",
+      "latency_ms": 1.83,
+      "image_count": 0
+    },
+    {
+      "phase": "reminder_create_list_cancel",
+      "group": 20001,
+      "label": "reminder list",
+      "latency_ms": 1.71,
+      "image_count": 0
+    },
+    {
+      "phase": "reminder_create_list_cancel",
+      "group": 20001,
+      "label": "reminder cancel",
+      "latency_ms": 1.69,
+      "image_count": 0
+    },
+    {
+      "phase": "wordle_first_image",
+      "group": 20001,
+      "label": "wordle start",
+      "latency_ms": 12.26,
+      "image_count": 1
+    },
+    {
+      "phase": "wordle_guess_warm",
+      "group": 20001,
+      "label": "wordle guess",
+      "latency_ms": 47.9,
+      "image_count": 1
+    },
+    {
+      "phase": "wordle_guess_warm",
+      "group": 20001,
+      "label": "wordle stop",
+      "latency_ms": 1.81,
+      "image_count": 0
+    },
+    {
+      "phase": "calendar_warm",
+      "group": 20001,
+      "label": "deer calendar",
+      "latency_ms": 44.9,
+      "image_count": 1
+    },
+    {
+      "phase": "meal_menu_warm",
+      "group": 20001,
+      "label": "meal menu",
+      "latency_ms": 58.47,
+      "image_count": 1
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "group": 20001,
+      "label": "memory recall",
+      "latency_ms": 504.18,
+      "image_count": 0
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "group": 20002,
+      "label": "memory recall",
+      "latency_ms": 505.3,
+      "image_count": 0
+    }
+  ],
+  "images": [
+    {
+      "phase": "wordle_first_image",
+      "bytes": 14390,
+      "width": 900,
+      "height": 645
+    },
+    {
+      "phase": "wordle_guess_warm",
+      "bytes": 16542,
+      "width": 900,
+      "height": 645
+    },
+    {
+      "phase": "calendar_warm",
+      "bytes": 46706,
+      "width": 900,
+      "height": 650
+    },
+    {
+      "phase": "meal_menu_warm",
+      "bytes": 291829,
+      "width": 900,
+      "height": 2884
+    }
+  ],
+  "model_calls": [
+    {
+      "kind": "chat",
+      "elapsed_ms": 13065.63,
+      "input_json_bytes": 3976
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 13066.49,
+      "input_json_bytes": 3977
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 13573.22,
+      "input_json_bytes": 4237
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 13574.05,
+      "input_json_bytes": 4240
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 14079.19,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 14079.68,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 14583.94,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 14584.89,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 15089.32,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 15090.29,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 15594.92,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 15595.54,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 16101.15,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 16101.85,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 16607.06,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 16607.75,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 17112.08,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 17113.27,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 17617.8,
+      "input_json_bytes": 4498
+    },
+    {
+      "kind": "chat",
+      "elapsed_ms": 17618.53,
+      "input_json_bytes": 4503
+    },
+    {
+      "kind": "tool_request",
+      "elapsed_ms": 18124.58,
+      "input_json_bytes": 4465
+    },
+    {
+      "kind": "tool_request",
+      "elapsed_ms": 18125.16,
+      "input_json_bytes": 4469
+    },
+    {
+      "kind": "tool_followup",
+      "elapsed_ms": 18627.17,
+      "input_json_bytes": 4901
+    },
+    {
+      "kind": "tool_followup",
+      "elapsed_ms": 18627.69,
+      "input_json_bytes": 4905
+    },
+    {
+      "kind": "memory",
+      "conversation": "10001:group:20001:v0:group",
+      "source_count": 10,
+      "elapsed_ms": 67345.5,
+      "input_json_bytes": 4973
+    },
+    {
+      "kind": "memory",
+      "conversation": "10001:group:20002:v0:group",
+      "source_count": 10,
+      "elapsed_ms": 127345.47,
+      "input_json_bytes": 4987
+    },
+    {
+      "kind": "recall",
+      "elapsed_ms": 128210.03,
+      "input_json_bytes": 4732
+    },
+    {
+      "kind": "recall",
+      "elapsed_ms": 128210.9,
+      "input_json_bytes": 4734
+    }
+  ],
+  "database_counts": {
+    "messages": 64,
+    "conversations": 2,
+    "memories": 2,
+    "conversations_with_summary": 2,
+    "successful_clock_tools": 2,
+    "reminders": 1,
+    "cancelled_reminders": 1,
+    "wordle_games": 1,
+    "meal_items": 151,
+    "native_receipts": 5,
+    "outbox": [
+      {
+        "state": "confirmed",
+        "count": 32
+      }
+    ],
+    "logical_database_bytes": 503808
+  },
+  "lifetime_peak_resident_mib": 53.95,
+  "sampled_peak_private_mib": null,
+  "total_child_cpu_seconds": 0.21,
+  "samples": [
+    {
+      "phase": "startup",
+      "elapsed_ms": 7892.6,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 7892.78,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 8144.11,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 8395.16,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 8646.24,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 8897.33,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 9148.33,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 9399.36,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 9650.38,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 9901.41,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 10152.3,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "idle_before_admin_setup",
+      "elapsed_ms": 10394.29,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "admin_password_setup",
+      "elapsed_ms": 10417.62,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "admin_password_setup",
+      "elapsed_ms": 10449.64,
+      "resident_bytes": 15785984,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 15785984,
+      "cpu_seconds": 0.01
+    },
+    {
+      "phase": "admin_password_setup",
+      "elapsed_ms": 10555.43,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 10559.05,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 10700.85,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 10951.91,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 11202.83,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 11453.95,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 11704.9,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 11955.98,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 12206.95,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 12458.05,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 12709.01,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 12960,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "idle_after_admin_setup",
+      "elapsed_ms": 13059.76,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 13060.58,
+      "resident_bytes": 15896576,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 13210.28,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 13460.27,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.03
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 13710.91,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.04
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 13961.91,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.04
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 14212.39,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.05
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 14463.36,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.05
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 14714.74,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.05
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 14965.76,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.05
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 15217.02,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.06
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 15467.96,
+      "resident_bytes": 17117184,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.06
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 15718.31,
+      "resident_bytes": 17121280,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.06
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 15968.11,
+      "resident_bytes": 17121280,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.06
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 16218.8,
+      "resident_bytes": 17121280,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.07
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 16469.75,
+      "resident_bytes": 17121280,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.07
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 16720.49,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.07
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 16971.56,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.07
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 17223.16,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.08
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 17474.1,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.08
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 17724.52,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 17975.59,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "chat_20_two_groups",
+      "elapsed_ms": 18121.38,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 18121.97,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 18226.84,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 18477.9,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 18728.46,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 18979.51,
+      "resident_bytes": 17125376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.09
+    },
+    {
+      "phase": "clock_tool_two_groups",
+      "elapsed_ms": 19130.77,
+      "resident_bytes": 17129472,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.1
+    },
+    {
+      "phase": "reminder_create_list_cancel",
+      "elapsed_ms": 19131.26,
+      "resident_bytes": 17129472,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.1
+    },
+    {
+      "phase": "reminder_create_list_cancel",
+      "elapsed_ms": 19137.75,
+      "resident_bytes": 17133568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.1
+    },
+    {
+      "phase": "wordle_first_image",
+      "elapsed_ms": 19138.24,
+      "resident_bytes": 17133568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 35770368,
+      "cpu_seconds": 0.1
+    },
+    {
+      "phase": "wordle_first_image",
+      "elapsed_ms": 19151.36,
+      "resident_bytes": 43675648,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 43675648,
+      "cpu_seconds": 0.12
+    },
+    {
+      "phase": "wordle_guess_warm",
+      "elapsed_ms": 19151.95,
+      "resident_bytes": 43675648,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 43675648,
+      "cpu_seconds": 0.12
+    },
+    {
+      "phase": "wordle_guess_warm",
+      "elapsed_ms": 19202.48,
+      "resident_bytes": 44945408,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 44945408,
+      "cpu_seconds": 0.12
+    },
+    {
+      "phase": "calendar_warm",
+      "elapsed_ms": 19202.94,
+      "resident_bytes": 44945408,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 44945408,
+      "cpu_seconds": 0.12
+    },
+    {
+      "phase": "calendar_warm",
+      "elapsed_ms": 19230.23,
+      "resident_bytes": 45002752,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 45002752,
+      "cpu_seconds": 0.13
+    },
+    {
+      "phase": "calendar_warm",
+      "elapsed_ms": 19248.89,
+      "resident_bytes": 45002752,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 45002752,
+      "cpu_seconds": 0.13
+    },
+    {
+      "phase": "meal_menu_warm",
+      "elapsed_ms": 19249.49,
+      "resident_bytes": 45002752,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 45002752,
+      "cpu_seconds": 0.13
+    },
+    {
+      "phase": "meal_menu_warm",
+      "elapsed_ms": 19308.94,
+      "resident_bytes": 56037376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56037376,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 19309.42,
+      "resident_bytes": 56037376,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56037376,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 19480.54,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 19731.6,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 19982.76,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 20233.58,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 20484.44,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 20735.35,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 20986.59,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 21237.46,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 21488.64,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 21739.64,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 21990.67,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 22241.49,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 22492.37,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 22743.34,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 22993.27,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 23243.17,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 23494.34,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 23744.39,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 23996.05,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 24247.02,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 24497.98,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 24748.95,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 24999.9,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 25250.43,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 25501.57,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 25752.52,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 26003.5,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 26254.52,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 26505.52,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 26756.45,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 27007.34,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 27258.29,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 27508.34,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 27758.28,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 28008.13,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 28259.06,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 28509.04,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 28759.96,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 29011.38,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 29262.56,
+      "resident_bytes": 56045568,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56045568,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 29513.5,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 29764.45,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 30015.23,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 30265.28,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 30516.03,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 30767.19,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 31017.1,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 31268.06,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 31518.93,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 31769.9,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 32020.72,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 32271.8,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 32522.63,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 32773.49,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 33025.35,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 33276.27,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 33526.15,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 33777.13,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 34027.36,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 34278.26,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 34528.13,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 34779.26,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 35029.12,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 35279.99,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.14
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 35531.1,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 35782.15,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 36032.38,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 36283.3,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 36533.53,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 36784.72,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 37035.62,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 37286.46,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 37538.03,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 37788.97,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 38039.96,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 38290.91,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 38541.96,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 38792.83,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 39043.15,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 39294.02,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 39544.02,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 39794.85,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 40045.88,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 40296.71,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 40547.71,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 40798.63,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 41049.53,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 41300.69,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 41551.7,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 41802.56,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 42053.39,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 42304.34,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 42554.26,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 42805.13,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 43055.76,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 43306.89,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 43557.83,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 43808.89,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 44060.59,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 44311.51,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 44562.78,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 44814.09,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 45065.08,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 45315.98,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 45566.08,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 45817.07,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 46067.98,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 46318.87,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 46569.91,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 46820.75,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 47071.74,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 47322.65,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 47573.57,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 47824.94,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 48076.01,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 48326.95,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 48577.91,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 48828.89,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 49080.29,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 49331.19,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 49581.1,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 49831.98,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 50082.82,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 50333.76,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 50584.73,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 50835.57,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 51086.42,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 51337.38,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.15
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 51588.32,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 51839.25,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 52089.1,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 52340.07,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 52591.06,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 52841.91,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 53092.59,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 53343.65,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 53594.52,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 53845.45,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 54096.72,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 54347.7,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 54598.63,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 54849.58,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 55100.49,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 55351.42,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 55602.42,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 55853.29,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 56103.19,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 56354.11,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 56605,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 56855.94,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 57106.83,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 57357.77,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 57608.73,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 57859.65,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 58110.83,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 58361.81,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 58612.65,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 58863.56,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 59114.96,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 59365.88,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 59616.85,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 59867.71,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 60118.6,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 60369.74,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 60620.69,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 60871.62,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 61122.41,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 61373.25,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 61623.26,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 61874.14,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 62124.02,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 62374.92,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 62625.67,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 62876.65,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 63127.53,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 63378.43,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 63629.25,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 63880.16,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 64130.53,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 64381.42,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 64632.3,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 64882.26,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 65132.19,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 65383.08,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 65633.03,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 65883.95,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 66134.88,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 66385.88,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 66636.82,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 66887.82,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 67138.78,
+      "resident_bytes": 56225792,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56225792,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 67389.85,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 67640.8,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 67891.28,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 68141.1,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 68392.04,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 68642.89,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 68894.23,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 69144.08,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 69395.05,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 69645.95,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 69896.82,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 70147.95,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 70398.86,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 70649.63,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 70900.47,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 71151.39,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 71402.28,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 71652.19,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 71903.11,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 72154.11,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 72405.06,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 72655.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 72905.93,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 73157.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 73407.83,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 73658.84,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 73910.39,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 74161.17,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 74411.92,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 74662.83,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 74913.76,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 75164.54,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 75415.5,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 75666.29,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 75917.31,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 76167.21,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 76418.13,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 76669.01,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 76919.88,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 77170.76,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.16
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 77421.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 77672.52,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 77923.49,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 78174.38,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 78425.33,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 78675.27,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 78926.69,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 79177.54,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 79428.46,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 79679.59,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 79930.41,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 80181.24,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 80432.6,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 80683.52,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 80934.32,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 81184.32,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 81435.27,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 81685.14,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 81936.03,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 82186.87,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 82437.83,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 82688.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 82939.51,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 83190.42,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.17
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 83441.36,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 83692.24,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 83943.62,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 84194.37,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 84445.25,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 84695.14,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 84946.03,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 85196.85,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 85447.77,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 85698.7,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 85949.49,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 86200.37,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 86451.32,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 86701.39,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 86952.28,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 87202.01,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 87452.94,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 87703.94,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 87954.79,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 88205.64,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 88456.55,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 88707.48,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 88958.77,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 89209.79,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 89460.63,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 89711.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 89962.53,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 90213.31,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 90463.99,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 90714.84,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 90965.78,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 91216.64,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 91467.57,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 91718.33,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 91969.17,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 92219.18,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 92470.08,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 92721.06,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 92971.93,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 93222.88,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 93473.81,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 93724.53,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 93975.91,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 94226.8,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 94477.67,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 94728.58,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 94979.45,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 95230.24,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 95481.2,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 95731.94,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 95982.77,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 96233.68,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 96484.57,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 96735.45,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 96986.32,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 97236.22,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 97486.89,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 97737.79,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 97988.65,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 98239.51,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 98490.4,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 98741.32,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 98992.6,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 99243.58,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 99494.41,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 99745.28,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 99996.13,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 100247.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 100497.94,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 100748.9,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 100999.79,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 101250.93,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 101501.77,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 101752.64,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 102003.52,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 102254.27,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 102505.19,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 102756.13,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 103006.91,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 103257.55,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 103508.39,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 103759.11,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 104010.51,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 104261.25,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 104512.17,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 104763.1,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 105013.97,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 105264.79,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 105515.76,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 105766.86,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 106017.69,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 106268.48,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 106519.36,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 106770.29,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 107021.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 107271.89,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 107522.82,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 107773.67,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 108024.47,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 108275.3,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 108526.24,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 108776.15,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 109027.44,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 109278.18,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 109529.04,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 109779.95,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 110030.81,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 110281.65,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 110532.48,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 110783.33,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 111034.19,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 111284.98,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 111535.87,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 111786.75,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 112037.71,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 112288.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 112539.56,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 112790.6,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 113041.48,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 113292.03,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 113543.04,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 113793.94,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 114045.29,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 114295.83,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.18
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 114546.65,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 114797.55,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 115048.35,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 115298.11,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 115549.09,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 115800.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 116050.92,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 116301.78,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 116552.65,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 116803.63,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 117054.46,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 117305.35,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 117555.23,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 117805.15,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 118055.95,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 118306.81,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 118557.71,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 118808.62,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 119060,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 119310.88,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 119561.78,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 119812.67,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 120063.59,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 120314.38,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 120565.25,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 120816.14,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 121067.02,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 121318.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.19
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 121568.95,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 121819.9,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 122070.84,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 122321.68,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 122572.52,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 122823.28,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 123074.1,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 123324.85,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 123575.73,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 123826.74,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 124078.01,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 124328.78,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 124579.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 124830.49,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 125081.4,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 125332.27,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 125583.13,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 125834.07,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 126084.96,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 126335.86,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 126586.77,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 126837.66,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 127088.51,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 127339.34,
+      "resident_bytes": 56352768,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56352768,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 127590.2,
+      "resident_bytes": 56373248,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56373248,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 127840.97,
+      "resident_bytes": 56373248,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56373248,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 128091.25,
+      "resident_bytes": 56373248,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56373248,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_maintenance_wait_and_extract",
+      "elapsed_ms": 128205.86,
+      "resident_bytes": 56373248,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56373248,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "elapsed_ms": 128206.8,
+      "resident_bytes": 56373248,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56373248,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "elapsed_ms": 128341.55,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "elapsed_ms": 128592.43,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.2
+    },
+    {
+      "phase": "memory_recall_two_groups",
+      "elapsed_ms": 128712.98,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 128713.41,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 128843.13,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 129094.08,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 129344.87,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 129595.86,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 129846.87,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 130097.74,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 130348.6,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 130599.54,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 130850.5,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 131101.45,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 131352.29,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 131603.19,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    },
+    {
+      "phase": "idle_after_all_features",
+      "elapsed_ms": 131714.94,
+      "resident_bytes": 56569856,
+      "private_bytes": null,
+      "lifetime_peak_resident_bytes": 56569856,
+      "cpu_seconds": 0.21
+    }
+  ],
+  "limitations": [
+    "Only the isolated bot process is measured; Node/PowerShell, QQ/Milky, real model servers, Python/browser and container runtime/VM overhead are excluded.",
+    "Container mode, when selected, measures podman top HPID via host /proc; it is not cgroup memory or whole-container resource accounting. The deployment entrypoint is bypassed with an explicit synthetic config.",
+    "All 12 Rust native plugins are loaded, but only Wordle, deer calendar and meal-menu image paths are exercised; external-network plugins are not benchmarked.",
+    "Mock model waits 500 ms per request; chat/tool/memory latencies include that wait. Summarizer output is deterministic, not an intelligence-quality evaluation.",
+    "The memory phase includes the unchanged production 60-second maintenance cadence and a shortened configured 30-second idle threshold.",
+    "Admin password initialization is a separate first-run Argon2 workload; its peak is included in the lifetime peak.",
+    "Fresh database, 2 active conversations and 20 initial chat turns; this is not sustained-load, database-scale, reconnect or failure benchmarking.",
+    "Image timings include actual font/dictionary loading, rendering, PNG encoding and fetching the controlled local media URL.",
+    "Windows working set and private commit are different measures; sampled peaks may miss short transients. No memory-size acceptance threshold.",
+    "Temporary config, auth database and message database remain in target/perf-smoke; they contain synthetic test data only."
+  ],
+  "shutdown": {
+    "host_stopped_via_admin": true,
+    "isolated_process_exited": true
+  },
+  "storage": {
+    "after_process_exit": {
+      "sqlite_bytes": 503808,
+      "wal_bytes": 0,
+      "shm_bytes": 0
+    },
+    "after_explicit_checkpoint": {
+      "sqlite_bytes": 503808,
+      "wal_bytes": 0,
+      "shm_bytes": 0
+    }
+  },
+  "elapsed_total_ms": 132090.36,
+  "failures": []
+}

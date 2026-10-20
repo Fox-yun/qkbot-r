@@ -1,0 +1,33 @@
+# Optional rootless systemd/Quadlet unit for a Linux host with LLBot on loopback.
+# Symlink from ~/.config/containers/systemd/qkbot.container after building the image.
+[Unit]
+Description=小鱼 qkbot-r
+
+[Quadlet]
+# The image is local. The admin page must start even before QQ/network is ready;
+# qkbot retries the protocol connection itself.
+DefaultDependencies=false
+
+[Container]
+Image=localhost/qkbot-r:latest
+Pull=never
+ContainerName=qkbot
+Network=host
+Volume=qkbot-data:/data
+Environment=QKBOT_CONTAINER_NETWORK=host
+ReadOnly=true
+DropCapability=all
+NoNewPrivileges=true
+StopSignal=SIGTERM
+StopTimeout=600
+LogDriver=journald
+Label=io.github.fox-yun.qkbot=managed
+# Optional: Secret=qkbot-api,type=env,target=QKBOT_API_KEY
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=630
+
+[Install]
+WantedBy=default.target

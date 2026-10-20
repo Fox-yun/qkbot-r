@@ -2,7 +2,82 @@
 
 这个可选进程运行原版 NoneBot 插件，QQ 连接和会话权限仍由 Rust 宿主统一管理。未启用时无需 Python、浏览器或 ffmpeg。六项插件的真实版本、源码与功能差异见[源码核对](../../docs/nonebot-reference.md)。
 
-## 安装与启动
+## Podman 部署（可选）
+
+Rust 主镜像不含 Python。只有需要原版 NoneBot 插件时才构建本目录的独立镜像；构建使用现有 `requirements*.lock` 和 `pip --require-hashes`，没有换用同名插件或重新解析业务版本。基础 Python 镜像和 Debian 系统包仍由其发行源提供；需要固定基础镜像时可传 `--build-arg PYTHON_IMAGE=完整镜像摘要`。
+
+默认使用 PyPI 和 Debian 官方源。腾讯云服务器上若默认源连接缓慢，可仅在本次构建添加 `--build-arg PYTHON_IMAGE=mirror.ccs.tencentyun.com/library/python:3.11-slim-bookworm`、`--build-arg PYPI_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple` 和 `--build-arg DEBIAN_MIRROR=http://mirrors.tencentyun.com`。Python 包继续校验锁文件中的 SHA-256，Debian 源继续使用镜像内原有签名密钥；不修改宿主全局源、不关闭 TLS 或包签名校验。构建参数只用于公共镜像地址，不要嵌入凭据。[腾讯云官方软件源说明](https://cloud.tencent.com/document/product/213/8623)
+
+在仓库根目录构建。核心桥接验证只需：
+
+```sh
+podman build -f sidecar/nonebot/Containerfile \
+  --build-arg PROFILE=core \
+  -t localhost/qkbot-nonebot:latest .
+```
+
+六插件完整环境使用：
+
+```sh
+podman build -f sidecar/nonebot/Containerfile \
+  --build-arg PROFILE=full \
+  --build-arg WITH_BROWSER=1 \
+  --build-arg WITH_FFMPEG=1 \
+  --build-arg WITH_FONTS=1 \
+  -t localhost/qkbot-nonebot:latest .
+```
+
+`PROFILE` 可取下表中的安装 profile，默认 `core`。三个 `WITH_*` 参数默认均为 `0`：浏览器用于查成分、漫展和兽聚图片；ffmpeg 用于媒体处理；字体安装 Noto CJK、彩色 Emoji 和 DejaVu，供中文图片渲染使用。完整示例显式包含这些依赖，镜像会明显更大。`WITH_BROWSER=1` 只适用于包含 Playwright 的 `web` 或 `full` 环境，浏览器在构建时用锁定的 Playwright 安装，运行时不会自行安装；这是避免浏览器与 Python 包版本不匹配的方式。[Playwright 官方容器说明](https://playwright.dev/python/docs/docker)
+
+网络必须满足以下一种部署方式：
+
+- **Linux 宿主网络**：Rust、LLBot 在同一 Linux 主机，sidecar 使用 `--network host`，都能访问同一 `127.0.0.1`。
+- **同一 Pod**：Rust、LLBot、sidecar 全部加入 `qkbot` Pod，共享网络命名空间。桥端口 `3215` 无需发布到宿主；Web 端口只在创建 Pod 时发布。[Podman Pod 文档](https://docs.podman.io/en/latest/markdown/podman-pod-create.1.html)
+
+普通容器网络中的三个容器不能仅靠服务名称连接：桥明确限制 loopback，发送给 LLBot 的媒体地址也是 loopback。Windows/macOS 的 Podman Machine 是独立 Linux 虚拟机，`--network host` 指向该虚拟机，无法直接复用 Windows/macOS 上 QQ 的 `127.0.0.1`。这种环境应把 Linux 协议实现一起放入同一 Pod；现有 Windows QQ/LLBot 应继续使用下节本机 Python 方式。
+
+先在 Rust 管理页设置独立桥令牌、启用所需插件并保存应用，再将**相同令牌**放进 Podman secret。以下是 Linux Bash 的交互输入示例，令牌不会出现在命令参数中：
+
+```sh
+read -r -s -p 'NoneBot bridge token: ' QKBOT_NONEBOT_TOKEN
+printf '\n'
+printf '%s' "$QKBOT_NONEBOT_TOKEN" | podman secret create qkbot-nonebot-token -
+unset QKBOT_NONEBOT_TOKEN
+podman volume create qkbot-nonebot-data
+```
+
+Linux 宿主网络启动示例：
+
+```sh
+podman run -d --name qkbot-nonebot --init --network host \
+  --stop-timeout 30 --shm-size 512m \
+  --secret qkbot-nonebot-token,uid=10001,gid=10001,mode=0400 \
+  -v qkbot-nonebot-data:/data:U \
+  localhost/qkbot-nonebot:latest
+```
+
+同 Pod 部署时，将 `--network host` 换成 `--pod qkbot`；若 Pod 共享 IPC，把 `--shm-size 512m` 设在创建 Pod 时，并从此容器命令中删除。`512m` 是浏览器共享内存容量，并非整个容器的内存上限；按实际图片/浏览器负载调整。`--init` 用于回收浏览器子进程。容器内固定使用非 root 用户 `10001:10001`，`:U` 只调整这个独立命名卷的所有权。sidecar 不需要 Rust 数据库、管理台凭据目录或 LLBot 登录目录。
+
+默认从 `/run/secrets/qkbot-nonebot-token` 读取令牌，也支持 `QKBOT_NONEBOT_TOKEN_FILE` 指定其他挂载文件；若使用环境变量，启动时通过 `--env QKBOT_NONEBOT_TOKEN` 传入已设置的值，不要把值写在命令或镜像构建参数中。显式 token 文件与 token 环境变量同时设置会被拒绝。[Podman secrets 文档](https://docs.podman.io/en/latest/markdown/podman-run.1.html#secret-secret-opt-opt)
+
+可选插件配置先放入宿主受保护文件，再只读挂载到 `/config/plugins.toml`，并添加 `--env QKBOT_NONEBOT_PLUGIN_CONFIG=/config/plugins.toml`。其中路径必须是容器路径：完整镜像的浏览器已安装，不要复制 Windows 的 Chrome 路径；ffmpeg 使用 `/usr/bin/ffmpeg`。带 Cookie 的配置也可用 Podman secret 挂载。需要额外字体时，可将字体目录只读挂到 `/usr/local/share/fonts/custom`；字体自身许可证由提供者确认。
+
+| 运行环境变量 | 默认值与用途 |
+| --- | --- |
+| `QKBOT_NONEBOT_PROFILE` | 随构建 profile；完整镜像可改为任一子集，不能在核心镜像中凭此启用未安装的模块 |
+| `QKBOT_NONEBOT_URL` | `http://127.0.0.1:3215`，只允许 loopback HTTP |
+| `QKBOT_NONEBOT_PLUGIN_CONFIG` | 不设置，不额外读取插件 TOML |
+| `QKBOT_NONEBOT_CONCURRENCY` | `8`，同时处理事件数 |
+| `QKBOT_NONEBOT_TASK_TIMEOUT` | `120` 秒，与 Rust 一侧对齐 |
+| `QKBOT_NONEBOT_MEDIA_MAX_MIB` | `20`，与 Rust 一侧对齐，最大 `1024` |
+
+`/data` 持久化缓存、插件数据与配置。容器构建时仅把 WITFF 原版 `prefs.json` 文件链接到 `/data/witff-prefs.json`，使其个人输出偏好随卷保留；不改写插件业务代码。停止或重建容器不会删除命名卷。升级时重建镜像并重建容器，继续挂同一卷；不要同时启动两个 sidecar。Rust 必须先启动并应用桥配置，sidecar 启动时会读取真实插件目录，桥未就绪会明确退出；修复后运行 `podman start qkbot-nonebot`。用 `podman logs qkbot-nonebot` 检查启动错误，停止用 `podman stop qkbot-nonebot`。
+
+2026-10-20 已在 Debian 13 x86_64、rootless Podman 5.4.2 上构建并运行 `core`：Python 3.11.17，镜像约 197 MiB（Podman 报告的未压缩大小，含基础镜像；不是运行内存）。镜像 ID 为 `d34f3b555773b2d55b91fe8e2a273e66c610f2bb0756b670c190b1a01d5a21ec`。哈希锁安装及 `pip check` 通过；真实入口使用令牌文件与模拟桥建立认证 WebSocket、执行原版匹配器发送，并以退出码 0 响应 SIGTERM。还验证了 UID 10001、可写命名卷、容器重建后保留测试数据文件、无令牌时拒绝启动。入口单元测试 5 项通过。本轮仅验证 core 与数据持久化，未在 Linux 容器执行 WITFF 的业务偏好修改。
+
+**full 镜像、Linux 浏览器渲染和真实 QQ 容器链路仍未实测**。core 验证不代表六个业务插件都完成 Linux 验收；部署后先使用 `nb_echo` 验证文本、引用和图片下载，再逐项启用业务插件。Python 插件及网页渲染仍是受信任代码执行，不应将此容器称为不可信插件的安全沙箱。
+
+## 本机 Python 安装与启动
 
 使用 Python 3.11，在仓库根目录执行：
 
@@ -65,7 +140,7 @@ VoiceMusic 保留 `/点歌` 与 `/点一首歌`，最终发送语音。其 `uin`
 
 默认工作目录是 `data/nonebot-work`。LocalStore 缓存、数据与插件配置固定在其子目录，避免读取仓库 `.env`。媒体上传只允许缓存目录内的真实文件，或明确指定的 `run.py --media-root`；路径穿越、越出根目录的链接和宿主绝对路径转交均被拒绝。WITFF 原版将个人输出偏好写入隔离环境中自身包的 `prefs.json`，重新创建环境前如需保留，应单独备份该文件。
 
-桥默认每文件 20 MiB，可在 Rust `nonebot.media_max_bytes` 与 Python `run.py --media-max-mib` 两端一起调整，最大 1 GiB。文件按 64 KiB 块上传；大文件不会按其完整大小加载进桥内存。它与上游下载限制相互独立：parser 原版默认下载上限 90 MiB，B站下载原版为 500 MB，超过桥额度的文件会明确失败。上传 HTTP 超时取任务时限与 300 秒的较小值，普通桥 API 为 30 秒；大文件任务可同时调大两端任务时限。上游选择 bytes/base64 时，其自身仍可能将内容完整载入 Python 内存。媒体图片、语音、视频、文件和组合转发均保留结构；不会将失败发送伪装成成功。LLBot 与桥须能访问同一 `127.0.0.1`，当前方案不支持协议端位于另一台机器或不同容器网络。
+桥默认每文件 20 MiB，可在 Rust `nonebot.media_max_bytes` 与 Python `run.py --media-max-mib` 两端一起调整，最大 1 GiB。文件按 64 KiB 块上传；大文件不会按其完整大小加载进桥内存。它与上游下载限制相互独立：parser 原版默认下载上限 90 MiB，B站下载原版为 500 MB，超过桥额度的文件会明确失败。上传 HTTP 超时取任务时限与 300 秒的较小值，普通桥 API 为 30 秒；大文件任务可同时调大两端任务时限。上游选择 bytes/base64 时，其自身仍可能将内容完整载入 Python 内存。媒体图片、语音、视频、文件和组合转发均保留结构；不会将失败发送伪装成成功。LLBot 与桥须能访问同一 `127.0.0.1`；容器按上节共享网络，协议端位于另一台机器或独立网络命名空间仍不支持。
 
 ## 依赖与权限边界
 
@@ -91,5 +166,17 @@ Rust 的群/好友 Bot 开关、逐插件开关和最终发送校验始终生效
 ```
 
 第一组验证认证、真实官方模型与匹配器、跨插件拒绝、租约、取消、发送身份、媒体边界、无重试与 HTTP/WS 传输。第二组调用已安装的六个原版插件处理器，验证文本、别名、快捷命令、图片、语音和文件路径。第三组真实渲染三个上游模板，阻断 HTTP/HTTPS 素材请求并关闭临时浏览器。第四组复制已编译的 Rust 二进制到临时目录，启动真实 Rust 与 `run.py` 两个进程，由本机 Milky 模拟端注入消息并接收发送，验证文本、引用、图片实际下载、两次相同文本及持久发送回执；管理页和 AI 均关闭，退出时关闭子进程并删除临时数据。`--bot-bin` 可指定其他已编译路径，测试不会自行构建。真实网站与账号权限仍需要部署后分别验收，不能从模拟测试推导出所有网站永久可用。
+
+Linux 上可用已构建的 core 镜像运行容器入口检查。它在容器内部启动模拟桥，使用临时令牌，`--network none` 禁止外部网络；不需要 Rust 或 QQ 登录。以下测试卷专用于验收，不要换成运行中的数据卷：
+
+```sh
+podman volume create qkbot-nonebot-probe
+podman run --rm --init --network none \
+  -v qkbot-nonebot-probe:/data:U \
+  -v "$(pwd)/sidecar/nonebot/tests/container_probe.py:/qa/container_probe.py:ro" \
+  --entrypoint /opt/venv/bin/python \
+  localhost/qkbot-nonebot:latest /qa/container_probe.py
+podman volume rm qkbot-nonebot-probe
+```
 
 核心锁文件安装 29 个包，六插件完整环境 91 个包；这是安装规模，不是内存估值。浏览器启动、图片大小、并发媒体下载和 ffmpeg 是主要额外开销，完整 sidecar 通常远重于 Rust 核心。默认同时处理 8 个事件、单事件 120 秒；可用 `run.py --concurrency` 和 `--task-timeout` 调整，并与 Rust 任务超时对齐。尚未做真实 QQ 负载下的 RSS 压测，因而不承诺固定内存数字。

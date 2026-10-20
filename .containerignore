@@ -1,0 +1,25 @@
+# Allowlist: never send credentials, local runtime data, or toolchains to a builder.
+**
+!Containerfile
+!.containerignore
+!Cargo.toml
+!Cargo.lock
+!config.example.toml
+!src
+!src/**
+!assets
+!assets/**
+!deploy
+!deploy/container-entrypoint.sh
+!sidecar
+!sidecar/nonebot
+!sidecar/nonebot/Containerfile
+!sidecar/nonebot/catalog.json
+!sidecar/nonebot/requirements*.lock
+!sidecar/nonebot/run.py
+!sidecar/nonebot/qkbot_echo.py
+!sidecar/nonebot/container-entrypoint.py
+!sidecar/nonebot/profiles
+!sidecar/nonebot/profiles/*.toml
+!sidecar/nonebot/qkbot_bridge
+!sidecar/nonebot/qkbot_bridge/*.py

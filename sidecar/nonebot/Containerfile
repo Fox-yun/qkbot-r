@@ -1,0 +1,69 @@
+# Build from the repository root:
+# podman build -f sidecar/nonebot/Containerfile -t localhost/qkbot-nonebot:latest .
+ARG PYTHON_IMAGE=docker.io/library/python:3.11-slim-bookworm
+FROM ${PYTHON_IMAGE}
+
+ARG PROFILE=core
+ARG WITH_BROWSER=0
+ARG WITH_FFMPEG=0
+ARG WITH_FONTS=0
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+ARG DEBIAN_MIRROR=
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    QKBOT_NONEBOT_IMAGE_PROFILE=${PROFILE} \
+    QKBOT_NONEBOT_WORK_DIR=/data \
+    HOME=/data \
+    PATH=/opt/venv/bin:$PATH
+
+WORKDIR /opt/qkbot-nonebot
+COPY sidecar/nonebot/requirements*.lock ./locks/
+RUN set -eu; \
+    case "$PROFILE" in core|parser|parser-full|download|web|music|full) ;; *) echo "Invalid PROFILE" >&2; exit 1 ;; esac; \
+    for flag in "$WITH_BROWSER" "$WITH_FFMPEG" "$WITH_FONTS"; do \
+        case "$flag" in 0|1) ;; *) echo "Build feature flags must be 0 or 1" >&2; exit 1 ;; esac; \
+    done; \
+    if [ "$WITH_BROWSER" = 1 ]; then \
+        case "$PROFILE" in web|full) ;; *) echo "WITH_BROWSER requires PROFILE=web or full" >&2; exit 1 ;; esac; \
+    fi; \
+    if [ -n "$DEBIAN_MIRROR" ]; then \
+        DEBIAN_MIRROR="$DEBIAN_MIRROR" python -c 'import os,pathlib; p=pathlib.Path("/etc/apt/sources.list.d/debian.sources"); p.write_text(p.read_text().replace("http://deb.debian.org",os.environ["DEBIAN_MIRROR"].rstrip("/")))'; \
+    fi; \
+    packages=""; \
+    if [ "$WITH_FFMPEG" = 1 ]; then packages="$packages ffmpeg"; fi; \
+    if [ "$WITH_FONTS" = 1 ]; then packages="$packages fontconfig fonts-noto-cjk fonts-noto-color-emoji fonts-dejavu-core"; fi; \
+    if [ -n "$packages" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends $packages; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi; \
+    python -m venv /opt/venv; \
+    if [ "$PROFILE" = core ]; then lock=locks/requirements.lock; else lock="locks/requirements-$PROFILE.lock"; fi; \
+    python -m pip install --no-cache-dir --require-hashes --index-url "$PYPI_INDEX_URL" -r "$lock"; \
+    python -m pip check; \
+    if [ "$WITH_BROWSER" = 1 ]; then \
+        python -m playwright install --with-deps chromium; \
+        chmod -R a+rX /opt/playwright; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Source copies are deliberately explicit: never copy a local config, venv,
+# credentials, fixtures, generated media, or the repository working directory.
+COPY sidecar/nonebot/run.py sidecar/nonebot/qkbot_echo.py sidecar/nonebot/container-entrypoint.py ./
+COPY sidecar/nonebot/profiles ./profiles/
+COPY sidecar/nonebot/qkbot_bridge/*.py ./qkbot_bridge/
+RUN set -eu; \
+    groupadd --gid 10001 qkbot; \
+    useradd --uid 10001 --gid 10001 --no-create-home --home-dir /data qkbot; \
+    mkdir -p /data; \
+    chown 10001:10001 /data; \
+    python -c 'import importlib.util,pathlib; s=importlib.util.find_spec("nonebot_plugin_witff"); p=pathlib.Path(s.origin).parent/"prefs.json" if s else None; p.unlink(missing_ok=True) if p else None; p.symlink_to("/data/witff-prefs.json") if p else None'
+
+USER 10001:10001
+WORKDIR /data
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/opt/venv/bin/python", "/opt/qkbot-nonebot/container-entrypoint.py"]
+CMD []
