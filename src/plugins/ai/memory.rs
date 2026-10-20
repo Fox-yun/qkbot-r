@@ -45,6 +45,28 @@ const CURSOR_MIGRATION: &str = r#"
 ALTER TABLE ai_conversations ADD COLUMN memory_processed_until INTEGER NOT NULL DEFAULT 0;
 UPDATE ai_conversations SET memory_processed_until=compacted_until;
 "#;
+const ADMIN_MIGRATION: &str = r#"
+ALTER TABLE ai_memories ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE ai_memories ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE ai_memories ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ai_memories ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE ai_memories ADD COLUMN edited_by TEXT;
+ALTER TABLE ai_conversations ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
+INSERT OR IGNORE INTO ai_memory_provenance(memory_id,source_key,quote)
+ SELECT m.id,json_extract(e.value,'$.source_key'),json_extract(e.value,'$.quote')
+ FROM ai_memories m,json_each(m.evidence) e
+ WHERE json_type(e.value,'$.source_key')='text' AND json_type(e.value,'$.quote')='text';
+CREATE TABLE ai_memory_operations (
+ admin_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ request_hash TEXT NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(admin_id,session_id,request_id)
+);
+CREATE TABLE ai_memory_previews (
+ id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, session_id TEXT NOT NULL,
+ snapshot TEXT NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX ai_memory_previews_expiry ON ai_memory_previews(expires_at);
+"#;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -56,7 +78,7 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Preference => "preference",
             Self::Fact => "fact",
@@ -90,6 +112,12 @@ pub struct Memory {
     pub text: String,
     pub evidence: Vec<Evidence>,
     pub expires_at: Option<i64>,
+    #[serde(default = "legacy_origin")]
+    pub origin: String,
+}
+
+fn legacy_origin() -> String {
+    "legacy".to_owned()
 }
 
 #[derive(Debug)]
@@ -120,6 +148,7 @@ pub struct MessageSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryBatch {
     pub guard: ContextGuard,
+    pub memory_revision: i64,
     pub previous_compacted_until: i64,
     pub previous_memory_processed_until: i64,
     pub through_position: i64,
@@ -152,11 +181,6 @@ pub enum MemoryChange {
         evidence: Vec<Evidence>,
         ttl_days: Option<u16>,
     },
-    Forget {
-        id: i64,
-        subject_id: i64,
-        evidence: Vec<Evidence>,
-    },
 }
 
 #[derive(Clone)]
@@ -174,7 +198,8 @@ impl MemoryStore {
     }
     pub async fn init(&self) -> Result<()> {
         self.store.migrate("ai_memory", 1, MIGRATION).await?;
-        self.store.migrate("ai_memory", 2, CURSOR_MIGRATION).await
+        self.store.migrate("ai_memory", 2, CURSOR_MIGRATION).await?;
+        self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await
     }
 
     pub async fn is_revoked(&self, source_key: &str) -> Result<bool> {
@@ -386,9 +411,8 @@ fn source_by_key(
     Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only' FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, subject_id:r.get(2)?, role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
 }
 
-fn memory_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(i64, i64, String, String, String, Option<i64>)> {
+type MemoryRow = (i64, i64, String, String, String, Option<i64>, String);
+fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -396,10 +420,11 @@ fn memory_row(
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
     ))
 }
 
-fn decode_memory(raw: (i64, i64, String, String, String, Option<i64>)) -> Result<Memory> {
+fn decode_memory(raw: (i64, i64, String, String, String, Option<i64>, String)) -> Result<Memory> {
     Ok(Memory {
         id: raw.0,
         subject_id: raw.1,
@@ -407,12 +432,13 @@ fn decode_memory(raw: (i64, i64, String, String, String, Option<i64>)) -> Result
         text: raw.3,
         evidence: serde_json::from_str(&raw.4)?,
         expires_at: raw.5,
+        origin: raw.6,
     })
 }
 
-fn get_memory(db: &Connection, id: i64) -> Result<Option<Memory>> {
+pub(crate) fn get_memory(db: &Connection, id: i64) -> Result<Option<Memory>> {
     db.query_row(
-        "SELECT id,subject_id,kind,text,evidence,expires_at FROM ai_memories WHERE id=?1",
+        "SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE id=?1",
         [id],
         memory_row,
     )
@@ -429,7 +455,7 @@ fn memory_page(
 ) -> Result<MemoryPage> {
     ensure!(page > 0, "页码从 1 开始");
     purge_expired(db)?;
-    let total = usize::try_from(db.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND (expires_at IS NULL OR expires_at>?3)",params![conversation_id,subject_id,now()],|row|row.get::<_,i64>(0))?)?;
+    let total = usize::try_from(db.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3)",params![conversation_id,subject_id,now()],|row|row.get::<_,i64>(0))?)?;
     let total_pages = total.div_ceil(MEMORY_PAGE_SIZE).max(1);
     ensure!(page <= total_pages, "页码超出范围；当前共 {total_pages} 页");
     let offset = i64::try_from(
@@ -437,7 +463,7 @@ fn memory_page(
             .checked_mul(MEMORY_PAGE_SIZE)
             .context("page offset overflow")?,
     )?;
-    let mut stmt = db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4 OFFSET ?5")?;
+    let mut stmt = db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4 OFFSET ?5")?;
     let memories = stmt
         .query_map(
             params![
@@ -527,7 +553,7 @@ fn retrieve(
     let query = fts_query(query);
     let mut found = Vec::new();
     if !query.is_empty() {
-        let mut stmt=db.prepare("SELECT m.id,m.subject_id,m.kind,m.text,m.evidence,m.expires_at FROM ai_memory_search JOIN ai_memories m ON m.id=ai_memory_search.memory_id WHERE ai_memory_search MATCH ?1 AND m.conversation_id=?2 AND m.subject_id=?3 AND (m.expires_at IS NULL OR m.expires_at>?4) ORDER BY bm25(ai_memory_search),m.updated_at DESC,m.id DESC LIMIT ?5")?;
+        let mut stmt=db.prepare("SELECT m.id,m.subject_id,m.kind,m.text,m.evidence,m.expires_at,m.origin FROM ai_memory_search JOIN ai_memories m ON m.id=ai_memory_search.memory_id WHERE ai_memory_search MATCH ?1 AND m.conversation_id=?2 AND m.subject_id=?3 AND m.active=1 AND (m.expires_at IS NULL OR m.expires_at>?4) ORDER BY bm25(ai_memory_search),m.updated_at DESC,m.id DESC LIMIT ?5")?;
         found = stmt
             .query_map(
                 params![query, guard.conversation_id, subject_id, now(), candidates],
@@ -538,7 +564,7 @@ fn retrieve(
     }
     // Stable preferences and pending tasks remain useful when the user's wording changes.
     let mut seen: HashSet<i64> = found.iter().map(|m| m.id).collect();
-    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND kind IN('preference','task') AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
+    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND kind IN('preference','task') AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
     for row in stmt.query_map(
         params![guard.conversation_id, subject_id, now(), candidates],
         memory_row,
@@ -564,14 +590,14 @@ fn retrieve(
     Ok(result)
 }
 
-fn validate_text(text: &str) -> Result<()> {
+pub(crate) fn validate_text(text: &str) -> Result<()> {
     ensure!(
         !text.trim().is_empty() && text.chars().count() <= MAX_MEMORY_CHARS,
         "memory text must have 1..=180 characters"
     );
     Ok(())
 }
-fn validate_ttl(ttl: Option<u16>) -> Result<()> {
+pub(crate) fn validate_ttl(ttl: Option<u16>) -> Result<()> {
     ensure!(
         ttl.is_none_or(|days| (1..=365).contains(&days)),
         "memory TTL must be 1..=365 days"
@@ -582,8 +608,8 @@ fn validate_ttl(ttl: Option<u16>) -> Result<()> {
 fn purge_expired(db: &Connection) -> Result<()> {
     let timestamp = now();
     db.execute("DELETE FROM ai_memory_search WHERE memory_id IN (SELECT id FROM ai_memories WHERE expires_at<=?1)",[timestamp])?;
-    db.execute("DELETE FROM ai_memory_provenance WHERE memory_id IN (SELECT id FROM ai_memories WHERE expires_at<=?1)",[timestamp])?;
-    db.execute("DELETE FROM ai_memories WHERE expires_at<=?1", [timestamp])?;
+    // Expiry removes recall eligibility, not the administrator's evidence/history.
+    // Only an explicitly confirmed web operation physically forgets a record.
     Ok(())
 }
 
@@ -603,10 +629,10 @@ fn write_memory(
     let expires = ttl.map(|days| timestamp + i64::from(days) * 86_400);
     let encoded = serde_json::to_string(evidence)?;
     let id = if let Some(id) = id {
-        ensure!(db.execute("UPDATE ai_memories SET kind=?1,text=?2,evidence=?3,updated_at=?4,expires_at=?5 WHERE id=?6 AND conversation_id=?7 AND subject_id=?8",params![kind.as_str(),text,encoded,timestamp,expires,id,conversation_id,subject_id])?==1,"memory ownership changed");
+        ensure!(db.execute("UPDATE ai_memories SET kind=?1,text=?2,evidence=?3,updated_at=?4,expires_at=?5,version=version+1 WHERE id=?6 AND conversation_id=?7 AND subject_id=?8",params![kind.as_str(),text,encoded,timestamp,expires,id,conversation_id,subject_id])?==1,"memory ownership changed");
         id
     } else {
-        db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7)",params![conversation_id,subject_id,kind.as_str(),text,encoded,timestamp,expires])?;
+        db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,expires_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,'auto')",params![conversation_id,subject_id,kind.as_str(),text,encoded,timestamp,expires])?;
         db.last_insert_rowid()
     };
     for source in evidence {
@@ -618,6 +644,10 @@ fn write_memory(
     db.execute(
         "INSERT INTO ai_memory_search(memory_id,terms) VALUES(?1,?2)",
         params![id, lexical_terms(text).join(" ")],
+    )?;
+    db.execute(
+        "UPDATE ai_conversations SET memory_revision=memory_revision+1 WHERE id=?1",
+        [conversation_id],
     )?;
     Ok(id)
 }
@@ -643,7 +673,7 @@ fn revocation_inputs(memories: &[Memory]) -> Result<(String, String)> {
 const REVOCATION_KEYS: &str = "WITH keys AS MATERIALIZED (SELECT source_key FROM ai_memory_provenance WHERE memory_id IN (SELECT value FROM json_each(?1)) UNION SELECT value FROM json_each(?2))";
 const REVOCATION_RECORDS: &str = ", doomed AS MATERIALIZED (SELECT memory_id FROM ai_memory_provenance WHERE source_key IN (SELECT source_key FROM keys) UNION SELECT value FROM json_each(?1))";
 
-fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()> {
+pub(crate) fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()> {
     if memories.is_empty() {
         return Ok(());
     }
@@ -661,7 +691,7 @@ fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()> {
 }
 
 fn invalidate_context(db: &Connection, guard: &ContextGuard) -> Result<()> {
-    ensure!(db.execute("UPDATE ai_conversations SET epoch=epoch+1,summary='',compacted_until=0,memory_processed_until=0 WHERE id=?1 AND epoch=?2",params![guard.conversation_id,guard.epoch])?==1,"conversation changed");
+    ensure!(db.execute("UPDATE ai_conversations SET epoch=epoch+1,summary='',compacted_until=0,memory_processed_until=0,memory_revision=memory_revision+1 WHERE id=?1 AND epoch=?2",params![guard.conversation_id,guard.epoch])?==1,"conversation changed");
     Ok(())
 }
 
@@ -686,10 +716,10 @@ fn prepare_batch_modes(
         memory_write || summary_enabled,
         "both automatic memory and summary are disabled"
     );
-    let (previous, memory_previous, summary): (i64, i64, String) = db.query_row(
-        "SELECT compacted_until,memory_processed_until,summary FROM ai_conversations WHERE id=?1",
+    let (previous, memory_previous, summary, memory_revision): (i64, i64, String, i64) = db.query_row(
+        "SELECT compacted_until,memory_processed_until,summary,memory_revision FROM ai_conversations WHERE id=?1",
         [&guard.conversation_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let start = match (summary_enabled, memory_write) {
         (true, true) => previous.min(memory_previous),
@@ -768,7 +798,7 @@ fn prepare_batch_modes(
         .collect();
     let allowed_memories = if memory_write {
         let subjects = serde_json::to_string(&subjects)?;
-        let mut statement=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at FROM ai_memories WHERE conversation_id=?1 AND subject_id IN (SELECT value FROM json_each(?2)) AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT 16")?;
+        let mut statement=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id IN (SELECT value FROM json_each(?2)) AND active=1 AND locked=0 AND origin='auto' AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT 16")?;
         statement
             .query_map(params![guard.conversation_id, subjects, now()], memory_row)?
             .map(|row| decode_memory(row?))
@@ -778,6 +808,7 @@ fn prepare_batch_modes(
     };
     Ok(MemoryBatch {
         guard: guard.clone(),
+        memory_revision,
         previous_compacted_until: previous,
         previous_memory_processed_until: memory_previous,
         through_position,
@@ -800,7 +831,7 @@ fn serialize_allowed_memories<S: serde::Serializer>(
 ) -> std::result::Result<S::Ok, S::Error> {
     memories
         .iter()
-        .map(|m| json!({"id":m.id,"subject_id":m.subject_id,"kind":m.kind,"text":m.text}))
+        .map(|m| json!({"id":m.id,"subject_id":m.subject_id,"kind":m.kind,"text":m.text,"origin":m.origin}))
         .collect::<Vec<_>>()
         .serialize(serializer)
 }
@@ -916,15 +947,16 @@ fn commit_batch_with_limit(
     let tx = db.transaction()?;
     check_guard(&tx, &batch.guard)?;
     purge_expired(&tx)?;
-    let (compacted, memory_processed, summary): (i64, i64, String) = tx.query_row(
-        "SELECT compacted_until,memory_processed_until,summary FROM ai_conversations WHERE id=?1",
+    let (compacted, memory_processed, summary, revision): (i64, i64, String, i64) = tx.query_row(
+        "SELECT compacted_until,memory_processed_until,summary,memory_revision FROM ai_conversations WHERE id=?1",
         [&batch.guard.conversation_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     ensure!(
         compacted == batch.previous_compacted_until
             && memory_processed == batch.previous_memory_processed_until
-            && summary == batch.expected_summary,
+            && summary == batch.expected_summary
+            && revision == batch.memory_revision,
         "another summary already replaced this prefix"
     );
     // Validate the entire snapshot and every mutation before touching a row.
@@ -957,11 +989,6 @@ fn commit_batch_with_limit(
                 validate_ttl(*ttl_days)?;
                 (*id, *subject_id, evidence)
             }
-            MemoryChange::Forget {
-                id,
-                subject_id,
-                evidence,
-            } => (Some(*id), *subject_id, evidence),
         };
         validate_evidence(&tx, &batch, subject, evidence)?;
         if let Some(id) = id {
@@ -972,44 +999,22 @@ fn commit_batch_with_limit(
                 .find(|m| m.id == id && m.subject_id == subject)
                 .context("memory ID was not allowed for this subject")?;
             let current = get_memory(&tx, id)?.context("memory no longer exists")?;
+            let eligible: bool = tx.query_row("SELECT conversation_id=?2 AND origin='auto' AND active=1 AND locked=0 FROM ai_memories WHERE id=?1",params![id,batch.guard.conversation_id],|row|row.get(0))?;
+            ensure!(
+                eligible,
+                "automatic changes cannot modify locked, manual, inactive, or foreign memories"
+            );
             ensure!(
                 current.subject_id == allowed.subject_id
                     && current.kind == allowed.kind
                     && current.text == allowed.text
                     && current.evidence == allowed.evidence
-                    && current.expires_at == allowed.expires_at,
+                    && current.expires_at == allowed.expires_at
+                    && current.origin == allowed.origin,
                 "memory changed while summarizing"
             );
         }
     }
-    let mut forgotten_memories = Vec::new();
-    for change in &update.changes {
-        if let MemoryChange::Forget { id, .. } = change {
-            forgotten_memories.push(get_memory(&tx, *id)?.context("forgotten memory disappeared")?);
-        }
-    }
-    let (forgotten_ids, forgotten_keys) = revocation_inputs(&forgotten_memories)?;
-    for change in &update.changes {
-        if let MemoryChange::Upsert { evidence, .. } = change {
-            for source in evidence {
-                let revoked: bool = tx.query_row(
-                    &format!(
-                        "{REVOCATION_KEYS} SELECT EXISTS(SELECT 1 FROM keys WHERE source_key=?3)"
-                    ),
-                    params![forgotten_ids, forgotten_keys, source.source_key],
-                    |row| row.get(0),
-                )?;
-                ensure!(
-                    !revoked,
-                    "a batch cannot learn from sources it also forgets"
-                );
-            }
-        }
-    }
-    // Freeze every forgotten target first: removing one can also remove another
-    // target derived from the same source, whose other sources still need revoking.
-    let forgot = !forgotten_memories.is_empty();
-    revoke_memories(&tx, &forgotten_memories)?;
     let count: i64 = tx.query_row(
         "SELECT count(*) FROM ai_memories WHERE conversation_id=?1",
         [&batch.guard.conversation_id],
@@ -1017,7 +1022,6 @@ fn commit_batch_with_limit(
     )?;
     let mut count = usize::try_from(count)?;
     let mut skipped_new = 0;
-    let mut skipped_revoked = 0;
     for change in update.changes {
         match change {
             MemoryChange::Upsert {
@@ -1028,12 +1032,6 @@ fn commit_batch_with_limit(
                 evidence,
                 ttl_days,
             } => {
-                if let Some(id) = id
-                    && get_memory(&tx, id)?.is_none()
-                {
-                    skipped_revoked += 1;
-                    continue;
-                }
                 if id.is_none() && count >= maximum {
                     skipped_new += 1;
                     continue;
@@ -1052,12 +1050,9 @@ fn commit_batch_with_limit(
                     count += 1;
                 }
             }
-            MemoryChange::Forget { .. } => {}
         }
     }
-    if forgot {
-        invalidate_context(&tx, &batch.guard)?;
-    } else {
+    {
         tx.execute(
             "UPDATE ai_conversations SET summary=CASE WHEN ?1 THEN ?2 ELSE summary END,compacted_until=CASE WHEN ?1 THEN ?3 ELSE compacted_until END,memory_processed_until=CASE WHEN ?4 THEN ?3 ELSE memory_processed_until END WHERE id=?5 AND epoch=?6",
             params![
@@ -1073,9 +1068,6 @@ fn commit_batch_with_limit(
     tx.commit()?;
     if skipped_new > 0 {
         tracing::warn!(conversation_id=%batch.guard.conversation_id, skipped_new, maximum, "memory capacity reached; skipped validated new facts while preserving summary and existing facts");
-    }
-    if skipped_revoked > 0 {
-        tracing::warn!(conversation_id=%batch.guard.conversation_id, skipped_revoked, "skipped updates to memories removed by this batch's source revocations");
     }
     Ok(())
 }
@@ -1227,7 +1219,7 @@ mod tests {
         subject: Option<i64>,
     ) -> Result<Vec<Memory>> {
         purge_expired(db)?;
-        let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at FROM ai_memories WHERE conversation_id=?1 AND (?2 IS NULL OR subject_id=?2) ORDER BY id LIMIT 20")?;
+        let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND (?2 IS NULL OR subject_id=?2) ORDER BY id LIMIT 20")?;
         stmt.query_map(params![conversation, subject], memory_row)?
             .map(|row| decode_memory(row?))
             .collect()
@@ -1237,6 +1229,7 @@ mod tests {
         db.execute_batch("CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(CURSOR_MIGRATION).unwrap();
+        db.execute_batch(ADMIN_MIGRATION).unwrap();
         db
     }
     fn guard() -> ContextGuard {
@@ -1569,42 +1562,145 @@ mod tests {
         assert!(commit_batch(&mut db, batch, update).is_err());
     }
     #[test]
-    fn a_batch_cannot_relearn_its_own_forgotten_source() {
+    fn automatic_forget_is_rejected_at_deserialization() {
+        assert!(
+            serde_json::from_value::<MemoryChange>(
+                json!({"op":"forget","id":1,"subject_id":7,"evidence":[]})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn recall_preserves_manual_auto_and_legacy_attribution() {
+        let db = db();
+        for origin in ["manual", "auto", "legacy"] {
+            let id = write_memory(
+                &db,
+                "group",
+                None,
+                7,
+                MemoryKind::Preference,
+                "喜欢白茶",
+                &[],
+                None,
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE ai_memories SET origin=?1 WHERE id=?2",
+                params![origin, id],
+            )
+            .unwrap();
+            assert_eq!(get_memory(&db, id).unwrap().unwrap().origin, origin);
+        }
+        for query in ["白茶", "完全不匹配的词"] {
+            let memories = retrieve(&db, &guard(), 7, query, 5, 1000).unwrap();
+            let origins = memories
+                .iter()
+                .map(|memory| memory.origin.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(origins, HashSet::from(["manual", "auto", "legacy"]));
+        }
+        let old:Memory=serde_json::from_value(json!({"id":1,"subject_id":7,"kind":"fact","text":"旧记录","evidence":[],"expires_at":null})).unwrap();
+        assert_eq!(old.origin, "legacy");
+    }
+    #[test]
+    fn administrator_revision_and_locked_records_reject_automatic_changes() {
+        for (origin, locked, active) in [
+            ("manual", false, true),
+            ("auto", true, true),
+            ("auto", false, false),
+            ("legacy", false, true),
+        ] {
+            let mut db = db();
+            let end = source(&db, "human", 7, "我喜欢红茶", "user");
+            let id = write_memory(
+                &db,
+                "group",
+                None,
+                7,
+                MemoryKind::Preference,
+                "红茶",
+                &evidence("human", "红茶"),
+                None,
+            )
+            .unwrap();
+            let mut batch = prepare_batch(&db, &guard(), end, true).unwrap();
+            let frozen = batch.allowed_memories[0].clone();
+            db.execute(
+                "UPDATE ai_memories SET origin=?1,locked=?2,active=?3 WHERE id=?4",
+                params![origin, locked, active, id],
+            )
+            .unwrap();
+            let fresh = prepare_batch(&db, &guard(), end, true).unwrap();
+            assert!(fresh.allowed_memories.is_empty());
+            // Even a retained/forged allowed list cannot bypass current metadata checks.
+            batch.allowed_memories = vec![frozen];
+            assert!(
+                commit_batch(
+                    &mut db,
+                    batch,
+                    BatchUpdate {
+                        summary: String::new(),
+                        changes: vec![MemoryChange::Upsert {
+                            id: Some(id),
+                            subject_id: 7,
+                            kind: MemoryKind::Preference,
+                            text: "茶".into(),
+                            evidence: evidence("human", "茶"),
+                            ttl_days: None
+                        }]
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(get_memory(&db, id).unwrap().unwrap().text, "红茶");
+        }
         let mut db = db();
-        let end = source(&db, "same", 7, "我喜欢喝茶", "user");
-        let id = write_memory(
-            &db,
-            "group",
-            None,
-            7,
-            MemoryKind::Preference,
-            "喜欢喝茶",
-            &evidence("same", "喜欢喝茶"),
-            None,
+        let end = source(&db, "human", 7, "今天天气很好", "user");
+        let batch = prepare_batch(&db, &guard(), end, true).unwrap();
+        db.execute(
+            "UPDATE ai_conversations SET memory_revision=memory_revision+1 WHERE id='group'",
+            [],
         )
         .unwrap();
-        let batch = prepare_batch(&db, &guard(), end, true).unwrap();
-        let update = BatchUpdate {
-            summary: String::new(),
-            changes: vec![
-                MemoryChange::Forget {
-                    id,
-                    subject_id: 7,
-                    evidence: evidence("same", "喜欢喝茶"),
-                },
-                MemoryChange::Upsert {
-                    id: None,
-                    subject_id: 7,
-                    kind: MemoryKind::Preference,
-                    text: "喜欢喝茶".into(),
-                    evidence: evidence("same", "喜欢喝茶"),
-                    ttl_days: None,
-                },
-            ],
-        };
-        assert!(commit_batch(&mut db, batch, update).is_err());
-        assert!(get_memory(&db, id).unwrap().is_some());
-        assert!(!is_revoked(&db, "same").unwrap());
+        assert!(
+            commit_batch(
+                &mut db,
+                batch,
+                BatchUpdate {
+                    summary: "旧任务摘要".into(),
+                    changes: vec![]
+                }
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn administrator_migration_preserves_legacy_evidence() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,compacted_until INTEGER NOT NULL DEFAULT 0); INSERT INTO ai_conversations VALUES('old',7);").unwrap();
+        db.execute_batch(MIGRATION).unwrap();
+        db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at) VALUES('old',7,'fact','旧记录',?1,1,1)",[serde_json::to_string(&evidence("old-source","原文")).unwrap()]).unwrap();
+        db.execute_batch(CURSOR_MIGRATION).unwrap();
+        db.execute_batch(ADMIN_MIGRATION).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT origin,active,locked,version FROM ai_memories",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, i64>(3)?
+                ))
+            )
+            .unwrap(),
+            ("legacy".into(), true, false, 1)
+        );
+        assert_eq!(
+            get_memory(&db, 1).unwrap().unwrap().evidence[0].source_key,
+            "old-source"
+        );
     }
     #[test]
     fn forget_tombstones_sources_and_invalidates_frozen_batch() {
@@ -1989,107 +2085,22 @@ mod tests {
                 None,
             )
             .unwrap();
-            let through = source(&db, "forget-request", 7, "请忘记所有地址", "user");
-            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
-            let mut changes = vec![first, second]
-                .into_iter()
-                .map(|id| MemoryChange::Forget {
-                    id,
-                    subject_id: 7,
-                    evidence: evidence("forget-request", "忘记所有地址"),
-                })
-                .collect::<Vec<_>>();
+            let mut targets = vec![
+                get_memory(&db, first).unwrap().unwrap(),
+                get_memory(&db, second).unwrap().unwrap(),
+            ];
             if reverse {
-                changes.reverse();
+                targets.reverse();
             }
-            commit_batch(
-                &mut db,
-                batch,
-                BatchUpdate {
-                    summary: String::new(),
-                    changes,
-                },
-            )
-            .unwrap();
+            let tx = db.transaction().unwrap();
+            revoke_memories(&tx, &targets).unwrap();
+            invalidate_context(&tx, &guard()).unwrap();
+            tx.commit().unwrap();
             assert!(is_revoked(&db, "shared").unwrap());
             assert!(is_revoked(&db, "second-history").unwrap());
             assert!(get_memory(&db, first).unwrap().is_none());
             assert!(get_memory(&db, second).unwrap().is_none());
             assert_eq!(db.query_row("SELECT epoch,compacted_until,memory_processed_until FROM ai_conversations WHERE id='group'",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap(),(2,0,0));
-        }
-    }
-    #[test]
-    fn forgetting_precedes_capacity_checks_and_skips_revoked_updates_in_either_order() {
-        for reverse in [false, true] {
-            let mut db = db();
-            source(&db, "shared", 7, "我喜欢红茶", "user");
-            let first = write_memory(
-                &db,
-                "group",
-                None,
-                7,
-                MemoryKind::Preference,
-                "红茶",
-                &evidence("shared", "红茶"),
-                None,
-            )
-            .unwrap();
-            let second = write_memory(
-                &db,
-                "group",
-                None,
-                7,
-                MemoryKind::Fact,
-                "喝茶",
-                &evidence("shared", "红茶"),
-                None,
-            )
-            .unwrap();
-            let through = source(&db, "new-request", 7, "忘记红茶，我喜欢绿茶", "user");
-            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
-            let mut changes = vec![
-                MemoryChange::Upsert {
-                    id: None,
-                    subject_id: 7,
-                    kind: MemoryKind::Preference,
-                    text: "喜欢绿茶".into(),
-                    evidence: evidence("new-request", "喜欢绿茶"),
-                    ttl_days: None,
-                },
-                MemoryChange::Forget {
-                    id: first,
-                    subject_id: 7,
-                    evidence: evidence("new-request", "忘记红茶"),
-                },
-                MemoryChange::Upsert {
-                    id: Some(second),
-                    subject_id: 7,
-                    kind: MemoryKind::Fact,
-                    text: "绿茶".into(),
-                    evidence: evidence("new-request", "绿茶"),
-                    ttl_days: None,
-                },
-            ];
-            if reverse {
-                changes.reverse();
-            }
-            commit_batch_with_limit(
-                &mut db,
-                batch,
-                BatchUpdate {
-                    summary: String::new(),
-                    changes,
-                },
-                2,
-            )
-            .unwrap();
-            assert!(get_memory(&db, first).unwrap().is_none());
-            assert!(get_memory(&db, second).unwrap().is_none());
-            let left = list_memories(&db, "group", Some(7)).unwrap();
-            assert_eq!(left.len(), 1);
-            assert_eq!(left[0].text, "喜欢绿茶");
-            assert!(is_revoked(&db, "shared").unwrap());
-            assert!(!is_revoked(&db, "new-request").unwrap());
         }
     }
     #[test]
@@ -2141,7 +2152,7 @@ mod tests {
         );
     }
     #[test]
-    fn expired_memories_release_capacity_and_search_rows() {
+    fn expired_memories_leave_recall_but_preserve_records_and_evidence() {
         let db = db();
         let id = write_memory(
             &db,
@@ -2156,7 +2167,12 @@ mod tests {
         .unwrap();
         db.execute("UPDATE ai_memories SET expires_at=1 WHERE id=?1", [id])
             .unwrap();
-        assert!(list_memories(&db, "group", None).unwrap().is_empty());
+        assert!(
+            retrieve(&db, &guard(), 7, "茶", 5, 1000)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(get_memory(&db, id).unwrap().is_some());
         assert_eq!(
             db.query_row("SELECT count(*) FROM ai_memory_search", [], |r| r
                 .get::<_, i64>(0))
@@ -2167,7 +2183,7 @@ mod tests {
             db.query_row("SELECT count(*) FROM ai_memory_provenance", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            0
+            1
         );
     }
     #[test]

@@ -3,10 +3,13 @@
 
   const $ = (id) => document.getElementById(id);
   const state = {
-    token: "", session: 0, config: null, draft: null, revision: null,
+    authenticated: false, csrf: "", setupRequired: false, session: 0, config: null, draft: null, revision: null,
     secrets: {}, status: null, qq: null, busy: false, dirty: false,
-    jsonDirty: false, formInvalid: false, stale: false, poll: null,
-    polling: false, qqPollingPaused: false, qqQueryVersion: 0, qqError: "", qrExpires: null, view: "overview",
+    jsonDirty: false, formInvalid: false, stale: false,
+    runtimeTimer: null, qqTimer: null, runtimePolling: false, qqPolling: false,
+    qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
+    memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
+    pendingOperation: null,
   };
   const inputs = new Map();
   const secretInputs = new Map();
@@ -56,9 +59,8 @@
     { title: "会话与触发", description: "仅处理白名单中的会话。真实 @机器人、私聊或关键词可触发聊天。", fields: [
       field("access.groups", "允许的群号", "ids", "每行一个，也可使用逗号或空格分隔。空列表不允许群聊。"),
       field("access.friends", "允许的私聊 QQ 号", "ids", "每行一个。空列表不允许私聊。"),
-      field("access.admins", "管理员 QQ 号", "ids", "管理员可以修改群共享会话的设置。"),
       field("plugins.ai.keywords", "关键词触发", "lines", "每行一个；子串匹配。清空后仍可通过真实 @或私聊触发。"),
-      field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有群请使用 /ai mode 切换，避免复用旧会话。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
+      field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有会话在「记忆与上下文」中单独管理。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
       field("plugins.ai.defaults.persona", "默认人设名称", "text", "必须与下方人设表中的名称对应。"),
       field("plugins.ai.personas", "人设表", "json", "JSON 对象：名称对应人设文本。所有名称和文本均可编辑。", { full: true }),
     ] },
@@ -72,7 +74,7 @@
       field("plugins.ai.defaults.memory_write", "自动提炼长期记忆", "check", "只接受带有效原文证据的事实变更。"),
       field("plugins.ai.read_group_background", "读取群内背景消息", "check", "未触发的群消息也可进入上下文，与长期记忆学习独立。"),
       field("plugins.ai.learn_all_group_messages", "学习群内背景消息", "check", "未触发的群消息也可用于长期记忆；仍受记忆写入开关约束。"),
-      field("plugins.ai.defaults.paused", "默认暂停自动聊天", "check", "可使用 /ai resume 恢复，或 /ai once 放行一次。"),
+      field("plugins.ai.defaults.paused", "默认暂停自动聊天", "check", "可在「记忆与上下文」恢复或只放行一次回复。"),
     ] },
     { title: "插件", description: "启用需要的功能。写入类工具默认要求用户确认。", fields: [
       field("plugins.ai.enabled", "AI 聊天", "check", "启用后需配置有效的模型地址和名称。"),
@@ -82,6 +84,10 @@
       field("plugins.reminder.max_active_per_user", "每人最多活跃提醒", "number", "", { min: 1 }),
     ] },
     { title: "容量与整理", description: "并发、队列和后台整理均有边界。可先保留默认值，再按使用情况调整。", fields: [
+      field("limits.model_user_per_hour", "每位用户每小时模型请求上限", "number", "", { min: 1, max: 100000 }),
+      field("limits.model_conversation_per_hour", "每个会话每小时模型请求上限", "number", "", { min: 1, max: 100000 }),
+      field("limits.model_global_per_hour", "全局每小时模型请求上限", "number", "", { min: 1, max: 100000 }),
+      field("limits.memory_requests_per_hour", "每小时后台记忆整理请求上限", "number", "", { min: 1, max: 100000 }),
       field("limits.queued_global", "全局等待队列", "number", "", { min: 1, max: 1024 }),
       field("limits.queued_per_conversation", "单会话等待队列", "number", "不能超过全局等待队列。", { min: 1 }),
       field("limits.turn_timeout_secs", "完整聊天轮次超时（秒）", "number", "", { min: 1 }),
@@ -99,43 +105,45 @@
       field("plugins.ai.memory_recall_limit", "每轮最多召回记忆", "number", "", { min: 1 }),
       field("plugins.ai.memory_recall_budget", "召回记忆预算（估算）", "number", "", { min: 64 }),
     ] },
-    { title: "程序设置", description: "剩余低频参数可在完整 JSON 中编辑。管理端监听地址和令牌只能在本机配置文件修改。", fields: [
-      field("app.database", "SQLite 数据库路径", "text", "修改路径会使用该路径对应的数据库。"),
+    { title: "程序设置", description: "剩余低频参数可在完整 JSON 中编辑。监听地址、数据库路径和日志级别需要重启整个程序。", fields: [
+      field("app.database", "SQLite 数据库路径", "text", "修改后需重启整个程序，管理服务与机器人会统一使用新数据库。"),
       field("app.timezone", "时区", "text", "例如 Asia/Shanghai。"),
       field("app.log", "日志过滤级别", "text", "例如 info 或 qkbot=debug。修改后需要重启整个小鱼程序；应用机器人配置不会重载日志过滤器。"),
     ] },
   ];
 
   class ApiError extends Error {
-    constructor(message, status = 0) { super(message); this.status = status; }
+    constructor(message, status = 0, code = "", retryAfter = 0, path = "") { super(message); this.status = status; this.code = code; this.retryAfter = retryAfter; this.path = path; }
   }
 
   async function api(path, method = "GET", body) {
     const session = state.session;
-    const headers = { Accept: "application/json", Authorization: `Bearer ${state.token}` };
+    const headers = { Accept: "application/json" };
+    if (method !== "GET" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let response;
     try {
       response = await fetch(path, {
         method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-        credentials: "omit", cache: "no-store", redirect: "error",
+        credentials: "same-origin", cache: "no-store", redirect: "error",
         signal: AbortSignal.timeout(20000),
       });
     } catch (error) {
-      throw new ApiError(error.name === "TimeoutError" ? "请求超时，请检查管理服务是否仍在运行。" : "无法连接管理服务，请检查服务状态和网络。");
+      throw new ApiError(error.name === "TimeoutError" ? "请求超时，请检查管理服务是否仍在运行。" : "无法连接管理服务，请检查服务状态和网络。", 0, "network", 0, path);
     }
     if (session !== state.session) throw new ApiError("页面登录状态已变化。", -1);
-    if (response.status === 401) {
-      logout("管理令牌无效或已失效，请重新登录。");
-      throw new ApiError("管理令牌无效或已失效，请重新登录。", 401);
-    }
-    const text = await response.text();
+    let text;
+    try { text = await response.text(); } catch { throw new ApiError("响应传输中断，请先核对操作结果。", 0, "network", 0, path); }
     if (session !== state.session) throw new ApiError("页面登录状态已变化。", -1);
     let result = {};
     try { if (text) result = JSON.parse(text); } catch {
-      throw new ApiError(`服务返回了无法读取的数据（HTTP ${response.status}）。`, response.status);
+      throw new ApiError(`服务返回了无法读取的数据（HTTP ${response.status}）。`, response.status, "invalid_response", 0, path);
     }
-    if (!response.ok) throw new ApiError(typeof result.error === "string" ? result.error : `请求失败（HTTP ${response.status}）。`, response.status);
+    if (!response.ok) {
+      const error = new ApiError(typeof result.error === "string" ? result.error : `请求失败（HTTP ${response.status}）。`, response.status, result.code || "", Number(result.retry_after_ms) || 0, path);
+      if (result.code === "auth_required" || (response.status === 401 && !path.startsWith("/api/auth/"))) clearSession("登录会话已失效，请重新登录。");
+      throw error;
+    }
     return result;
   }
 
@@ -146,8 +154,14 @@
   }
 
   function report(error) {
-    if (error.status === 401 || error.status === -1) return;
-    if (error.status === 409) {
+    if (error.status === -1 || error.code === "auth_required") return;
+    if (error.code === "reauth_required") { $("reauth-error").textContent = ""; $("reauth-dialog").showModal(); return; }
+    if (error.code === "csrf_invalid") {
+      notice("页面安全凭据已变化，正在重新读取。当前编辑保留，请稍后手动重试操作。", "warning");
+      void api("/api/auth/state").then((view) => { if (view.authenticated) authView(view); else clearSession("登录会话已失效，请重新登录。"); }).catch((failure) => notice(failure.message, "error"));
+      return;
+    }
+    if (error.status === 409 && error.path === "/api/config") {
       state.stale = true;
       $("config-warning").textContent = "配置已被其他页面或本机修改。本页编辑仍保留；请先复制需要保留的内容，再点击「重新载入」取得最新版本。";
       $("config-warning").hidden = false;
@@ -257,7 +271,7 @@
       card.append(heading, grid); $("config-groups").append(card);
     });
     const web = state.config.web || {};
-    $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · web 分组与管理令牌只读，请在本机配置文件中修改并重启管理服务。${state.secrets.admin_token?.env_set ? " 管理令牌当前由环境变量提供。" : ""}`;
+    $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
     updateControls();
   }
 
@@ -294,9 +308,9 @@
   function validateImmutable(config) {
     if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("配置必须是 JSON 对象。");
     if (canonical(config.web) !== canonical(state.config.web)) throw new Error("web 分组不能在线修改，请恢复此分组，或通过本机配置文件修改后重启管理服务。");
-    for (const path of ["llm.api_key", "milky.access_token", "qq_login.token", "web.token"]) {
+    for (const path of ["llm.api_key", "milky.access_token", "qq_login.token"]) {
       const value = get(config, path);
-      if (value != null && value !== "") throw new Error(`请勿在 JSON 的 ${path} 中填入密钥；使用对应的密钥控件设置。管理令牌不能在线修改。`);
+      if (value != null && value !== "") throw new Error(`请勿在 JSON 的 ${path} 中填入密钥；使用对应的密钥控件设置。`);
     }
     for (const key of Object.keys(state.config)) {
       if (!Object.hasOwn(config, key)) throw new Error(`完整 JSON 缺少 ${key} 分组；请保留全部配置字段。`);
@@ -358,23 +372,40 @@
   }
 
   function updateControls() {
-    const unavailable = state.busy || !state.config;
-    document.querySelectorAll("[data-action]").forEach((button) => { button.disabled = unavailable; });
-    $("config-fields").disabled = unavailable || state.jsonDirty;
-    $("config-json").disabled = unavailable || state.formInvalid;
-    $("save-config").disabled = unavailable || state.stale;
-    $("save-apply").disabled = unavailable || state.stale;
-    $("adopt-json").disabled = unavailable || !state.jsonDirty;
-    $("discard-json").disabled = unavailable || !state.jsonDirty;
-    $("dirty-label").textContent = state.jsonDirty ? "JSON 有未采用的修改" : state.dirty ? "有未保存的修改" : "配置已同步";
-    const phase = state.status?.phase;
-    const transitional = phase === "starting" || phase === "stopping";
-    $("connect-runtime").hidden = !["stopped", "error"].includes(phase);
-    $("apply-runtime").hidden = ["stopped", "error"].includes(phase);
-    $("connect-runtime").disabled = unavailable || transitional || !phase;
-    $("apply-runtime").disabled = unavailable || transitional || !phase;
-    $("stop-runtime").disabled = unavailable || phase === "stopped" || phase === "stopping" || !phase;
-    $("get-qr").disabled = unavailable || !state.config?.qq_login?.enabled || !state.secrets.llbot_token?.effective_set || state.qq?.online === true;
+    const unavailable = state.busy || !state.authenticated || !state.config;
+    const pending = Boolean(state.pendingOperation);
+    document.querySelectorAll("[data-action]").forEach((node) => { node.disabled = unavailable; });
+    document.querySelectorAll("[data-memory-write]").forEach((node) => { node.disabled = unavailable || pending || state.memory.conflict || state.memory.settingsDirty; });
+    $("config-fields").disabled = unavailable || state.jsonDirty || pending;
+    $("config-json").disabled = unavailable || pending || (!state.jsonDirty && state.formInvalid);
+    $("dirty-label").textContent = state.stale ? "请先核对最新配置" : state.dirty || state.jsonDirty ? "有尚未保存的修改" : "配置已同步";
+    for (const id of ["save-config", "save-apply"]) $(id).disabled = unavailable || pending || state.stale;
+    for (const id of ["connect-runtime", "apply-runtime", "stop-runtime"]) $(id).disabled = unavailable || pending || ["starting", "stopping"].includes(state.status?.phase);
+    $("stop-runtime").disabled ||= state.status?.phase === "stopped";
+    $("get-qr").disabled = unavailable || !canPollQq() || Boolean(state.qq?.online);
+    $("conversation-settings-fields").disabled = unavailable || pending || !state.memory.detail || state.memory.conflict;
+    const memoryBlocked = unavailable || pending || !state.memory.detail || state.memory.conflict;
+    for (const id of ["pause-conversation", "once-conversation", "reset-conversation", "new-memory", "change-conversation-mode"]) $(id).disabled = memoryBlocked || state.memory.settingsDirty;
+    $("save-conversation-settings").disabled = memoryBlocked || !state.memory.settingsDirty;
+    $("conversation-mode").disabled = memoryBlocked || state.memory.settingsDirty || state.memory.detail?.scene !== "group";
+    $("change-conversation-mode").disabled ||= state.memory.detail?.scene !== "group";
+    $("forget-selected").disabled = memoryBlocked || state.memory.settingsDirty || !state.memory.checked.size;
+    $("save-memory").disabled = memoryBlocked;
+    $("confirm-forget").disabled = memoryBlocked || !state.memory.preview;
+    $("conversation-dirty").textContent = state.memory.settingsDirty ? "有尚未保存的会话设置" : "与当前会话同步";
+    $("memory-selection-count").textContent = state.memory.checked.size ? "已选择 " + state.memory.checked.size + " 条" : "未选择";
+    for (const [prefix, page, total] of [["conversations", state.memory.page, state.memory.totalPages], ["memories", state.memory.pageMemories, state.memory.totalMemoryPages]]) {
+      $(prefix + "-prev").disabled = unavailable || page <= 1;
+      $(prefix + "-next").disabled = unavailable || page >= total;
+    }
+    $("check-operation").disabled = state.busy || !state.authenticated;
+    $("logout").disabled = state.busy;
+    $("change-password").disabled = state.busy;
+    $("reauth-submit").disabled = state.busy;
+    $("open-security").disabled = state.busy;
+    document.querySelectorAll("#memory-editor-form input,#memory-editor-form select,#memory-editor-form textarea").forEach((node) => { node.disabled = state.busy || pending; });
+    $("edit-memory-subject").disabled ||= Boolean(state.memory.editing?.id);
+    $("edit-memory-locked").disabled ||= !state.memory.editing?.id;
   }
 
   async function loadConfig() {
@@ -383,13 +414,13 @@
     state.config = clone(result.config); state.draft = clone(result.config);
     state.revision = result.revision; state.secrets = result.secrets || {};
     state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
-    resumeQqPolling();
+    resumeQqPolling(); clearQr();
     $("config-warning").hidden = true;
-    $("saved-revision").textContent = `已保存版本：${state.revision}`;
-    renderFields(); syncJson(); renderStatus();
+    $("saved-revision").textContent = "已保存版本：" + state.revision;
+    renderFields(); syncJson(); renderStatus(); renderQq(); scheduleQq(0);
   }
 
-  function badge(id, text, kind) { $(id).textContent = text; $(id).className = `badge ${kind}`; }
+  function badge(id, text, kind) { $(id).textContent = text; $(id).className = "badge " + kind; }
   const phases = {
     stopped: ["已停止", "准备连接", "neutral"], starting: ["启动中", "正在启动机器人", "wait"],
     waiting_login: ["等待登录", "等待 QQ 登录", "wait"], running: ["运行中", "小鱼正在运行", "good"],
@@ -400,259 +431,592 @@
     const date = new Date(stamp > 1e12 ? stamp : stamp * 1000);
     return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN", { hour12: false });
   };
-
   function renderStatus() {
     if (!state.status) { updateControls(); return; }
     const status = state.status;
     const [label, title, kind] = phases[status.phase] || ["未知状态", "等待状态更新", "neutral"];
     badge("runtime-badge", label, kind); badge("header-status", label, kind);
     $("runtime-title").textContent = title;
-    $("runtime-message").textContent = typeof status.message === "string" ? status.message : "";
+    $("runtime-message").textContent = String(status.message || "");
     $("bot-id").textContent = status.bot_id == null ? "—" : String(status.bot_id);
     $("started-at").textContent = dateText(status.started_at);
-    const matches = state.revision && status.applied_revision === state.revision;
-    $("revision-state").textContent = !status.applied_revision ? "尚未应用" : matches ? "已应用最新配置" : "有待应用配置";
-    $("revision-detail").textContent = status.applied_revision ? `运行版本：${status.applied_revision}` : "保存后点击连接或应用配置";
+    $("revision-state").textContent = !status.applied_revision ? "尚未应用" : status.applied_revision === state.revision ? "已应用最新配置" : "有待应用配置";
+    $("revision-detail").textContent = status.applied_revision ? "运行版本：" + status.applied_revision : "保存后点击连接或应用配置";
+    $("poll-state").textContent = document.hidden ? "页面隐藏，已暂停轮询" : "自动同步";
     updateControls();
   }
-
-  function renderQq() {
-    const qq = state.qq;
-    if (!state.config?.qq_login?.enabled) {
-      badge("qq-badge", "适配已关闭", "neutral");
-      $("qq-detail").textContent = "请先在配置管理中启用 QQ 登录适配并保存。";
-      $("account-name").textContent = state.status?.online ? "机器人已在线" : "登录适配未启用";
-      $("account-id").textContent = state.status?.bot_id ? `QQ ${state.status.bot_id}` : "可使用外部客户端完成登录";
-    } else if (!state.secrets.llbot_token?.effective_set) {
-      badge("qq-badge", "未配置凭据", "wait");
-      $("qq-detail").textContent = "请在配置管理中设置 LLBot WebUI 密码 / 令牌并保存，再获取二维码。";
-      $("account-name").textContent = state.status?.online ? "机器人已在线" : "等待配置登录凭据";
-      $("account-id").textContent = state.status?.bot_id ? `QQ ${state.status.bot_id}` : "自动登录状态查询尚未启用";
-    } else if (state.qqPollingPaused) {
-      badge("qq-badge", "登录查询已暂停", "bad");
-      $("qq-detail").textContent = `${state.qqError || "无法连接 QQ 管理端。"} 自动查询已暂停，请检查地址与 WebUI 密码，手动刷新状态、获取二维码或保存配置后重试。`;
-      $("account-name").textContent = "QQ 状态暂不可用";
-      $("account-id").textContent = "已暂停重复请求，避免触发上游登录保护";
-    } else if (qq?.online) {
-      badge("qq-badge", "QQ 已登录", "good");
-      $("account-name").textContent = qq.nick || "QQ 已登录";
-      $("account-id").textContent = qq.uin ? `QQ ${qq.uin}` : "账号在线";
-      $("qq-detail").textContent = `${qq.nick || "QQ"}${qq.uin ? `（${qq.uin}）` : ""} 已登录。等待中的机器人会自动连接。`;
-      clearQr();
-      $("qr-placeholder").replaceChildren(element("span", "", "✓"), element("strong", "", "QQ 已登录"), element("p", "", "返回运行概览即可检查机器人连接。"));
-      $("qr-expiry").textContent = "账号已在线，无需重新获取二维码。";
-    } else {
-      badge("qq-badge", "QQ 未登录", "wait");
-      $("account-name").textContent = "尚未登录";
-      $("account-id").textContent = "前往 QQ 登录页扫码";
-      $("qq-detail").textContent = "登录状态每 5 秒自动同步。扫码成功后无需反复重启机器人。";
-      if ($("qr-image").hidden) $("qr-placeholder").replaceChildren(element("span", "", "▦"), element("strong", "", "等待获取二维码"), element("p", "", "点击下方按钮，用手机 QQ 扫码登录。"));
-      updateQrExpiry();
-    }
-    updateControls();
+  async function loadBudget() {
+    const result = await api("/api/budget");
+    const usage = Array.isArray(result.usage) ? result.usage : [];
+    const total = (name) => usage.reduce((sum, row) => sum + (Number(row[name]) || 0), 0).toLocaleString("zh-CN");
+    const box = $("budget-usage"); box.replaceChildren();
+    for (const [title, value, hint] of [
+      ["前台请求", String(result.used?.foreground ?? 0) + " / " + String(result.limits?.model_global_per_hour ?? "—"), "最近 1 小时 · 全局上限"],
+      ["后台整理", String(result.used?.background ?? 0) + " / " + String(result.limits?.memory_requests_per_hour ?? "—"), "最近 1 小时 · 独立预算"],
+      ["输入 token", total("input_tokens"), "最近 7 天 · 服务商实际用量"],
+      ["输出 token", total("output_tokens"), "最近 7 天 · 服务商实际用量"],
+    ]) { const item = element("div", "budget-item"); item.append(element("span", "section-label", title), element("strong", "", value), element("p", "hint", hint)); box.append(item); }
   }
-
+  function canPollQq() { return Boolean(state.config?.qq_login?.enabled && state.secrets.llbot_token?.effective_set); }
   function clearQr() {
-    $("qr-image").removeAttribute("src"); $("qr-image").hidden = true;
-    $("qr-placeholder").hidden = false; state.qrExpires = null;
-    $("get-qr").textContent = "获取登录二维码";
+    $("qr-image").hidden = true; $("qr-image").removeAttribute("src"); $("qr-placeholder").hidden = false;
+    state.qrExpires = null; $("qr-expiry").textContent = "二维码不会自动刷新，避免正在扫描时失效。"; $("get-qr").textContent = "获取登录二维码";
   }
-
-  function updateQrExpiry() {
-    if (state.qrExpires == null) {
-      $("qr-expiry").textContent = "二维码不会自动刷新；失效后请手动获取新的二维码。";
-      return;
-    }
-    const expires = state.qrExpires > 1e12 ? state.qrExpires : state.qrExpires * 1000;
-    $("qr-expiry").textContent = expires <= Date.now() ? "二维码已过期，请点击「刷新二维码」。" : `二维码有效期至 ${dateText(state.qrExpires)}；不会自动刷新。`;
+  function renderQq() {
+    let label = "待同步", kind = "neutral", text = "正在读取 QQ 状态。";
+    if (!state.config?.qq_login?.enabled) { label = "未启用"; text = "请先在配置中启用 QQ 登录适配。"; }
+    else if (!state.secrets.llbot_token?.effective_set) { label = "待配置"; text = "请先配置 LLBot WebUI 地址和密码。"; }
+    else if (state.qqPollingPaused) { label = "等待检查"; kind = "bad"; text = state.qqError + " 自动查询已暂停，修正配置后手动刷新。"; }
+    else if (state.qqError) { label = "暂时不可用"; kind = "wait"; text = state.qqError + " 将稍后重试。"; }
+    else if (state.qq?.online) { label = "已登录"; kind = "good"; text = "QQ 已在线，每 30 秒或服务端建议间隔同步。"; clearQr(); }
+    else if (state.qq) { label = "等待扫码"; kind = "wait"; text = "QQ 尚未登录，按服务端建议间隔同步状态。"; }
+    badge("qq-badge", label, kind);
+    $("qq-detail").textContent = text;
+    $("account-name").textContent = state.qq?.online ? String(state.qq.nick || "已登录") : label;
+    $("account-id").textContent = state.qq?.online ? "QQ " + String(state.qq.uin || "—") : "前往 QQ 登录查看详情";
+    if (state.qrExpires && !$("qr-image").hidden) $("qr-expiry").textContent = Date.now() >= state.qrExpires * 1000 ? "二维码可能已过期，请手动刷新。" : "二维码有效期至 " + dateText(state.qrExpires);
+    updateControls();
   }
-
+  function stopTimers() { clearTimeout(state.runtimeTimer); clearTimeout(state.qqTimer); state.runtimeTimer = null; state.qqTimer = null; }
+  function scheduleRuntime(delay = 5000) {
+    clearTimeout(state.runtimeTimer);
+    if (state.authenticated && !document.hidden) state.runtimeTimer = setTimeout(() => { void refreshStatus(); }, delay);
+  }
+  function scheduleQq(delay = state.qqInterval) {
+    clearTimeout(state.qqTimer);
+    if (state.authenticated && !document.hidden && canPollQq() && !state.qqPollingPaused) state.qqTimer = setTimeout(() => { void refreshQq(); }, delay);
+  }
   function resumeQqPolling() {
-    state.qqQueryVersion += 1;
-    state.qqPollingPaused = false;
-    state.qqError = "";
+    state.qqQueryVersion++; state.qqPolling = false; state.qqPollingPaused = false; state.qqFailures = 0;
+    state.qqInterval = 5000; state.qqError = ""; state.qq = null; clearTimeout(state.qqTimer);
   }
-
   async function refreshStatus(manual = false) {
-    if (manual) resumeQqPolling();
-    if (!state.token || state.polling) return;
-    state.polling = true;
-    const session = state.session;
-    try {
-      const requests = [api("/api/status")];
-      const queryQq = Boolean(state.config?.qq_login?.enabled && state.secrets.llbot_token?.effective_set && !state.qqPollingPaused);
-      const qqVersion = state.qqQueryVersion;
-      if (queryQq) requests.push(api("/api/qq/status"));
-      const results = await Promise.allSettled(requests);
-      if (session !== state.session) return;
-      if (results[0].status === "fulfilled") { state.status = results[0].value; renderStatus(); }
-      const currentQq = queryQq && qqVersion === state.qqQueryVersion;
-      if (currentQq && results[1].status === "fulfilled") state.qq = results[1].value;
-      const failed = results[0].status === "rejected" ? results[0] : currentQq && results[1].status === "rejected" ? results[1] : null;
-      $("poll-state").textContent = failed ? "状态同步失败" : `已同步 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
-      if (currentQq && results[1].status === "rejected") {
-        state.qqPollingPaused = true; state.qq = null;
-        state.qqError = results[1].reason.message || "无法查询 QQ 登录状态。";
-      }
-      renderQq();
-      if (failed && manual) report(failed.reason);
-      else if (manual) notice("状态已刷新。");
-      if (!state.qq?.online) updateQrExpiry();
-    } finally { if (session === state.session) state.polling = false; }
+    if (!state.authenticated || state.runtimePolling || document.hidden) return;
+    const session = state.session; state.runtimePolling = true;
+    try { state.status = await api("/api/status"); renderStatus(); if (manual) notice("运行状态已更新。"); }
+    catch (error) { if (session === state.session && error.status !== -1) { if (manual) report(error); else badge("header-status", "状态暂不可用", "wait"); } }
+    finally { if (session === state.session) { state.runtimePolling = false; scheduleRuntime(); } }
   }
-
+  function qqFailure(error) {
+    state.qqError = error.message || "QQ 状态查询失败。";
+    if (["qq_auth", "qq_config"].includes(error.code)) state.qqPollingPaused = true;
+    else { state.qqFailures++; state.qqInterval = Math.min(60000, Math.max(Number(error.retryAfter) || 0, 3000 * 2 ** Math.min(state.qqFailures - 1, 5))); }
+  }
+  async function refreshQq(manual = false) {
+    if (!state.authenticated || !canPollQq() || document.hidden) return;
+    if (manual) resumeQqPolling();
+    if (state.qqPolling || state.qqPollingPaused) return;
+    const version = state.qqQueryVersion, session = state.session; state.qqPolling = true;
+    try {
+      const result = await api("/api/qq/status" + (manual ? "?force=true" : ""));
+      if (version !== state.qqQueryVersion) return;
+      state.qq = result; state.qqError = ""; state.qqFailures = 0;
+      state.qqInterval = Math.max(result.online ? 30000 : 1000, Math.min(60000, Number(result.poll_interval_ms) || 5000));
+      renderQq();
+    } catch (error) { if (session === state.session && version === state.qqQueryVersion && error.status !== -1) { qqFailure(error); renderQq(); if (manual) report(error); } }
+    finally { if (session === state.session && version === state.qqQueryVersion) { state.qqPolling = false; scheduleQq(); } }
+  }
+  async function getQr() {
+    resumeQqPolling(); const version = state.qqQueryVersion;
+    try {
+      const result = await api("/api/qq/qrcode", "POST", {});
+      if (version !== state.qqQueryVersion) return;
+      if (typeof result.image !== "string" || result.image.length > 4 * 1024 * 1024 || !/^data:image\/png;base64,[A-Za-z0-9+/=\r\n]+$/u.test(result.image)) throw new Error("服务端没有返回有效的 PNG 二维码。");
+      $("qr-image").src = result.image; $("qr-image").hidden = false; $("qr-placeholder").hidden = true;
+      $("get-qr").textContent = "刷新登录二维码";
+      state.qrExpires = Number(result.expires_at) || null; state.qqInterval = Math.max(1000, Math.min(60000, Number(result.poll_interval_ms) || 5000));
+      renderQq(); scheduleQq();
+    } catch (error) { if (version === state.qqQueryVersion && error.status !== -1) { qqFailure(error); renderQq(); scheduleQq(); } throw error; }
+  }
   async function runAction(action) {
     if (state.busy) return;
-    state.busy = true; updateControls();
-    const session = state.session;
-    try { await action(); } catch (error) { report(error); }
+    const session = state.session; state.busy = true; updateControls();
+    try { return await action(); } catch (error) { report(error); }
     finally { if (session === state.session) { state.busy = false; updateControls(); } }
   }
-
-  async function applyRuntime() {
-    await api("/api/runtime/apply", "POST", {});
-    notice("连接任务已提交。QQ 尚未登录时，请前往 QQ 登录页扫码，机器人会自动等待连接。");
-    await refreshStatus();
+  const uncertain = (error) => error.status === 0 || error.status >= 500 || error.code === "invalid_response";
+  function trackOperation(operation) {
+    state.pendingOperation = operation;
+    $("operation-text").textContent = operation.label + "的响应未确认。请查询结果；页面不会重复提交。" + (operation.requestId ? " 操作号：" + operation.requestId : "");
+    $("operation-notice").hidden = false; updateControls();
   }
-
-  async function saveConfig(apply) {
-    if (state.stale) throw new Error("请先重新载入最新配置版本，再保存。");
-    if (state.jsonDirty) adoptJson();
-    const config = readForm();
-    const logChanged = config.app.log !== state.config.app.log;
-    const logHint = logChanged ? " 日志级别已修改，需要重启整个小鱼程序后生效。" : "";
-    const secrets = secretChanges();
-    try { await api("/api/config", "PUT", { revision: state.revision, config, secrets }); } catch (error) {
-      if (error.status === 0 || error.status >= 500) {
-        state.stale = true;
-        $("config-warning").textContent = "保存结果尚未确认，本页编辑仍保留。请先复制需要保留的内容，再重新载入核实服务端配置；不会自动重复保存。";
-        $("config-warning").hidden = false;
-      }
+  function clearOperation() { state.pendingOperation = null; $("operation-notice").hidden = true; updateControls(); }
+  async function applyRuntime(stop = false) {
+    try { await api(stop ? "/api/runtime/stop" : "/api/runtime/apply", "POST", {}); }
+    catch (error) {
+      if (uncertain(error)) { trackOperation({ kind: "runtime", label: stop ? "断开连接" : "应用配置", goal: stop ? "stopped" : "running", revision: state.revision }); return; }
       throw error;
     }
-    // Fetch the normalized saved version; never reuse an optimistic or stale revision.
-    try { await loadConfig(); } catch (error) {
-      if (error.status === 401 || error.status === -1) throw error;
-      state.stale = true;
-      $("config-warning").textContent = "配置已保存，但读取新版本失败。请重新载入后再继续编辑或应用。";
-      $("config-warning").hidden = false;
-      throw new Error(`配置已保存；尚未应用。${error.message}${logHint}`);
+    notice(stop ? "已提交断开请求。" : "已提交应用请求，连接进度会自动更新。"); await refreshStatus();
+  }
+  async function saveConfig(apply) {
+    if (state.jsonDirty) adoptJson();
+    const config = readForm(), secrets = secretChanges();
+    const logChanged = config.app.log !== state.config.app.log, databaseChanged = config.app.database !== state.config.app.database;
+    try { await api("/api/config", "PUT", { revision: state.revision, config, secrets }); }
+    catch (error) {
+      if (uncertain(error)) { state.stale = true; trackOperation({ kind: "config", label: "保存配置", previousRevision: state.revision, config }); return; }
+      throw error;
     }
-    if (apply) {
-      try {
-        await applyRuntime();
-        if (logChanged) notice(`配置已保存，连接任务已提交。${logHint.trim()}`);
-      } catch (error) {
-        if (error.status === 401 || error.status === -1) throw error;
-        throw new Error(`配置已保存，但应用未完成：${error.message}${logHint}`);
-      }
-    } else notice(`配置已保存。运行中的机器人保持当前配置，点击「应用已保存配置」后生效。${logHint}`);
+    await loadConfig();
+    if (databaseChanged) notice("配置已保存。数据库路径已改变，请重启整个程序后再使用；不会在当前进程中应用。", "warning");
+    else if (apply) { await applyRuntime(); if (logChanged) notice("配置已保存并提交应用。日志过滤级别仍需要重启整个程序。", "warning"); }
+    else notice("配置已保存，应用后生效。" + (logChanged ? " 日志过滤级别需要重启整个程序。" : ""), logChanged ? "warning" : "success");
   }
-
+  async function checkOperation() {
+    const operation = state.pendingOperation; if (!operation) return;
+    if (operation.kind === "memory") {
+      const result = await api("/api/memory/operations/" + encodeURIComponent(operation.requestId));
+      if (result.status === "completed") { clearOperation(); await operation.complete(result); }
+      else notice("尚未查到完成记录。请稍后再次查询，不要重新提交。操作号：" + operation.requestId, "warning");
+    } else if (operation.kind === "config") {
+      const result = await api("/api/config");
+      clearOperation(); state.stale = true;
+      $("config-warning").hidden = false;
+      $("config-warning").textContent = result.revision !== operation.previousRevision && canonical(result.config) === canonical(operation.config)
+        ? "服务器已有匹配的配置。密钥不可回读，请核对密钥状态后重新载入；不会自动应用。"
+        : "已取得服务器当前版本，但无法确认这次保存。当前编辑仍保留，请先复制再重新载入核对。";
+      notice($("config-warning").textContent, "warning"); updateControls();
+    } else {
+      state.status = await api("/api/status"); renderStatus();
+      const done = operation.goal === "stopped" ? state.status.phase === "stopped" : state.status.applied_revision === operation.revision && ["running", "waiting_login"].includes(state.status.phase);
+      if (done || state.status.phase === "error") { clearOperation(); notice(done ? "运行状态已确认。" : String(state.status.message || "运行时应用失败。"), done ? "success" : "error"); }
+      else notice("当前状态：" + String(state.status.phase) + "。请稍后再次查询。", "warning");
+    }
+  }
   function showView(view) {
-    if (!["overview", "qq", "config"].includes(view)) return;
+    if (!["overview", "qq", "config", "memory"].includes(view)) return;
     state.view = view;
-    for (const name of ["overview", "qq", "config"]) $(`view-${name}`).hidden = name !== view;
-    document.querySelectorAll(".nav-item").forEach((button) => {
-      const active = button.dataset.view === view;
-      button.classList.toggle("active", active);
-      if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
-    });
-    window.scrollTo({ top: 0, behavior: "instant" });
+    document.querySelectorAll(".view").forEach((node) => { node.hidden = node.id !== "view-" + view; });
+    document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
+    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", config: "配置管理", memory: "记忆与上下文" }[view];
+    if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
+    if (view === "qq") scheduleQq(0);
+  }
+  const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty;
+  function authView(result) {
+    state.authenticated = Boolean(result.authenticated); state.csrf = result.csrf_token || ""; state.setupRequired = Boolean(result.setup_required);
+    $("setup-code-field").hidden = !state.setupRequired; $("setup-confirm-field").hidden = !state.setupRequired;
+    $("setup-code").required = state.setupRequired; $("setup-confirm").required = state.setupRequired;
+    $("admin-password").minLength = state.setupRequired ? 12 : 1; $("admin-password").autocomplete = state.setupRequired ? "new-password" : "current-password";
+    $("password-label").textContent = state.setupRequired ? "设置管理员密码" : "管理员密码";
+    $("login-description").textContent = state.setupRequired ? "使用本机启动时显示的一次性初始化码，设置管理员密码。" : "输入管理员密码，进入本机管理台。";
+    $("login-hint").textContent = state.setupRequired ? "密码至少 12 个字符。初始化码只用于首次设置。" : "登录状态由安全会话 Cookie 管理；退出后立即撤销。";
+    $("login-button").textContent = state.setupRequired ? "初始化并登录" : "登录管理台"; $("login-button").disabled = false;
+  }
+  function clearSession(message = "") {
+    stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
+    state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false;
+    state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
+    inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
+    clearMemorySelection(); state.memory.list = []; $("conversation-list").replaceChildren(); $("budget-usage").replaceChildren();
+    document.querySelectorAll("dialog").forEach((dialog) => { if (dialog.open) dialog.close(); });
+    document.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
+    $("setup-code").value = ""; clearQr(); $("app").hidden = true; $("login-screen").hidden = false;
+    $("notice").hidden = true; $("operation-notice").hidden = true; $("login-error").textContent = message;
+    authView({ authenticated: false, setup_required: state.setupRequired }); updateControls();
+  }
+  async function enterSession(result) {
+    authView(result); state.session++;
+    await loadConfig();
+    $("login-screen").hidden = true; $("app").hidden = false; $("login-error").textContent = "";
+    document.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; }); $("setup-code").value = "";
+    showView("overview");
+    await Promise.allSettled([refreshStatus(), refreshQq(), loadBudget()]);
+    updateControls();
+  }
+  async function bootstrap() {
+    try { const result = await api("/api/auth/state"); authView(result); if (result.authenticated) await enterSession(result); }
+    catch (error) { $("login-error").textContent = error.message; $("login-button").disabled = false; }
   }
 
-  function logout(message = "") {
-    clearInterval(state.poll); state.poll = null; state.token = ""; state.session += 1;
-    state.config = null; state.draft = null; state.revision = null; state.secrets = {};
-    state.status = null; state.qq = null; state.busy = false; state.polling = false;
-    state.qqPollingPaused = false; state.qqError = "";
-    state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
-    inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren();
-    $("config-json").value = ""; $("admin-token").value = ""; clearQr();
-    $("app").hidden = true; $("login-screen").hidden = false;
-    $("login-error").textContent = message; $("login-button").disabled = false;
-    $("notice").hidden = true; $("admin-token").focus();
+
+  const settingInputs = new Map();
+  const settingDefinitions = [
+    field("persona", "人设名称", "text", "对应已保存配置中的人设表。"),
+    field("input_budget", "输入预算（保守估算）", "number", "", { min: 1024, max: 262144 }),
+    field("output_budget", "输出 token 上限", "number", "", { min: 64, max: 32768 }),
+    field("recent_messages", "最近历史条数", "number", "", { min: 0, max: 4096 }),
+    field("allowed_tools", "允许的工具", "lines", "每行一个工具名，例如 clock_now。"),
+    field("summary", "生成并使用摘要", "check", "关闭后不生成或注入摘要；保留原文按历史条数读取。"),
+    field("memory_read", "读取长期记忆", "check", "将当前范围内相关记忆加入回复上下文。"),
+    field("memory_write", "自动提炼记忆", "check", "与摘要开关独立，只处理有效的人类消息证据。"),
+  ];
+  const kindNames = { fact: "事实", preference: "偏好", task: "任务", event: "事件" };
+  function positiveId(value, label, optional = false) {
+    const text = String(value).trim(); if (!text && optional) return null;
+    const number = Number(text);
+    if (!/^\d+$/u.test(text) || !Number.isSafeInteger(number) || number <= 0) throw new Error(label + "需要填写有效的正整数 QQ 号。");
+    return number;
   }
+  function scopeTitle(conversation) {
+    return (conversation.scene === "group" ? "群 " : "私聊 ") + String(conversation.peer_id ?? conversation.scope) + (conversation.owner_id ? " · 成员 " + conversation.owner_id : "");
+  }
+  function scopeDescription(conversation) {
+    return "机器人 " + String(conversation.bot_id ?? "—") + " · " + (conversation.mode === "user" ? "成员隔离" : "共享上下文") + " · 版本 " + conversation.epoch + " / " + conversation.memory_revision + (conversation.is_current === false ? " · 历史会话" : "");
+  }
+  function memoryIsCurrent(version, id) { return state.authenticated && state.memory.version === version && state.memory.selected?.id === id; }
+  function clearMemorySelection() {
+    state.memory.version++; state.memory.selected = null; state.memory.detail = null; state.memory.rows = []; state.memory.checked.clear();
+    state.memory.settingsDirty = false; state.memory.editorDirty = false; state.memory.editing = null; state.memory.preview = null; state.memory.conflict = false;
+    settingInputs.clear(); $("conversation-settings-grid").replaceChildren(); $("memory-list").replaceChildren(); $("context-content").replaceChildren();
+    $("selected-conversation").hidden = true; $("no-conversation").hidden = false; $("context-details").open = false;
+    $("conversation-conflict").hidden = true; $("memory-editor-form").reset(); $("forget-preview").replaceChildren();
+    for (const id of ["memory-editor", "forget-dialog"]) if ($(id).open) $(id).close();
+  }
+  function canDiscardMemory() {
+    if (state.pendingOperation?.kind === "memory") { notice("请先查询并确认当前记忆操作的结果。", "warning"); return false; }
+    return !(state.memory.settingsDirty || state.memory.editorDirty) || window.confirm("当前会话有未保存的编辑。确定放弃并重新载入或切换范围？");
+  }
+  async function loadConversations() {
+    const query = new URLSearchParams({ page: String(state.memory.page) });
+    for (const [id, key] of [["scope-bot", "bot_id"], ["scope-peer", "peer_id"], ["scope-owner", "owner_id"]]) {
+      const number = positiveId($(id).value, $(id).previousElementSibling?.textContent || "筛选项", true);
+      if (number !== null) query.set(key, String(number));
+    }
+    for (const [id, key] of [["scope-scene", "scene"], ["scope-mode", "mode"]]) if ($(id).value) query.set(key, $(id).value);
+    const result = await api("/api/memory/conversations?" + query);
+    state.memory.list = result.items || []; state.memory.totalPages = Math.max(1, result.total_pages || 1);
+    $("conversations-page").textContent = "第 " + result.page + " / " + state.memory.totalPages + " 页 · " + result.total + " 个";
+    renderConversationList(); updateControls();
+  }
+  function renderConversationList() {
+    const box = $("conversation-list"); box.replaceChildren();
+    if (!state.memory.list.length) box.append(element("p", "empty-state", "没有符合条件的会话。先在白名单会话中与机器人聊天，随后在这里刷新。"));
+    for (const conversation of state.memory.list) {
+      const button = element("button", "conversation-item" + (state.memory.selected?.id === conversation.id ? " selected" : ""));
+      button.type = "button"; button.dataset.action = "";
+      button.setAttribute("aria-pressed", String(state.memory.selected?.id === conversation.id));
+      button.append(element("strong", "", scopeTitle(conversation)), element("span", "hint", "机器人 " + conversation.bot_id + " · " + (conversation.mode === "user" ? "成员隔离" : "共享") + " · " + conversation.memory_count + " 条记忆" + (conversation.is_current === false ? " · 历史" : "")));
+      button.addEventListener("click", () => { if (!state.busy && canDiscardMemory()) void runAction(() => selectConversation(conversation)); });
+      box.append(button);
+    }
+  }
+  async function selectConversation(conversation) {
+    clearMemorySelection(); state.memory.selected = clone(conversation); state.memory.pageMemories = 1;
+    $("memory-keyword").value = ""; $("memory-subject").value = ""; $("memory-enabled").value = "";
+    renderConversationList();
+    await reloadSelected(); await loadMemories();
+  }
+  async function reloadSelected() {
+    const id = state.memory.selected?.id, version = state.memory.version; if (!id) return;
+    const detail = await api("/api/memory/conversations/" + encodeURIComponent(id));
+    if (!memoryIsCurrent(version, id)) return;
+    state.memory.detail = detail; state.memory.selected = detail; state.memory.conflict = false; state.memory.settingsDirty = false;
+    $("no-conversation").hidden = true; $("selected-conversation").hidden = false; $("conversation-conflict").hidden = true;
+    $("selected-scope-title").textContent = scopeTitle(detail); $("selected-scope-detail").textContent = scopeDescription(detail);
+    badge("selected-scope-badge", detail.is_current === false ? "历史会话" : detail.settings.paused ? "已暂停" : "可聊天", detail.is_current === false ? "neutral" : detail.settings.paused ? "wait" : "good");
+    $("pause-conversation").textContent = detail.settings.paused ? "恢复聊天" : "暂停聊天";
+    $("once-conversation").textContent = detail.settings.once ? "已放行一次" : "只回复一次";
+    $("conversation-mode").value = detail.scope_mode || detail.mode;
+    renderSettings(); if ($("context-details").open) renderContext(detail); updateControls();
+  }
+  function renderSettings() {
+    settingInputs.clear(); const box = $("conversation-settings-grid"); box.replaceChildren();
+    for (const def of settingDefinitions) {
+      const wrapper = element("div", "field" + (def.type === "check" ? " check-field" : ""));
+      const label = element("label", "", def.label); label.htmlFor = "setting-" + def.path;
+      const input = document.createElement(def.type === "lines" ? "textarea" : "input"); input.id = label.htmlFor;
+      if (def.type !== "lines") input.type = def.type === "check" ? "checkbox" : def.type;
+      input.autocomplete = "off"; const value = state.memory.detail.settings[def.path];
+      if (def.type === "check") input.checked = Boolean(value);
+      else input.value = def.type === "lines" ? (value || []).join("\n") : String(value ?? "");
+      if (def.type === "number") { input.min = String(def.min); input.max = String(def.max); input.step = "1"; input.required = true; }
+      if (def.path === "persona") input.required = true;
+      const hint = element("p", "hint", def.hint);
+      if (def.type === "check") { const copy = element("div"); copy.append(label, hint); wrapper.append(input, copy); }
+      else wrapper.append(label, input, hint);
+      input.addEventListener("input", () => { state.memory.settingsDirty = true; updateControls(); });
+      settingInputs.set(def.path, { input, def }); box.append(wrapper);
+    }
+  }
+  function readSettings() {
+    const result = clone(state.memory.detail.settings);
+    for (const [key, { input, def }] of settingInputs) {
+      if (def.type === "check") result[key] = input.checked;
+      else if (def.type === "number") {
+        const number = Number(input.value);
+        if (!input.value || !Number.isSafeInteger(number) || number < def.min || number > def.max) throw new Error("「" + def.label + "」超出允许范围。");
+        result[key] = number;
+      } else if (def.type === "lines") result[key] = [...new Set(input.value.split(/\r?\n/u).map((text) => text.trim()).filter(Boolean))];
+      else result[key] = input.value.trim();
+    }
+    return result;
+  }
+  function renderContext(detail) {
+    $("context-content").replaceChildren(element("p", "hint", "当前有效上下文 " + detail.context_count + " 条 · 摘要" + (detail.settings.summary ? "启用" : "未启用")));
+    $("context-content").append(element("pre", "source-text", detail.summary || "尚无摘要。"));
+  }
+  async function loadContext() {
+    const id = state.memory.selected?.id, version = state.memory.version; if (!id) return;
+    const result = await api("/api/memory/conversations/" + encodeURIComponent(id));
+    if (memoryIsCurrent(version, id)) renderContext(result);
+  }
+  async function loadMemories() {
+    const id = state.memory.selected?.id, version = state.memory.version; if (!id) return;
+    const query = new URLSearchParams({ conversation_id: id, page: String(state.memory.pageMemories) });
+    if ($("memory-keyword").value.trim()) query.set("keyword", $("memory-keyword").value.trim());
+    const subject = positiveId($("memory-subject").value, "人物", true); if (subject !== null) query.set("subject_id", String(subject));
+    if ($("memory-enabled").value) query.set("active", $("memory-enabled").value);
+    const result = await api("/api/memory/records?" + query);
+    if (!memoryIsCurrent(version, id)) return;
+    if ((result.items || []).some((item) => item.conversation_id !== id)) throw new Error("记忆响应的会话范围不一致，已停止显示。");
+    state.memory.rows = result.items || []; state.memory.totalMemoryPages = Math.max(1, result.total_pages || 1);
+    $("memories-page").textContent = "第 " + result.page + " / " + state.memory.totalMemoryPages + " 页 · " + result.total + " 条";
+    renderMemories(); updateControls();
+  }
+  function memoryButton(text, handler, write = false) {
+    const button = element("button", "text-button accent", text); button.type = "button";
+    if (write) button.dataset.memoryWrite = ""; else button.dataset.action = "";
+    button.addEventListener("click", () => { void runAction(handler); }); return button;
+  }
+  function renderMemories() {
+    const box = $("memory-list"); box.replaceChildren();
+    if (!state.memory.rows.length) box.append(element("p", "empty-state", "这个范围下没有符合筛选条件的记忆。"));
+    for (const record of state.memory.rows) {
+      const card = element("article", "memory-record");
+      const top = element("div", "memory-record-top"), checkbox = document.createElement("input");
+      checkbox.type = "checkbox"; checkbox.checked = state.memory.checked.has(record.id);
+      checkbox.setAttribute("aria-label", "选择记忆 " + record.id); checkbox.dataset.memoryId = String(record.id);
+      checkbox.addEventListener("change", () => { if (checkbox.checked) state.memory.checked.add(record.id); else state.memory.checked.delete(record.id); updateSelection(); updateControls(); });
+      top.append(checkbox, element("span", "record-kind", kindNames[record.kind] || record.kind), element("span", "hint", "人物 " + record.subject_id), element("span", "record-state", (record.active ? "已启用" : "已停用") + " · " + (record.origin === "manual" ? "人工" : "自动") + (record.locked ? " · 锁定" : "")));
+      card.append(top, element("p", "memory-text", record.text));
+      const actions = element("div", "button-row");
+      actions.append(memoryButton("编辑", () => openMemoryEditor(record), true), memoryButton(record.active ? "停用" : "启用", () => mutateMemory({ op: "set_active", id: record.id, version: record.version, active: !record.active }), true), memoryButton("遗忘", () => previewForget([record.id]), true));
+      const details = element("details", "evidence-details"), summary = element("summary", "", "查看证据与来源"), evidence = element("div", "evidence-content"); details.append(summary, evidence);
+      let loaded = false;
+      details.addEventListener("toggle", () => {
+        if (details.open && !loaded) { loaded = true; void loadEvidence(record, evidence, 1).catch((error) => { loaded = false; evidence.replaceChildren(element("p", "inline-error", error.message)); report(error); }); }
+      });
+      card.append(actions, details); box.append(card);
+    }
+    updateSelection();
+  }
+  function updateSelection() {
+    const all = state.memory.rows.length > 0 && state.memory.rows.every((row) => state.memory.checked.has(row.id));
+    $("select-page-memories").checked = all; $("select-page-memories").indeterminate = !all && state.memory.rows.some((row) => state.memory.checked.has(row.id));
+  }
+  async function loadEvidence(record, box, page) {
+    const version = state.memory.version, id = state.memory.selected?.id;
+    const result = await api("/api/memory/records/" + record.id + "?evidence_page=" + page);
+    if (!memoryIsCurrent(version, id) || !box.isConnected) return;
+    if (result.conversation_id !== id) throw new Error("证据不属于当前选中会话。");
+    const evidence = result.evidence || {}; box.replaceChildren();
+    box.append(element("p", "hint", "记录 #" + record.id + " · 版本 " + result.version + " · 更新于 " + dateText(result.updated_at) + (result.expires_at ? " · 到期 " + dateText(result.expires_at) : " · 长期有效")));
+    if (!(evidence.items || []).length) box.append(element("p", "hint", "没有可显示的原文证据。人工记录不伪造聊天来源。"));
+    for (const item of evidence.items || []) {
+      const entry = element("div", "evidence-entry"), source = element("div", "source-container");
+      entry.append(element("blockquote", "", item.quote), element("p", "hint", item.source_key));
+      entry.append(memoryButton("按需查看关联原文", async () => {
+        const value = await api("/api/memory/records/" + record.id + "/source?source_key=" + encodeURIComponent(item.source_key));
+        if (!memoryIsCurrent(version, id) || !entry.isConnected) return;
+        source.replaceChildren(element("pre", "source-text", value.available ? String(value.text || "") : "原文已过期或撤销，无法查看。"));
+        if (value.available) source.prepend(element("p", "hint", "人物 " + value.subject_id + " · " + dateText(value.received_at)));
+      }), source); box.append(entry);
+    }
+    const pagination = element("div", "pagination");
+    if (page > 1) pagination.append(memoryButton("← 上一页证据", () => loadEvidence(record, box, page - 1)));
+    pagination.append(element("span", "hint", "证据第 " + page + " / " + Math.max(1, evidence.total_pages || 1) + " 页"));
+    if (page < evidence.total_pages) pagination.append(memoryButton("下一页证据 →", () => loadEvidence(record, box, page + 1)));
+    box.append(pagination); updateControls();
+  }
+  function requestId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    return Array.from(bytes, (byte, index) => ([4, 6, 8, 10].includes(index) ? "-" : "") + byte.toString(16).padStart(2, "0")).join("");
+  }
+  function memoryConflict(error) {
+    if (error.status === 409) { state.memory.conflict = true; $("conversation-conflict").hidden = false; updateControls(); }
+  }
+  async function finishMemory(result, completed) {
+    if (typeof completed === "function") completed(result);
+    state.memory.settingsDirty = false; state.memory.checked.clear(); state.memory.preview = null;
+    await reloadSelected(); await loadMemories(); await loadConversations();
+    notice("操作已完成；记忆与上下文已刷新。");
+  }
+  async function performMemory(path, payload, completed) {
+    const version = state.memory.version, id = state.memory.selected?.id;
+    const complete = async (result) => { if (memoryIsCurrent(version, id)) await finishMemory(result, completed); };
+    let result;
+    try { result = await api(path, "POST", payload); }
+    catch (error) {
+      if (uncertain(error)) { trackOperation({ kind: "memory", label: "记忆操作", requestId: payload.request_id, complete }); return; }
+      memoryConflict(error); throw error;
+    }
+    await complete(result);
+  }
+  async function mutateMemory(action, completed) {
+    const detail = state.memory.detail;
+    if (!detail || state.pendingOperation || state.memory.conflict) throw new Error("请先确认未完成操作或重新载入当前会话。");
+    await performMemory("/api/memory/mutate", { request_id: requestId(), conversation_id: detail.id, epoch: detail.epoch, memory_revision: detail.memory_revision, action }, completed);
+  }
+  function openMemoryEditor(record = null) {
+    state.memory.editing = record ? clone(record) : {}; state.memory.editorDirty = false;
+    $("memory-editor-title").textContent = record ? "编辑记忆" : "新增记忆";
+    $("memory-editor-scope").textContent = scopeTitle(state.memory.detail) + " · 人工记录默认锁定，模型不会覆盖。";
+    $("edit-memory-subject").value = String(record?.subject_id ?? state.memory.detail.owner_id ?? (state.memory.detail.scene === "friend" ? state.memory.detail.peer_id : ""));
+    $("edit-memory-kind").value = record?.kind || "fact"; $("edit-memory-text").value = record?.text || "";
+    $("edit-memory-locked").checked = true; $("edit-memory-enabled").checked = record?.active ?? true;
+    $("edit-memory-ttl").value = record?.expires_at ? String(Math.max(1, Math.min(365, Math.ceil((record.expires_at - Date.now() / 1000) / 86400)))) : "";
+    $("memory-editor-error").textContent = ""; $("memory-editor").showModal(); updateControls();
+  }
+  async function saveMemory() {
+    const record = state.memory.editing, text = $("edit-memory-text").value.trim();
+    if (!text || [...text].length > 180) throw new Error("记忆内容需要 1 至 180 个字符。");
+    const ttl = $("edit-memory-ttl").value.trim(), days = ttl ? Number(ttl) : null;
+    if (days !== null && (!Number.isInteger(days) || days < 1 || days > 365)) throw new Error("有效期应为 1 至 365 天，留空为长期。");
+    const action = { op: record?.id ? "edit" : "create", kind: $("edit-memory-kind").value, text, ttl_days: days, active: $("edit-memory-enabled").checked };
+    if (record?.id) Object.assign(action, { id: record.id, version: record.version, locked: $("edit-memory-locked").checked });
+    else action.subject_id = positiveId($("edit-memory-subject").value, "人物");
+    await mutateMemory(action, () => { state.memory.editorDirty = false; state.memory.editing = null; $("memory-editor").close(); });
+  }
+  async function previewForget(ids) {
+    if (!ids.length) return;
+    const detail = state.memory.detail, version = state.memory.version;
+    try {
+      const result = await api("/api/memory/forget/preview", "POST", { conversation_id: detail.id, epoch: detail.epoch, memory_revision: detail.memory_revision, ids });
+      if (!memoryIsCurrent(version, detail.id)) return;
+      state.memory.preview = result; $("forget-error").textContent = "";
+      const box = $("forget-preview"); box.replaceChildren();
+      box.append(element("p", "memory-text", "选择 " + result.requested_count + " 条 · 实际影响 " + result.affected_count + " 条记忆 · " + result.source_count + " 个来源"));
+      box.append(element("p", "hint", "预览有效期至 " + dateText(result.expires_at)));
+      box.append(element("p", "hint", "影响范围（机器人:类型:会话）："));
+      const scopes = element("ul", "scope-preview"); for (const scope of result.scopes || []) scopes.append(element("li", "", scope)); box.append(scopes);
+      box.append(element("p", "hint", "包含关联来源派生的其他记忆；确认会撤销这些来源并重置受影响上下文。"));
+      $("forget-dialog").showModal(); updateControls();
+    } catch (error) { memoryConflict(error); throw error; }
+  }
+  async function confirmForget() {
+    const preview = state.memory.preview; if (!preview) return;
+    if (preview.expires_at * 1000 <= Date.now()) throw new Error("预览已过期，请关闭并重新生成预览。");
+    await performMemory("/api/memory/forget/confirm", { request_id: requestId(), preview_id: preview.preview_id }, () => { $("forget-dialog").close(); });
+  }
+
 
   $("login-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if ($("login-button").disabled) return;
-    const token = $("admin-token").value.trim();
-    if (token.length < 32) { $("login-error").textContent = "管理令牌至少需要 32 个字符。"; return; }
-    $("login-button").disabled = true; $("login-error").textContent = "";
-    state.token = token; state.session += 1;
-    const session = state.session;
+    event.preventDefault(); if (state.busy) return;
+    $("login-error").textContent = ""; $("login-button").disabled = true; state.busy = true;
     try {
-      await loadConfig();
-      $("admin-token").value = ""; $("login-screen").hidden = true; $("app").hidden = false;
-      showView("overview");
-      await refreshStatus();
-      if (session !== state.session) return;
-      state.poll = setInterval(() => { if (!state.busy) void refreshStatus(); }, 5000);
-    } catch (error) { logout(error.message || "登录失败。"); }
-    finally { $("login-button").disabled = false; }
+      const password = $("admin-password").value;
+      if (state.setupRequired && ([...password].length < 12 || password !== $("setup-confirm").value)) throw new Error("密码至少 12 个字符，且两次输入需一致。");
+      const result = await api(state.setupRequired ? "/api/auth/setup" : "/api/auth/login", "POST", state.setupRequired ? { code: $("setup-code").value.trim(), password } : { password });
+      await enterSession(result);
+    } catch (error) {
+      if (error.code === "setup_complete") { authView({ setup_required: false, authenticated: false }); }
+      $("login-error").textContent = error.message;
+    } finally { state.busy = false; $("login-button").disabled = false; updateControls(); }
   });
   $("logout").addEventListener("click", () => {
-    if ((state.dirty || state.jsonDirty) && !window.confirm("有未保存的配置修改。退出会丢弃这些修改，确定退出吗？")) return;
-    logout();
+    if ((hasEdits() || state.pendingOperation) && !window.confirm("有未保存编辑或待查询的操作。确定退出并清空本页内容？")) return;
+    void runAction(async () => {
+      try { await api("/api/auth/logout", "POST", {}); }
+      catch (error) { if (error.code !== "auth_required") throw error; }
+      clearSession("已退出，登录会话已撤销。");
+    });
   });
+  $("open-security").addEventListener("click", () => { $("security-error").textContent = ""; $("password-change-form").reset(); $("security-dialog").showModal(); });
+  $("open-reauth").addEventListener("click", () => { $("security-dialog").close(); $("reauth-error").textContent = ""; $("reauth-dialog").showModal(); });
+  $("password-change-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void runAction(async () => {
+      try {
+        const password = $("new-password").value;
+        if ([...password].length < 12 || password !== $("confirm-password").value) throw new Error("新密码至少 12 个字符，且两次输入需一致。");
+        authView(await api("/api/auth/reauth", "POST", { password: $("current-password").value }));
+        authView(await api("/api/auth/password", "POST", { new_password: password }));
+        $("password-change-form").reset(); $("security-dialog").close(); notice("密码已修改，其他旧会话已撤销。");
+      } catch (error) { $("security-error").textContent = uncertain(error) ? "响应未确认。请使用新密码重新登录核对，不要重复提交修改。" : error.message; throw error; }
+    });
+  });
+  $("reauth-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void runAction(async () => {
+      try { authView(await api("/api/auth/reauth", "POST", { password: $("reauth-password").value })); $("reauth-password").value = ""; $("reauth-dialog").close(); notice("验证成功，请返回继续刚才的操作。"); }
+      catch (error) { $("reauth-error").textContent = error.message; throw error; }
+    });
+  });
+  function closeDialog(id) {
+    if (state.busy) return;
+    if (id === "memory-editor" && (state.pendingOperation?.kind === "memory" || (state.memory.editorDirty && !window.confirm("确定放弃尚未保存的记忆编辑？")))) return;
+    if (id === "memory-editor") { state.memory.editorDirty = false; state.memory.editing = null; }
+    if (id === "security-dialog") $("password-change-form").reset();
+    if (id === "reauth-dialog") $("reauth-form").reset();
+    $(id).close(); updateControls();
+  }
+  document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => closeDialog(button.dataset.close)));
+  document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeDialog(dialog.id); }));
   $("dismiss-notice").addEventListener("click", () => { $("notice").hidden = true; });
+  $("check-operation").addEventListener("click", () => { void runAction(checkOperation); });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelector(".brand").addEventListener("click", (event) => { event.preventDefault(); showView("overview"); });
   $("config-form").addEventListener("submit", (event) => event.preventDefault());
-  for (const id of ["refresh-status", "refresh-qq"]) $(id).addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
+  $("refresh-status").addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
+  $("refresh-qq").addEventListener("click", () => { void runAction(() => refreshQq(true)); });
+  $("refresh-budget").addEventListener("click", () => { void runAction(loadBudget); });
   for (const id of ["connect-runtime", "apply-runtime"]) $(id).addEventListener("click", () => {
-    void runAction(async () => {
-      if (state.dirty || state.jsonDirty || state.stale) throw new Error("本页有未保存或过期的配置，请先「保存并应用」，或重新载入已保存版本后再连接。");
-      await applyRuntime();
-    });
+    if ((state.dirty || state.jsonDirty) && !window.confirm("本页有未保存配置。继续使用服务器已保存的配置连接？")) return;
+    void runAction(() => applyRuntime());
   });
-  $("stop-runtime").addEventListener("click", () => {
-    void runAction(async () => {
-      await api("/api/runtime/stop", "POST", {});
-      notice("断开任务已提交。管理台保持可用，QQ 登录状态不受影响。");
-      await refreshStatus();
-    });
-  });
+  $("stop-runtime").addEventListener("click", () => { void runAction(() => applyRuntime(true)); });
   $("reload-config").addEventListener("click", () => {
-    if ((state.dirty || state.jsonDirty) && !window.confirm("重新载入会丢弃本页尚未保存的编辑。确定继续吗？")) return;
-    void runAction(async () => { await loadConfig(); notice("已载入最新保存的配置。"); await refreshStatus(); });
+    if (state.pendingOperation) { notice("请先查询待确认操作。", "warning"); return; }
+    if ((state.dirty || state.jsonDirty) && !window.confirm("重新载入将丢弃本页未保存的配置。确定继续？")) return;
+    void runAction(loadConfig);
   });
   $("save-config").addEventListener("click", () => { void runAction(() => saveConfig(false)); });
   $("save-apply").addEventListener("click", () => { void runAction(() => saveConfig(true)); });
-  $("get-qr").addEventListener("click", () => {
-    void runAction(async () => {
-      resumeQqPolling();
-      let result;
-      try { result = await api("/api/qq/qrcode", "POST", {}); } catch (error) {
-        if (error.status !== 401 && error.status !== -1) {
-          state.qqPollingPaused = true; state.qqError = error.message; state.qq = null; renderQq();
-        }
-        throw error;
-      }
-      if (typeof result.image !== "string" || result.image.length > 4 * 1024 * 1024 || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/u.test(result.image)) throw new Error("管理服务未返回有效的 PNG 二维码。");
-      $("qr-image").src = result.image; $("qr-image").hidden = false; $("qr-placeholder").hidden = true;
-      state.qrExpires = Number.isFinite(result.expires_at) ? result.expires_at : null;
-      $("get-qr").textContent = "刷新二维码"; updateQrExpiry();
-      notice("二维码已获取，请用手机 QQ 扫码。页面会自动查询登录状态，不会自动刷新二维码。");
-    });
-  });
-  $("advanced").addEventListener("toggle", () => {
-    if ($("advanced").open && state.config && !state.jsonDirty) syncJson();
-  });
-  $("config-json").addEventListener("input", () => {
-    state.jsonDirty = true; state.dirty = true;
-    $("json-state").textContent = "JSON 已修改，分组表单暂时锁定。点击「采用 JSON 到表单」或保存会采用此处内容；关闭折叠区不会丢弃编辑。";
-    updateControls();
-  });
+  $("get-qr").addEventListener("click", () => { void runAction(getQr); });
+  $("advanced").addEventListener("toggle", () => { if ($("advanced").open && !state.jsonDirty && state.config) syncJson(); });
+  $("config-json").addEventListener("input", () => { state.jsonDirty = true; state.dirty = true; $("json-state").textContent = "JSON 有未采用修改，分组表单已暂时锁定。"; updateControls(); });
   $("adopt-json").addEventListener("click", () => { try { adoptJson(); notice("JSON 已采用到分组表单，尚未保存。"); } catch (error) { report(error); } });
   $("discard-json").addEventListener("click", () => {
-    if (!window.confirm("确定放弃尚未采用的 JSON 编辑，并恢复分组表单中的内容吗？")) return;
+    if (state.jsonDirty && !window.confirm("放弃完整 JSON 中尚未采用的编辑？")) return;
     state.jsonDirty = false; syncJson();
   });
-  window.addEventListener("beforeunload", (event) => {
-    if (state.dirty || state.jsonDirty) { event.preventDefault(); event.returnValue = ""; }
+  $("conversation-filter").addEventListener("submit", (event) => {
+    event.preventDefault(); void runAction(async () => { if (!canDiscardMemory()) return; clearMemorySelection(); state.memory.page = 1; await loadConversations(); });
   });
-  // Clear volatile credentials before the browser can keep this page in its back/forward cache.
-  window.addEventListener("pagehide", () => logout());
+  $("refresh-conversations").addEventListener("click", () => { void runAction(loadConversations); });
+  for (const [id, direction] of [["conversations-prev", -1], ["conversations-next", 1]]) $(id).addEventListener("click", () => { void runAction(async () => { state.memory.page += direction; await loadConversations(); }); });
+  $("reload-conversation").addEventListener("click", () => {
+    if (!canDiscardMemory()) return;
+    void runAction(async () => { const current = state.memory.selected; if (current) await selectConversation(current); });
+  });
+  $("conversation-settings-form").addEventListener("submit", (event) => { event.preventDefault(); void runAction(() => mutateMemory({ op: "settings", settings: readSettings() })); });
+  $("pause-conversation").addEventListener("click", () => {
+    void runAction(() => mutateMemory({ op: "settings", settings: { ...state.memory.detail.settings, paused: !state.memory.detail.settings.paused, once: false } }));
+  });
+  $("once-conversation").addEventListener("click", () => {
+    void runAction(() => mutateMemory({ op: "settings", settings: { ...state.memory.detail.settings, paused: true, once: true } }));
+  });
+  $("reset-conversation").addEventListener("click", () => {
+    if (window.confirm("确定重置「" + scopeTitle(state.memory.detail) + "」的短期上下文？未完成回答会失效，长期记忆保留。")) void runAction(() => mutateMemory({ op: "reset" }));
+  });
+  $("change-conversation-mode").addEventListener("click", () => {
+    const mode = $("conversation-mode").value;
+    if (mode === (state.memory.detail.scope_mode || state.memory.detail.mode)) { notice("当前范围已经使用该模式。"); return; }
+    if (window.confirm("切换会话模式会开启新的隔离范围，旧上下文不会混入。新会话会在收到下一条聊天消息后出现。确定继续？")) void runAction(() => mutateMemory({ op: "mode", mode }));
+  });
+  $("memory-filter").addEventListener("submit", (event) => { event.preventDefault(); void runAction(async () => { state.memory.pageMemories = 1; state.memory.checked.clear(); await loadMemories(); }); });
+  for (const [id, direction] of [["memories-prev", -1], ["memories-next", 1]]) $(id).addEventListener("click", () => { void runAction(async () => { state.memory.pageMemories += direction; await loadMemories(); }); });
+  $("new-memory").addEventListener("click", () => { if (!state.busy) openMemoryEditor(); });
+  $("select-page-memories").addEventListener("change", () => {
+    for (const row of state.memory.rows) { if ($("select-page-memories").checked) state.memory.checked.add(row.id); else state.memory.checked.delete(row.id); }
+    document.querySelectorAll("[data-memory-id]").forEach((node) => { node.checked = state.memory.checked.has(Number(node.dataset.memoryId)); }); updateSelection(); updateControls();
+  });
+  $("forget-selected").addEventListener("click", () => { void runAction(() => previewForget([...state.memory.checked])); });
+  $("memory-editor-form").addEventListener("input", () => { state.memory.editorDirty = true; });
+  $("memory-editor-form").addEventListener("submit", (event) => {
+    event.preventDefault(); void runAction(async () => { try { await saveMemory(); } catch (error) { $("memory-editor-error").textContent = error.status === 409 ? "记录已变化。编辑仍保留，请复制后关闭并重新载入会话。" : error.message; throw error; } });
+  });
+  $("confirm-forget").addEventListener("click", () => { void runAction(async () => { try { await confirmForget(); } catch (error) { $("forget-error").textContent = error.message; throw error; } }); });
+  $("context-details").addEventListener("toggle", () => { if ($("context-details").open) void runAction(loadContext); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { stopTimers(); $("poll-state").textContent = "页面隐藏，已暂停轮询"; }
+    else if (state.authenticated) { $("poll-state").textContent = "自动同步"; void refreshStatus(); void refreshQq(); }
+  });
+  window.addEventListener("beforeunload", (event) => { if (hasEdits() || state.pendingOperation) { event.preventDefault(); event.returnValue = ""; } });
+  window.addEventListener("pagehide", stopTimers);
+  window.addEventListener("pageshow", (event) => { if (event.persisted) { clearSession(); void bootstrap(); } });
+  void bootstrap();
 })();

@@ -9,11 +9,14 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::Config,
     host::{Host, Router},
+    plugins::ai::memory::MemoryStore,
+    store::Store,
     types::now,
 };
 
 #[derive(Clone, Serialize)]
 pub struct RuntimeStatus {
+    pub runtime_generation: u64,
     pub phase: String,
     pub online: bool,
     pub bot_id: Option<i64>,
@@ -25,6 +28,7 @@ pub struct RuntimeStatus {
 impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
+            runtime_generation: 0,
             phase: "stopped".into(),
             online: false,
             bot_id: None,
@@ -40,10 +44,24 @@ enum Command {
     Stop,
 }
 
+#[derive(Debug)]
+pub struct DataUnavailable;
+impl std::fmt::Display for DataUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("数据服务尚未就绪或数据库不可用")
+    }
+}
+impl std::error::Error for DataUnavailable {}
+
 pub struct Runtime {
     status: RwLock<RuntimeStatus>,
     active: RwLock<Option<Arc<Host>>>,
     commands: mpsc::Sender<Command>,
+    data: RwLock<Option<Store>>,
+    config: RwLock<Arc<Config>>,
+    router: RwLock<Option<Arc<Router>>>,
+    database: String,
+    database_queue: usize,
 }
 
 struct BotTask {
@@ -62,6 +80,11 @@ impl Runtime {
             status: RwLock::new(RuntimeStatus::default()),
             active: RwLock::new(None),
             commands,
+            data: RwLock::new(None),
+            config: RwLock::new(Arc::new(config.clone())),
+            router: RwLock::new(None),
+            database: config.app.database.clone(),
+            database_queue: config.limits.database_queue,
         });
         let worker = runtime.clone();
         let task = tokio::spawn(async move {
@@ -86,6 +109,12 @@ impl Runtime {
     }
 
     pub fn apply(&self, config: Config, revision: String) -> Result<()> {
+        anyhow::ensure!(
+            config.app.database == self.database
+                && config.limits.database_queue == self.database_queue,
+            "数据库路径或数据库队列配置已改变，请重启程序以应用"
+        );
+        config.validate_runtime()?;
         self.commands
             .try_send(Command::Apply(Box::new(config), revision))
             .context("已有管理操作正在等待执行，请稍后重试")
@@ -95,6 +124,52 @@ impl Runtime {
         self.commands
             .try_send(Command::Stop)
             .context("已有管理操作正在等待执行，请稍后重试")
+    }
+
+    pub async fn data(&self) -> Result<Store> {
+        self.data
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| DataUnavailable.into())
+    }
+
+    pub async fn config(&self) -> Arc<Config> {
+        self.config.read().await.clone()
+    }
+
+    pub async fn cancel_scopes(&self, scopes: &[String]) {
+        let Ok(store) = self.data().await else { return };
+        let scopes = scopes.to_vec();
+        let epochs = store
+            .call(move |db| {
+                let mut statement =
+                    db.prepare("SELECT id,epoch FROM ai_conversations WHERE scope=?1")?;
+                let mut epochs = Vec::new();
+                for scope in scopes {
+                    epochs.extend(
+                        statement
+                            .query_map([scope], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                    );
+                }
+                Ok(epochs)
+            })
+            .await;
+        match epochs {
+            Ok(epochs) => {
+                if let Some(router) = self.router.read().await.as_ref() {
+                    for (id, epoch) in epochs {
+                        router.chat.cancel_before(&id, epoch);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error,"prompt cancellation deferred; durable epoch still blocks stale output")
+            }
+        }
     }
 
     async fn phase(&self, phase: &str, message: &str) {
@@ -118,6 +193,34 @@ impl Runtime {
         revision: String,
         cancel: CancellationToken,
     ) {
+        let opened = async {
+            let store = Store::open(&config.app.database, config.limits.database_queue).await?;
+            let ready = async {
+                MemoryStore::new(
+                    store.clone(),
+                    config.plugins.ai.max_memories_per_conversation,
+                )
+                .init()
+                .await?;
+                crate::budget::Budget::new(store.clone(), config.limits.clone())
+                    .init()
+                    .await?;
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = ready {
+                let _ = store.stop().await;
+                return Err(error);
+            }
+            Ok(store)
+        }
+        .await;
+        match opened {
+            Ok(store) => *self.data.write().await = Some(store),
+            Err(error) => {
+                tracing::error!(%error,"shared data service failed");
+            }
+        }
         let mut pending = Some(Command::Apply(Box::new(config), revision));
         let mut running: Option<BotTask> = None;
         loop {
@@ -132,26 +235,38 @@ impl Runtime {
                     break;
                 }
                 *self.active.write().await = None;
+                *self.router.write().await = None;
+                let generation = self
+                    .status
+                    .read()
+                    .await
+                    .runtime_generation
+                    .saturating_add(1);
                 match command {
-                    Command::Stop => *self.status.write().await = RuntimeStatus::default(),
+                    Command::Stop => {
+                        *self.status.write().await = RuntimeStatus {
+                            runtime_generation: generation,
+                            ..Default::default()
+                        }
+                    }
                     Command::Apply(config, revision) => {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        *self.config.write().await = Arc::new((*config).clone());
                         *self.status.write().await = RuntimeStatus {
+                            runtime_generation: generation,
                             phase: "starting".into(),
                             message: "正在加载已保存的配置……".into(),
-                            applied_revision: Some(revision),
                             started_at: Some(now()),
                             ..Default::default()
                         };
                         let stop = CancellationToken::new();
                         let child_cancel = stop.clone();
                         let worker = self.clone();
-                        let task =
-                            tokio::spawn(
-                                async move { worker.run_bot(*config, child_cancel).await },
-                            );
+                        let task = tokio::spawn(async move {
+                            worker.run_bot(*config, revision, child_cancel).await
+                        });
                         running = Some(BotTask { cancel: stop, task });
                     }
                 }
@@ -163,6 +278,7 @@ impl Runtime {
                     result = &mut task.task => {
                         running = None;
                         *self.active.write().await = None;
+                        *self.router.write().await = None;
                         match result {
                             Ok(Ok(())) => *self.status.write().await = RuntimeStatus::default(),
                             Ok(Err(error)) => {
@@ -190,12 +306,25 @@ impl Runtime {
             }
             *self.active.write().await = None;
         }
+        *self.router.write().await = None;
+        if let Some(store) = self.data.write().await.take()
+            && let Err(error) = store.stop().await
+        {
+            tracing::error!(%error,"shared data shutdown failed");
+        }
     }
 
-    async fn run_bot(&self, config: Config, cancel: CancellationToken) -> Result<()> {
-        let host = Host::create(config).await?;
+    async fn run_bot(
+        &self,
+        config: Config,
+        revision: String,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let host = Host::create_with_store(config, self.data().await?).await?;
         let router = Arc::new(Router::new(host.clone()));
+        *self.router.write().await = Some(router.clone());
         *self.active.write().await = Some(host.clone());
+        self.status.write().await.applied_revision = Some(revision);
         self.phase(
             "waiting_login",
             "等待 QQ 登录或 Milky 连接；请扫码并确认 Milky 地址和令牌。",

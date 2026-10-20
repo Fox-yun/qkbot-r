@@ -22,9 +22,26 @@ pub struct Host {
     pub cancel: CancellationToken,
     pub epochs: HashMap<String, i64>,
     pub plugins: crate::plugin::PluginRegistry,
+    owns_store: bool,
 }
 impl Host {
     pub async fn create(config: Config) -> Result<Arc<Self>> {
+        config.validate_runtime()?;
+        let store = Store::open(&config.app.database, config.limits.database_queue).await?;
+        match Self::create_inner(config, store.clone(), true).await {
+            Ok(host) => Ok(host),
+            Err(error) => {
+                let _ = store.stop().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn create_with_store(config: Config, store: Store) -> Result<Arc<Self>> {
+        Self::create_inner(config, store, false).await
+    }
+
+    async fn create_inner(config: Config, store: Store, owns_store: bool) -> Result<Arc<Self>> {
         config.validate()?;
         let (plugins, registry, enabled) = crate::plugins::assemble(&config)?;
         let http = reqwest::Client::builder()
@@ -33,12 +50,13 @@ impl Host {
             .pool_max_idle_per_host(4)
             .build()?;
         let milky = Milky::new(config.milky.clone(), http.clone())?;
+        let budget = crate::budget::Budget::new(store.clone(), config.limits.clone());
+        budget.init().await?;
         let llm = if config.plugins.ai.enabled {
-            Some(Llm::new(config.llm.clone(), http)?)
+            Some(Llm::new(config.llm.clone(), http)?.with_budget(budget))
         } else {
             None
         };
-        let store = Store::open(&config.app.database, config.limits.database_queue).await?;
         store
             .activate_plugins(enabled.iter().cloned().collect())
             .await?;
@@ -70,6 +88,7 @@ impl Host {
             cancel: CancellationToken::new(),
             epochs,
             plugins,
+            owns_store,
         });
         for plugin in host.plugins.enabled_handlers() {
             tokio::time::timeout(std::time::Duration::from_secs(15), plugin.init(&host)).await??;
@@ -239,6 +258,7 @@ impl Router {
         let host = &self.host;
         if !host.config.access.allows(&msg.key.scope)
             || msg.text.len() > host.config.limits.max_message_bytes
+            || removed_management_command(&msg.text)
         {
             return Ok(());
         }
@@ -269,21 +289,13 @@ impl Router {
             && !msg.is_self()
             && command.is_none()
             && (trigger || host.config.plugins.ai.read_group_background);
-        let explicit_remember = matches!(
-            msg.text
-                .split_whitespace()
-                .take(3)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            ["/ai", "memory", "remember"]
-        );
         let incoming = msg.clone();
         let context = conv.clone();
         let pos=host.store.call(move|c|{
             let tx=c.transaction()?;
             let (id,epoch)=context.as_ref().map(|v|(v.guard.conversation_id.clone(),v.guard.epoch)).unwrap_or((String::new(),0));
-            let role=if incoming.is_self(){"self_unknown"}else if keep||learn||explicit_remember{"user"}else{"control"};
-            let text=if keep||learn||explicit_remember{incoming.text.as_str()}else{""};
+            let role=if incoming.is_self(){"self_unknown"}else if keep||learn{"user"}else{"control"};
+            let text=if keep||learn{incoming.text.as_str()}else{""};
             let origin=if command.is_some(){Some("control")}else if learn&&!keep {Some("memory_only")}else{None};
             let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn])?;
             if changed==0{return Ok(None);}
@@ -310,13 +322,9 @@ impl Router {
                 }
             };
             let host = host.clone();
-            let chat = self.chat.clone();
-            // Built-in controls only perform bounded local work. Finish their state
-            // transition before dispatch accepts the next message; sending the receipt
-            // can remain asynchronous. Otherwise /ai new or mode can strand that
-            // next message in a conversation generation that has just been invalidated.
+
             let Some(handler) = handler else {
-                let result = route_command(&host, &chat, &msg, conv.as_ref(), command).await;
+                let result = route_command(&host, &msg, command).await;
                 let text = result.unwrap_or_else(|e| format!("指令未完成：{e}"));
                 self.tasks.spawn(async move {
                     let _permit = permit;
@@ -503,77 +511,64 @@ impl Router {
                 );
             }
         }
-        self.host.store.stop().await
+        self.host.store.call_wait(|db| {
+            let tx=db.transaction()?;
+            tx.execute("UPDATE outbox SET state='failed',detail='runtime stopped before submission',updated_at=?1 WHERE state='prepared'",[now()])?;
+            tx.execute("UPDATE plugin_states SET enabled=0,epoch=epoch+1",[])?;
+            tx.commit()?;
+            Ok(())
+        }).await?;
+        if self.host.owns_store {
+            self.host.store.stop().await?;
+        }
+        Ok(())
     }
 }
 
-fn command_root(text: &str) -> Option<&'static str> {
-    match text.split_whitespace().next()? {
-        "/bot" => Some("/bot"),
-        "/ai" => Some("/ai"),
-        "/clock" => Some("/clock"),
-        "/remind" => Some("/remind"),
-        _ => None,
+// Tombstones live only at ingress: no handler, storage, reply, observer, or model work.
+fn removed_management_command(text: &str) -> bool {
+    let parts: Vec<_> = text.split_whitespace().take(4).collect();
+    match parts.first().copied() {
+        Some("/ai") => true,
+        Some("/bot") => !matches!(parts.as_slice(), [_, "confirm" | "reject", _]),
+        _ => false,
     }
 }
-async fn route_command(
-    host: &Host,
-    chat: &crate::plugins::ai::chat::Chat,
-    msg: &crate::types::Incoming,
-    conv: Option<&crate::plugins::ai::Conversation>,
-    command: &str,
-) -> Result<String> {
+
+async fn route_command(host: &Host, msg: &crate::types::Incoming, command: &str) -> Result<String> {
     use crate::tools::ToolOutcome;
-    let parts: Vec<&str> = msg.text.split_whitespace().collect();
-    if command == "/ai" {
-        ensure!(host.config.plugins.ai.enabled, "AI 插件已关闭");
-        return crate::plugins::ai::command(
-            host,
-            chat,
-            msg,
-            conv.ok_or_else(|| anyhow::anyhow!("会话不存在"))?,
-        )
-        .await;
-    }
+    let parts: Vec<_> = msg.text.split_whitespace().collect();
     if command == "/bot" {
-        return match parts.as_slice() {
-            [_, "status"] => {
-                let scope = msg.key.scope.key();
-                let stats=host.store.call(move|c|Ok(c.query_row("SELECT COALESCE(SUM(state='confirmed'),0),COALESCE(SUM(state='failed'),0),COALESCE(SUM(state IN('unknown','submitted')),0) FROM outbox WHERE scope=?1",[scope],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?)).await?;
-                Ok(format!(
-                    "qkbot {}；聊天队列 {}；数据库独立线程。\n当前会话保留的发送记录：成功 {}，失败 {}，未知/处理中 {}（不自动重发）。",
-                    env!("CARGO_PKG_VERSION"),
-                    chat.pending(),
-                    stats.0,
-                    stats.1,
-                    stats.2
-                ))
-            }
-            [_, "plugins"] => {
-                let mut names = host.epochs.keys().cloned().collect::<Vec<_>>();
-                names.sort();
-                Ok(format!("已启用：{}", names.join(", ")))
-            }
+        match parts.as_slice() {
             [_, "confirm", token] => match host
                 .gateway
                 .confirm(&msg.key.scope, msg.sender_id, token)
                 .await?
             {
-                ToolOutcome::Completed { receipt, .. } => Ok(receipt),
+                ToolOutcome::Completed { receipt, .. } => return Ok(receipt),
                 _ => anyhow::bail!("确认后状态异常"),
             },
             [_, "reject", token] => {
                 host.gateway
                     .reject(&msg.key.scope, msg.sender_id, token)
                     .await?;
-                Ok("已拒绝该操作。".into())
+                return Ok("已拒绝该操作。".into());
             }
-            _ => Ok("/bot status | plugins | confirm TOKEN | reject TOKEN".into()),
-        };
+            _ => anyhow::bail!("无效确认操作"),
+        }
     }
     anyhow::bail!("此插件已停用")
 }
 
+fn command_root(text: &str) -> Option<&'static str> {
+    match text.split_whitespace().next()? {
+        "/bot" => Some("/bot"),
+
+        "/clock" => Some("/clock"),
+        "/remind" => Some("/remind"),
+        _ => None,
+    }
+}
 pub fn check_guard(c: &rusqlite::Connection, g: &ContextGuard) -> Result<()> {
     let valid: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1 AND epoch=?2)",

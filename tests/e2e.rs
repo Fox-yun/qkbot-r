@@ -192,7 +192,6 @@ async fn setup_with(
     config.llm.api_key = "synthetic".into();
     config.llm.max_concurrent_requests = 1;
     config.access.groups = vec![456];
-    config.access.admins = vec![789];
     config.plugins.ai.enabled = enable_ai;
     config.plugins.ai.defaults.allowed_tools = vec!["clock_now".into(), "reminder_create".into()];
     config.plugins.reminder.enabled = true;
@@ -262,8 +261,17 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
     assert!(state.1 > 0);
     assert!(state.2.is_empty());
 
-    router.dispatch(message(7, "/ai summary on")).await.unwrap();
-    assert!(mock.sent().await.contains("设置已更新"));
+    web_change(
+        &host,
+        &router,
+        qkbot::admin::memory::Action::Settings {
+            settings: qkbot::config::AiSettings {
+                summary: true,
+                ..host.config.plugins.ai.defaults.clone()
+            },
+        },
+    )
+    .await;
     let chat = router.chat.clone();
     let work = tokio::spawn(async move { chat.compact_idle().await });
     let request = mock.model().await;
@@ -384,8 +392,8 @@ async fn reset_and_mode_controls_commit_before_following_message_ingress() {
         .await
         .unwrap();
     let abandoned = mock.model().await;
-    router.dispatch(message(2, "/ai new")).await.unwrap();
-    // No wait for the asynchronously sent command receipt before the next message.
+    web_change(&host, &router, qkbot::admin::memory::Action::Reset).await;
+    // The web mutation commits and cancels queued work before new ingress.
     router
         .dispatch(message(3, "fresh-generation-question"))
         .await
@@ -403,15 +411,21 @@ async fn reset_and_mode_controls_commit_before_following_message_ingress() {
     );
     let _ = abandoned.reply.send(answer("obsolete-answer"));
     next.reply.send(answer("fresh-generation-answer")).unwrap();
-    let receipts = [mock.sent().await, mock.sent().await];
-    assert!(receipts.iter().any(|text| text.contains("已开始新对话")));
+    let receipts = [mock.sent().await];
     assert!(
         receipts
             .iter()
             .any(|text| text == "fresh-generation-answer")
     );
 
-    router.dispatch(message(4, "/ai mode user")).await.unwrap();
+    web_change(
+        &host,
+        &router,
+        qkbot::admin::memory::Action::Mode {
+            mode: "user".into(),
+        },
+    )
+    .await;
     let mut personal = message(5, "new-personal-question");
     personal.sender_id = 999;
     router.dispatch(personal).await.unwrap();
@@ -439,13 +453,7 @@ async fn reset_and_mode_controls_commit_before_following_message_ingress() {
         .unwrap();
     assert!(stored.0.ends_with(":v1:user:999"));
     next.reply.send(answer("personal-answer")).unwrap();
-    let receipts = [mock.sent().await, mock.sent().await];
-    assert!(
-        receipts
-            .iter()
-            .any(|text| text.contains("群模式已切换为 user"))
-    );
-    assert!(receipts.iter().any(|text| text == "personal-answer"));
+    assert_eq!(mock.sent().await, "personal-answer");
     within(router.shutdown()).await.unwrap();
     assert!(mock.models.try_recv().is_err());
     assert!(mock.sends.try_recv().is_err());
@@ -522,8 +530,8 @@ async fn reset_during_model_wait_releases_capacity_and_suppresses_stale_reply() 
         .await
         .unwrap();
     let old = mock.model().await;
-    router.dispatch(message(2, "/ai new")).await.unwrap();
-    assert!(mock.sent().await.contains("已开始新对话"));
+    web_change(&host, &router, qkbot::admin::memory::Action::Reset).await;
+
     router
         .dispatch(message(3, "fresh-context-question"))
         .await
@@ -996,6 +1004,70 @@ async fn four_tool_rounds_preserve_protocol_and_end_at_the_smaller_http_budget()
     within(router.shutdown()).await.unwrap();
     assert!(mock.models.try_recv().is_err());
     assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+async fn web_change(host: &Host, router: &Router, action: qkbot::admin::memory::Action) {
+    use qkbot::admin::memory::{Actor, MemoryAdmin, MutationRequest};
+    let conv = qkbot::plugins::ai::conversation(host, &message(0, "lookup"))
+        .await
+        .unwrap();
+    let service = MemoryAdmin::new(host.store.clone(), host.config.plugins.ai.clone());
+    let actor = Actor {
+        admin_id: "test-admin".into(),
+        session_id: "test-session".into(),
+    };
+    let current = service
+        .conversation(&actor, &conv.guard.conversation_id)
+        .await
+        .unwrap();
+    service
+        .mutate(
+            &actor,
+            MutationRequest {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conv.guard.conversation_id,
+                epoch: current["epoch"].as_i64().unwrap(),
+                memory_revision: current["memory_revision"].as_i64().unwrap(),
+                action,
+            },
+        )
+        .await
+        .unwrap();
+    router.chat.cancel_scope(&message(0, "").key.scope);
+}
+
+#[tokio::test]
+async fn removed_management_commands_are_silent_and_never_stored_or_learned() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    for (i, text) in [
+        "/ai",
+        "/ai memory remember secret",
+        "/ai new",
+        "/bot status",
+        "/bot plugins",
+    ]
+    .iter()
+    .enumerate()
+    {
+        router.dispatch(message(i as i64 + 1, text)).await.unwrap();
+    }
+    let counts: (i64, i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?,
+                db.query_row("SELECT count(*) FROM ai_conversations", [], |r| r.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    within(router.shutdown()).await.unwrap();
     drop(host);
     mock.stop().await;
 }

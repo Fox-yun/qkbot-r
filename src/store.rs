@@ -109,6 +109,22 @@ impl Store {
         .await
     }
 
+    /// Reserved for lifecycle work that must drain past ordinary queue backpressure.
+    pub async fn call_wait<F, R>(&self, work: F) -> Result<R>
+    where
+        F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Job::Work(Box::new(move |conn| {
+                let _ = tx.send(work(conn));
+            })))
+            .await
+            .map_err(|_| anyhow!("database worker closed"))?;
+        rx.await.context("database worker closed")?
+    }
+
     pub async fn activate_plugins(&self, enabled: Vec<String>) -> Result<()> {
         self.call(move |c| {
             let tx = c.transaction()?;

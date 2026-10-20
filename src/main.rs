@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use qkbot::{
-    admin::{self, AdminState, runtime::Runtime, settings::ConfigStore},
+    admin::{self, AdminState, auth::AuthService, runtime::Runtime, settings::ConfigStore},
     config::Config,
 };
 use std::{path::PathBuf, sync::Arc};
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
             "--check" => check = true,
             "--help" | "-h" => {
                 println!(
-                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，并在终端显示管理地址和临时管理员令牌。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_ADMIN_TOKEN、QKBOT_LLBOT_TOKEN"
+                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN"
                 );
                 return Ok(());
             }
@@ -64,20 +64,22 @@ async fn main() -> Result<()> {
     } else {
         config.web.token.clone()
     };
+    let auth = AuthService::open(store.path(), &token, config.web.secure_cookie).await?;
     if let Some(listener) = &listener {
         tracing::info!(address = %listener.local_addr()?, "admin panel ready");
         eprintln!("管理员页面：http://{}", listener.local_addr()?);
-        if config.web.token.is_empty() {
+        if !auth.is_configured() {
             eprintln!(
-                "本次管理员令牌：{token}\n此令牌仅本次运行有效；固定令牌可用 QKBOT_ADMIN_TOKEN 设置。"
+                "管理员初始化码：{token}\n打开管理页面并设置管理员密码；设置成功后初始化码失效。"
             );
         }
     }
     let cancel = CancellationToken::new();
     let (runtime, worker) = Runtime::start(config, revision, cancel.clone());
-    let admin_stop = cancel.clone();
+    let web_cancel = CancellationToken::new();
+    let admin_stop = web_cancel.clone();
     let mut server = if let Some(listener) = listener {
-        let state = AdminState::new(store, runtime, &token)?;
+        let state = AdminState::new(store, runtime, auth);
         tokio::spawn(async move { admin::serve(listener, state, admin_stop).await })
     } else {
         tokio::spawn(async move {
@@ -89,11 +91,12 @@ async fn main() -> Result<()> {
         _ = shutdown_signal() => None,
         result = &mut server => Some(result),
     };
-    cancel.cancel();
+    web_cancel.cancel();
     let result = match server_result {
         Some(result) => result,
         None => server.await,
     };
+    cancel.cancel();
     worker.await.context("机器人控制任务异常结束")?;
     result.context("管理员页面任务异常结束")??;
     tracing::info!("qkbot stopped");

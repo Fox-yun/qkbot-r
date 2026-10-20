@@ -20,7 +20,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     })?;
     plugins.register(PluginSpec {
         id: "ai",
-        commands: &["/ai"],
+        commands: &[],
         tools: &[],
         dependencies: &["host"],
     })?;

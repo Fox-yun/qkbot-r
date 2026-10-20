@@ -51,6 +51,14 @@ impl Session {
             cancel.cancel();
         }
     }
+    fn cancel_before(&mut self, epoch: i64) {
+        self.queue.retain(|job| job.guard.epoch >= epoch);
+        if self.active_guard.as_ref().is_some_and(|g| g.epoch < epoch)
+            && let Some(cancel) = &self.cancel
+        {
+            cancel.cancel();
+        }
+    }
 }
 pub struct Chat {
     host: Arc<Host>,
@@ -150,6 +158,12 @@ impl Chat {
             }
         }
     }
+    /// A late web receipt must never cancel work accepted under its new generation.
+    pub fn cancel_before(&self, conversation_id: &str, epoch: i64) {
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(conversation_id) {
+            state.cancel_before(epoch);
+        }
+    }
     pub fn pending(&self) -> usize {
         self.host.config.limits.queued_global - self.queued.available_permits()
     }
@@ -237,10 +251,7 @@ impl Chat {
                 }
             };
             let (plugin, text) = if text.len() > self.host.config.limits.max_message_bytes {
-                (
-                    "host",
-                    "模型回复超过消息字节上限，未发送；请调低 /ai output。".into(),
-                )
+                ("host", "模型回复超过消息字节上限，未发送。".into())
             } else {
                 (plugin, text)
             };
@@ -294,7 +305,17 @@ impl Chat {
                 )
                 .await?
                 .into_iter()
-                .map(|m| format!("用户 {} / {:?}：{}", m.subject_id, m.kind, m.text))
+                .map(|m| {
+                    let origin = match m.origin.as_str() {
+                        "manual" => "管理员补充（不代表本人自述）",
+                        "auto" => "原始消息提取",
+                        _ => "历史记录",
+                    };
+                    format!(
+                        "关于用户 {} / {:?} / 来源：{}：{}",
+                        m.subject_id, m.kind, origin, m.text
+                    )
+                })
                 .collect()
         } else {
             vec![]
@@ -373,7 +394,18 @@ impl Chat {
             );
             // No automatic retries: ambiguous provider responses should not multiply work or cost.
             let response = llm
-                .complete(input.messages, tools, settings.output_budget, cancel)
+                .complete_admitted(
+                    input.messages,
+                    tools,
+                    settings.output_budget,
+                    cancel,
+                    crate::budget::Admission {
+                        scope: job.key.scope.clone(),
+                        actor: job.actor,
+                        guard: job.guard.clone(),
+                        plugin_epoch: host.epochs["ai"],
+                    },
+                )
                 .await?;
             host.usage("chat", &response).await?;
             let message = response.message;
@@ -526,10 +558,12 @@ impl Chat {
                 .llm
                 .as_ref()
                 .unwrap()
-                .complete_background(
+                .complete_background_admitted(
                     input.messages,
                     self.host.config.plugins.ai.memory_output_budget,
                     &self.host.cancel,
+                    guard.clone(),
+                    self.host.epochs["ai"],
                 )
                 .await?;
             if let Some(response) = response {
@@ -916,7 +950,7 @@ mod tests {
             };
             // A new epoch was queued/running after a reset committed but before
             // its old command task resumed to cancel the previous generation.
-            session.cancel_epoch(&old);
+            session.cancel_before(2);
             assert_eq!(session.queue.len(), 1);
             assert_eq!(session.queue.front().unwrap().guard.epoch, 2);
             assert_eq!(cancel.is_cancelled(), active_epoch == 1);

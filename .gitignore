@@ -1,6 +1,7 @@
 /target/
 /.toolchain/
 /config.toml
+/.qkbot-admin/
 .qkbot-config-*.tmp
 .env
 .env.*

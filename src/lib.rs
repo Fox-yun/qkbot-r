@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod budget;
 pub mod config;
 pub mod host;
 pub mod llm;

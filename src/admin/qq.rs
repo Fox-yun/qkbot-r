@@ -22,19 +22,63 @@ pub struct QqClient {
     token: HeaderValue,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LoginStatus {
     pub online: bool,
     pub uin: String,
     pub nick: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LoginQrCode {
     pub image: String,
     pub expires_at: Option<i64>,
     pub poll_interval_ms: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QqError {
+    Auth,
+    Config,
+    Transient,
+    Stale,
+    Busy,
+}
+impl QqError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auth => "qq_auth",
+            Self::Config => "qq_config",
+            Self::Transient => "qq_transient",
+            Self::Stale => "qq_stale",
+            Self::Busy => "qq_busy",
+        }
+    }
+    pub fn status(self) -> axum::http::StatusCode {
+        use axum::http::StatusCode;
+        match self {
+            Self::Config => StatusCode::BAD_REQUEST,
+            Self::Stale => StatusCode::CONFLICT,
+            Self::Busy => StatusCode::TOO_MANY_REQUESTS,
+            Self::Auth | Self::Transient => StatusCode::BAD_GATEWAY,
+        }
+    }
+    pub fn retry_after_ms(self) -> u64 {
+        3000
+    }
+}
+impl std::fmt::Display for QqError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auth => "LLBot 管理认证失败，已暂停请求；请检查 WebUI 密码后手动重试",
+            Self::Config => "QQ 登录管理配置不完整或不可用，请检查是否启用、地址和 WebUI 密码",
+            Self::Transient => "LLBot 暂时不可用，请稍后重试或检查其官方管理页面",
+            Self::Stale => "QQ 登录配置已改变，旧请求已丢弃，请重新查询",
+            Self::Busy => "正在获取登录二维码，请等待当前请求完成",
+        })
+    }
+}
+impl std::error::Error for QqError {}
 
 impl QqClient {
     pub fn new(config: QqLoginConfig) -> Result<Self> {
@@ -88,7 +132,7 @@ impl QqClient {
             .map_err(|_| anyhow::anyhow!("无法连接 LLBot 管理服务，请检查地址与服务状态"))?;
         let status = response.status();
         if matches!(status.as_u16(), 401 | 403) {
-            bail!("LLBot 管理认证失败，请检查 WebUI 密码；暂勿反复重试");
+            return Err(QqError::Auth.into());
         }
         ensure!(!status.is_redirection(), "LLBot 管理接口不允许重定向");
         ensure!(

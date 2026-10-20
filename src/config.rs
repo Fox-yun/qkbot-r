@@ -26,6 +26,7 @@ pub struct WebConfig {
     pub enabled: bool,
     pub listen: String,
     pub token: String,
+    pub secure_cookie: bool,
 }
 impl Default for WebConfig {
     fn default() -> Self {
@@ -33,6 +34,7 @@ impl Default for WebConfig {
             enabled: true,
             listen: "127.0.0.1:3210".into(),
             token: String::new(),
+            secure_cookie: false,
         }
     }
 }
@@ -96,7 +98,12 @@ impl Default for AppConfig {
 pub struct AccessConfig {
     pub groups: Vec<i64>,
     pub friends: Vec<i64>,
-    pub admins: Vec<i64>,
+    #[serde(
+        rename = "admins",
+        skip_serializing,
+        deserialize_with = "ignore_legacy_admins"
+    )]
+    _legacy_admins: Vec<i64>,
 }
 impl AccessConfig {
     pub fn allows(&self, scope: &Scope) -> bool {
@@ -105,9 +112,13 @@ impl AccessConfig {
             Scene::Friend => self.friends.contains(&scope.peer_id),
         }
     }
-    pub fn admin(&self, user: i64) -> bool {
-        self.admins.contains(&user)
-    }
+}
+
+fn ignore_legacy_admins<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<i64>, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(d)?;
+    Ok(Vec::new())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +138,10 @@ pub struct Limits {
     pub retention_days: u64,
     pub send_cooldown_secs: u64,
     pub sends_per_hour: usize,
+    pub model_user_per_hour: usize,
+    pub model_conversation_per_hour: usize,
+    pub model_global_per_hour: usize,
+    pub memory_requests_per_hour: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -145,6 +160,10 @@ impl Default for Limits {
             retention_days: 7,
             send_cooldown_secs: 2,
             sends_per_hour: 120,
+            model_user_per_hour: 60,
+            model_conversation_per_hour: 180,
+            model_global_per_hour: 600,
+            memory_requests_per_hour: 60,
         }
     }
 }
@@ -313,6 +332,17 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            [
+                self.limits.model_user_per_hour,
+                self.limits.model_conversation_per_hour,
+                self.limits.model_global_per_hour,
+                self.limits.memory_requests_per_hour
+            ]
+            .iter()
+            .all(|n| (1..=100_000).contains(n)),
+            "model hourly request limits must be 1..100000"
+        );
         ensure!(!self.app.database.trim().is_empty(), "app.database不能为空");
         tracing_subscriber::EnvFilter::try_new(&self.app.log)
             .map_err(|_| anyhow::anyhow!("app.log不是有效日志过滤器"))?;
@@ -339,8 +369,7 @@ impl Config {
                 && login_url.fragment().is_none(),
             "qq_login.url 不能包含用户名、密码、查询参数或片段"
         );
-        reqwest::header::HeaderValue::from_str(&self.qq_login.token)
-            .map_err(|_| anyhow::anyhow!("qq_login.token 包含无效请求头字符"))?;
+        ensure!(self.qq_login.token.len() <= 4096, "LLBot WebUI 密码过长");
         self.app
             .timezone
             .parse::<chrono_tz::Tz>()

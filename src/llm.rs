@@ -70,6 +70,7 @@ pub struct Llm {
     endpoint: reqwest::Url,
     requests: Arc<Semaphore>,
     background: Arc<Semaphore>,
+    budget: Option<crate::budget::Budget>,
 }
 
 impl Llm {
@@ -109,11 +110,41 @@ impl Llm {
             endpoint,
             requests,
             background: Arc::new(Semaphore::new(1)),
+            budget: None,
         })
     }
 
     pub fn has_capacity(&self) -> bool {
         self.requests.available_permits() > 0
+    }
+
+    pub fn with_budget(mut self, budget: crate::budget::Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub async fn complete_admitted(
+        &self,
+        messages: Vec<Value>,
+        tools: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        admission: crate::budget::Admission,
+    ) -> Result<LlmResponse> {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
+            p = self.requests.clone().acquire_owned() => p.context("model request scheduler closed")?,
+        };
+        self.request(
+            messages,
+            tools,
+            max_output,
+            cancel,
+            permit,
+            Some(crate::budget::RequestAdmission::Chat(admission)),
+        )
+        .await
     }
 
     pub async fn complete(
@@ -128,7 +159,7 @@ impl Llm {
             _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
             permit = self.requests.clone().acquire_owned() => permit.context("model request scheduler closed")?,
         };
-        self.request(messages, tools, max_output, cancel, permit)
+        self.request(messages, tools, max_output, cancel, permit, None)
             .await
     }
 
@@ -139,13 +170,44 @@ impl Llm {
         max_output: usize,
         cancel: &CancellationToken,
     ) -> Result<Option<LlmResponse>> {
+        self.background_request(messages, max_output, cancel, None)
+            .await
+    }
+
+    pub async fn complete_background_admitted(
+        &self,
+        messages: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        guard: crate::types::ContextGuard,
+        plugin_epoch: i64,
+    ) -> Result<Option<LlmResponse>> {
+        self.background_request(
+            messages,
+            max_output,
+            cancel,
+            Some(crate::budget::RequestAdmission::Memory {
+                guard,
+                plugin_epoch,
+            }),
+        )
+        .await
+    }
+
+    async fn background_request(
+        &self,
+        messages: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        admission: Option<crate::budget::RequestAdmission>,
+    ) -> Result<Option<LlmResponse>> {
         let Ok(_background) = self.background.clone().try_acquire_owned() else {
             return Ok(None);
         };
         let Ok(permit) = self.requests.clone().try_acquire_owned() else {
             return Ok(None);
         };
-        self.request(messages, Vec::new(), max_output, cancel, permit)
+        self.request(messages, Vec::new(), max_output, cancel, permit, admission)
             .await
             .map(Some)
     }
@@ -157,6 +219,7 @@ impl Llm {
         max_output: usize,
         cancel: &CancellationToken,
         _permit: OwnedSemaphorePermit,
+        admission: Option<crate::budget::RequestAdmission>,
     ) -> Result<LlmResponse> {
         ensure!(
             (1..=32768).contains(&max_output),
@@ -194,6 +257,14 @@ impl Llm {
             body["parallel_tool_calls"] = json!(false);
         }
         let operation = async {
+            if let Some(budget) = &self.budget {
+                ensure!(
+                    admission.is_some(),
+                    "model request requires a runtime admission"
+                );
+                budget.reserve_request(admission).await?;
+            }
+            ensure!(!cancel.is_cancelled(), "model request cancelled");
             let mut request = self
                 .http
                 .post(self.endpoint.clone())

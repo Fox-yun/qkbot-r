@@ -2,7 +2,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use qkbot::{
-    admin::{self, AdminState, runtime::Runtime, settings::ConfigStore},
+    admin::{self, AdminState, auth::AuthService, runtime::Runtime, settings::ConfigStore},
     config::Config,
 };
 use reqwest::{Client, Method, Response, StatusCode};
@@ -22,6 +22,8 @@ struct Panel {
     database: PathBuf,
     url: String,
     client: Client,
+    cookie: String,
+    csrf: String,
     cancel: CancellationToken,
     worker: Option<JoinHandle<()>>,
     server: Option<JoinHandle<anyhow::Result<()>>>,
@@ -51,21 +53,40 @@ impl Panel {
         let (config, revision) = store.effective_with_revision().await.unwrap();
         let cancel = CancellationToken::new();
         let (runtime, worker) = Runtime::start(config, revision, cancel.clone());
-        let state = AdminState::new(store, runtime, TOKEN).unwrap();
+        let auth = AuthService::open(&path, TOKEN, false).await.unwrap();
+        let state = AdminState::new(store, runtime, auth);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let stop = cancel.clone();
         let server = tokio::spawn(async move { admin::serve(listener, state, stop).await });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("{url}/api/auth/setup"))
+            .json(&json!({"code":TOKEN,"password":"integration password 123"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let view: Value = response.json().await.unwrap();
         Self {
             _directory: directory,
             path,
             database,
             url,
-            client: Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            client,
+            cookie,
+            csrf: view["csrf_token"].as_str().unwrap().to_owned(),
             cancel,
             worker: Some(worker),
             server: Some(server),
@@ -75,7 +96,8 @@ impl Panel {
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method, format!("{}{path}", self.url))
-            .bearer_auth(TOKEN)
+            .header("cookie", &self.cookie)
+            .header("x-csrf-token", &self.csrf)
     }
 
     async fn snapshot(&self) -> Value {
@@ -168,6 +190,106 @@ impl Drop for Panel {
     }
 }
 
+#[tokio::test]
+async fn sessions_csrf_logout_and_offline_web_memory_transactions() {
+    let panel = Panel::start().await;
+    panel.phase("waiting_login", None).await;
+    let response = panel
+        .client
+        .post(format!("{}/api/runtime/stop", panel.url))
+        .header("cookie", &panel.cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["code"],
+        "csrf_invalid"
+    );
+    let response = panel
+        .request(Method::POST, "/api/auth/setup")
+        .json(&json!({"code":TOKEN,"password":"another password 123"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    panel
+        .request(Method::POST, "/api/runtime/stop")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    panel.phase("stopped", None).await;
+    {
+        let db = Connection::open(&panel.database).unwrap();
+        db.execute(
+            "INSERT INTO ai_conversations(id,scope,mode) VALUES('web-c','123:group:456','group')",
+            [],
+        )
+        .unwrap();
+    }
+    let req = json!({"request_id":uuid::Uuid::new_v4().to_string(),"conversation_id":"web-c","epoch":1,"memory_revision":0,"action":{"op":"create","subject_id":789,"kind":"preference","text":"喜欢白茶"}});
+    let create = panel
+        .request(Method::POST, "/api/memory/mutate")
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let result: Value = create.json().await.unwrap();
+    let again: Value = panel
+        .request(Method::POST, "/api/memory/mutate")
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result, again);
+    let mut conflict = req.clone();
+    conflict["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        panel
+            .request(Method::POST, "/api/memory/mutate")
+            .json(&conflict)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let listing: Value = panel
+        .request(Method::GET, "/api/memory/records?conversation_id=web-c")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listing["total"], 1);
+    assert_eq!(listing["items"][0]["origin"], "manual");
+    assert_eq!(listing["items"][0]["locked"], true);
+    panel
+        .request(Method::POST, "/api/auth/logout")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        panel
+            .request(Method::GET, "/api/memory/conversations")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    panel.shutdown().await;
+}
+
 fn assert_secure(response: &Response) {
     let headers = response.headers();
     assert_eq!(headers["cache-control"], "no-store");
@@ -193,7 +315,7 @@ fn assert_redacted(snapshot: &Value) {
     }
     assert_eq!(snapshot["config"]["llm"]["api_key"], "");
     assert!(snapshot["config"]["milky"]["access_token"].is_null());
-    assert_eq!(snapshot["config"]["web"]["token"], "");
+    assert!(snapshot["config"]["web"].get("token").is_none());
     assert_eq!(snapshot["config"]["qq_login"]["token"], "");
 }
 
@@ -225,7 +347,7 @@ async fn offline_bot_keeps_panel_available_and_every_api_requires_authentication
         (Method::POST, "/api/qq/qrcode"),
         (Method::GET, "/api/nonexistent"),
     ] {
-        for credential in [None, Some("incorrect-token")] {
+        for credential in [None, Some("incorrect-token"), Some(TOKEN)] {
             let mut request = panel
                 .client
                 .request(method.clone(), format!("{}{path}", panel.url));
@@ -243,12 +365,7 @@ async fn offline_bot_keeps_panel_available_and_every_api_requires_authentication
     }
     let snapshot = panel.snapshot().await;
     assert_redacted(&snapshot);
-    for name in [
-        "llm_api_key",
-        "milky_access_token",
-        "admin_token",
-        "llbot_token",
-    ] {
+    for name in ["llm_api_key", "milky_access_token", "llbot_token"] {
         assert_eq!(snapshot["secrets"][name]["file_set"], true);
     }
     for (name, value) in [
@@ -421,7 +538,7 @@ async fn malformed_partial_and_oversized_requests_never_replace_configuration() 
 }
 
 #[tokio::test]
-async fn save_apply_and_stop_apply_close_the_prior_database_and_preserve_durable_data() {
+async fn apply_and_stop_share_database_and_preserve_durable_data() {
     let panel = Panel::start().await;
     let mut snapshot = panel.snapshot().await;
     let old_revision = snapshot["revision"].as_str().unwrap().to_owned();
@@ -448,7 +565,7 @@ async fn save_apply_and_stop_apply_close_the_prior_database_and_preserve_durable
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     panel.phase("waiting_login", Some(&new_revision)).await;
-    assert_eq!(panel.clock_epoch(), original_epoch + 1);
+    assert_eq!(panel.clock_epoch(), original_epoch + 2);
     {
         let connection = Connection::open(&panel.database).unwrap();
         let note: String = connection
@@ -476,7 +593,12 @@ async fn save_apply_and_stop_apply_close_the_prior_database_and_preserve_durable
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     panel.phase("stopped", None).await;
-    panel.assert_database_closed();
+    let response = panel
+        .request(Method::GET, "/api/memory/conversations")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let response = panel
         .request(Method::POST, "/api/runtime/apply")
         .send()
@@ -484,7 +606,7 @@ async fn save_apply_and_stop_apply_close_the_prior_database_and_preserve_durable
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     panel.phase("waiting_login", Some(&new_revision)).await;
-    assert_eq!(panel.clock_epoch(), original_epoch + 2);
+    assert_eq!(panel.clock_epoch(), original_epoch + 4);
     let note: String = Connection::open(&panel.database)
         .unwrap()
         .query_row("SELECT note FROM admin_restart_fixture", [], |row| {
