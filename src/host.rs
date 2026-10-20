@@ -6,7 +6,7 @@ use crate::{
     plugins::ai::memory::MemoryStore,
     store::Store,
     tools::Gateway,
-    types::{ContextGuard, Scope, now},
+    types::{ContextGuard, Incoming, OutgoingMessage, Scope, now},
 };
 use anyhow::{Result, ensure};
 use rusqlite::params;
@@ -24,6 +24,9 @@ pub struct Host {
     pub cancel: CancellationToken,
     pub epochs: HashMap<String, i64>,
     pub plugins: crate::plugin::PluginRegistry,
+    pub bridge: crate::bridge::Bridge,
+    pub media: crate::media::MediaStore,
+    pub tasks: tokio_util::task::TaskTracker,
     owns_store: bool,
 }
 impl Host {
@@ -79,6 +82,7 @@ impl Host {
         let gateway = Gateway::new(store.clone(), &config.app.timezone, registry, allowed)?;
         gateway.migrate().await?;
         crate::plugins::reminder::migrate(&store).await?;
+        crate::plugins::native::migrate(&store).await?;
         let host = Arc::new(Self {
             config: Arc::new(config),
             access: AccessStore::new(store.clone()),
@@ -90,6 +94,9 @@ impl Host {
             cancel: CancellationToken::new(),
             epochs,
             plugins,
+            bridge: crate::bridge::Bridge::default(),
+            media: crate::media::MediaStore::default(),
+            tasks: tokio_util::task::TaskTracker::new(),
             owns_store,
         });
         for plugin in host.plugins.enabled_handlers() {
@@ -142,8 +149,74 @@ impl Host {
         text: String,
         id: String,
     ) -> Result<SendOutcome> {
+        self.send_message_with_id(
+            scope,
+            plugin,
+            guard,
+            inbound_position,
+            OutgoingMessage::text(text),
+            id,
+        )
+        .await
+    }
+
+    pub async fn send_message(
+        &self,
+        scope: &Scope,
+        plugin: &str,
+        guard: Option<ContextGuard>,
+        inbound_position: i64,
+        message: OutgoingMessage,
+    ) -> Result<SendOutcome> {
+        self.send_message_with_id(
+            scope,
+            plugin,
+            guard,
+            inbound_position,
+            message,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    pub async fn send_plugin_reply(
+        &self,
+        source: &Incoming,
+        plugin: &str,
+        body: OutgoingMessage,
+        attempt_id: String,
+    ) -> Result<SendOutcome> {
+        let key = source.key.key();
+        let origin = plugin.to_owned();
+        let position = self
+            .store
+            .call(move |db| {
+                crate::catalog::check_message(db, &key, &origin)?;
+                Ok(db.query_row("SELECT id FROM messages WHERE key=?1", [key], |r| r.get(0))?)
+            })
+            .await?;
+        self.send_message_with_id(&source.key.scope, plugin, None, position, body, attempt_id)
+            .await
+    }
+
+    pub(crate) async fn send_message_with_id(
+        &self,
+        scope: &Scope,
+        plugin: &str,
+        guard: Option<ContextGuard>,
+        inbound_position: i64,
+        message: OutgoingMessage,
+        id: String,
+    ) -> Result<SendOutcome> {
+        message.validate(self.config.limits.max_message_bytes)?;
+        self.media
+            .bind(self, scope, plugin, inbound_position, &message)
+            .await?;
+        let text = message.text_content();
+        let serialized = serde_json::to_string(&message)?;
+        let origin = plugin.to_owned();
         let scope_key = scope.key();
-        let access_revision = self
+        let (access_revision, plugin_revision) = self
             .store
             .call(move |db| {
                 let revision = crate::access::require_enabled(db, &scope_key)?;
@@ -160,13 +233,12 @@ impl Host {
                         return Err(crate::access::AccessDisabled.into());
                     }
                 }
-                Ok(revision)
+                let plugin_revision = crate::catalog::allowed_revision(db, &scope_key, &origin)?
+                    .ok_or_else(|| anyhow::anyhow!("此会话已关闭该插件"))?;
+                check_source_policy(db, &scope_key, &origin, inbound_position)?;
+                Ok((revision, plugin_revision))
             })
             .await?;
-        ensure!(
-            !text.trim().is_empty() && text.len() <= self.config.limits.max_message_bytes,
-            "发送文本为空或超出上限"
-        );
         let plugin_epoch = *self
             .epochs
             .get(plugin)
@@ -181,12 +253,14 @@ impl Host {
             ensure!(!self.cancel.is_cancelled(), "宿主正在停止");
             let id1 = id.clone();
             let scope_key = scope.key();
-            let body = text.clone();
+            let body = serialized.clone();
             let origin = plugin.to_owned();
             let g = guard.clone();
             let delay=self.store.call(move|c| {
             let tx=c.transaction()?;
             crate::access::check_revision(&tx,&scope_key,access_revision)?;
+            crate::catalog::check_revision(&tx,&scope_key,&origin,plugin_revision)?;
+            check_source_policy(&tx,&scope_key,&origin,inbound_position)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g { check_guard(&tx,g)?; }
             let count:i64=tx.query_row("SELECT COUNT(*) FROM outbox WHERE scope=?1 AND created_at>?2 AND state IN('prepared','submitted','confirmed','unknown')",params![scope_key,now()-3600],|r|r.get(0))?;
@@ -213,6 +287,8 @@ impl Host {
         let submit=self.store.call(move|c|{
             let tx=c.transaction()?;
             crate::access::check_revision(&tx,&scope_key,access_revision)?;
+            crate::catalog::check_revision(&tx,&scope_key,&origin,plugin_revision)?;
+            check_source_policy(&tx,&scope_key,&origin,inbound_position)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g {check_guard(&tx,g)?;}
             ensure!(tx.execute("UPDATE outbox SET state='submitted',updated_at=?2 WHERE id=?1 AND state='prepared'",params![id1,now()])?==1,"发送已取消");
@@ -224,7 +300,7 @@ impl Host {
             return Err(e);
         }
         // Deliberately finish the ledger after submission, even if a reset cancels AI.
-        let outcome = self.milky.send_text(scope, &text).await;
+        let outcome = self.milky.send_message(scope, &message, &self.cancel).await;
         let (state, seq, detail) = match &outcome {
             SendOutcome::Confirmed { message_seq } => {
                 ("confirmed", Some(*message_seq), String::new())
@@ -287,6 +363,7 @@ pub struct Router {
     pub host: Arc<Host>,
     pub chat: Arc<crate::plugins::ai::chat::Chat>,
     controls: Arc<tokio::sync::Semaphore>,
+    observations: Arc<tokio::sync::Semaphore>,
     plugin_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     tasks: tokio_util::task::TaskTracker,
     reminder_delivery: tokio::sync::Mutex<()>,
@@ -303,6 +380,7 @@ impl Router {
             controls: Arc::new(tokio::sync::Semaphore::new(
                 host.config.limits.control_tasks,
             )),
+            observations: Arc::new(tokio::sync::Semaphore::new(4)),
             host,
             plugin_limits,
             tasks: tokio_util::task::TaskTracker::new(),
@@ -321,18 +399,41 @@ impl Router {
         let Some(access_revision) = host.access.allowed_revision(&msg.key.scope).await? else {
             return Ok(());
         };
-        let handler = msg
-            .text
-            .split_whitespace()
-            .next()
-            .and_then(|root| host.plugins.handler_for(root));
-        let registered = msg.text.split_whitespace().next().is_some_and(|root| {
-            host.plugins
-                .specs()
-                .any(|spec| spec.commands.contains(&root))
+        let selection = host.plugins.select(host, &msg).await?;
+        let external = if selection.is_none() && msg.notification.is_none() {
+            host.bridge.selected(host, &msg).await?
+        } else {
+            None
+        };
+        let owner = selection
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| external.clone());
+        // Notifications are control events; unsupported ones are never AI text.
+        if msg.notification.is_some() && owner.is_none() {
+            return Ok(());
+        }
+        let handler = selection.and_then(|(_, handler)| handler);
+        let command = command_root(&msg.text).or(if owner.is_some() {
+            Some("plugin")
+        } else {
+            None
         });
-        let command = command_root(&msg.text).or(if registered { Some("plugin") } else { None });
-        let conv = if host.config.plugins.ai.enabled && !msg.is_self() {
+        let plugin_revision = if let Some(plugin) = &owner {
+            let scope = msg.key.scope.key();
+            let plugin = plugin.clone();
+            let Some(revision) = host
+                .store
+                .call(move |db| crate::catalog::allowed_revision(db, &scope, &plugin))
+                .await?
+            else {
+                return Ok(());
+            };
+            revision
+        } else {
+            0
+        };
+        let conv = if command.is_none() && host.config.plugins.ai.enabled && !msg.is_self() {
             Some(ai::conversation(host, &msg).await?)
         } else {
             None
@@ -350,6 +451,7 @@ impl Router {
             && (trigger || host.config.plugins.ai.read_group_background);
         let incoming = msg.clone();
         let context = conv.clone();
+        let command_plugin = owner.clone();
         let pos=host.store.call(move|c|{
             let tx=c.transaction()?;
             if crate::access::check_revision(&tx,&incoming.key.scope.key(),access_revision).is_err() { return Ok(None); }
@@ -359,7 +461,8 @@ impl Router {
             let origin=if command.is_some(){Some("control")}else if learn&&!keep {Some("memory_only")}else{None};
             let nickname=crate::types::sanitize_display_name(incoming.sender_nickname.as_deref());
             let card=crate::types::sanitize_display_name(incoming.sender_card.as_deref());
-            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable,access_revision,sender_nickname,sender_card) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn,access_revision,nickname,card])?;
+            if let Some(plugin)=&command_plugin {crate::catalog::check_revision(&tx,&incoming.key.scope.key(),plugin,plugin_revision)?;}
+            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable,access_revision,sender_nickname,sender_card,command_plugin,plugin_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn,access_revision,nickname,card,command_plugin,plugin_revision])?;
             if changed==0{return Ok(None);}
             let id=tx.last_insert_rowid();tx.execute("UPDATE messages SET inbound_position=id WHERE id=?1",[id])?;
             tx.commit()?;Ok(Some(id))
@@ -368,6 +471,58 @@ impl Router {
             return Ok(());
         };
         if msg.is_self() {
+            return Ok(());
+        }
+        // Activity observers see real commands as well as ordinary messages;
+        // command ownership still prevents AI context and memory ingestion.
+        for observer in host.plugins.observers() {
+            if !observer.accepts(&msg) {
+                continue;
+            }
+            let Ok(permit) = self.observations.clone().try_acquire_owned() else {
+                continue;
+            };
+            let host = host.clone();
+            let message = msg.clone();
+            self.tasks.spawn(async move {
+                let _permit = permit;
+                if !host.accepts_message(&message).await.unwrap_or(false) {
+                    return;
+                }
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    observer.on_message(&host, &message),
+                )
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    tracing::warn!(
+                        plugin = observer.spec().id,
+                        "plugin event failed or timed out"
+                    );
+                }
+            });
+        }
+        if let Some(plugin) = external {
+            if let Err(error) = host
+                .bridge
+                .publish(host, msg.clone(), position, plugin)
+                .await
+                && let Ok(permit) = self.controls.clone().try_acquire_owned()
+            {
+                let host = host.clone();
+                self.tasks.spawn(async move {
+                    let _permit = permit;
+                    let _ = host
+                        .send(
+                            &msg.key.scope,
+                            "host",
+                            None,
+                            position,
+                            format!("外部插件未完成：{error}"),
+                        )
+                        .await;
+                });
+            }
             return Ok(());
         }
         if let Some(command) = command {
@@ -405,58 +560,54 @@ impl Router {
                     return;
                 }
                 let origin = handler.spec().id;
+                // Bounded network work in native plugins can include several
+                // member lookups or four parallel batches of MC probes.
+                let seconds = match origin {
+                    "mc_status" | "mock_chat_image" => 120,
+                    "mute_roulette" => {
+                        host.config.milky.request_timeout_secs.saturating_mul(36) + 30
+                    }
+                    "nudge" => host.config.milky.request_timeout_secs.saturating_mul(8) + 30,
+                    _ => host.config.milky.request_timeout_secs.saturating_mul(3) + 30,
+                };
                 let result = if handler.accepts(&msg) {
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        handler.command(&host, &msg),
+                        std::time::Duration::from_secs(seconds),
+                        handler.reply(&host, &msg),
                     )
                     .await
                     {
                         Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!("插件指令超时")),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "插件处理超时；发送或管理操作可能已生效，请先核对结果"
+                        )),
                     }
                 } else {
                     Err(anyhow::anyhow!("插件不接受当前会话"))
                 };
-                let text = result.unwrap_or_else(|e| format!("指令未完成：{e}"));
-                if let Err(error) = host
-                    .send(&msg.key.scope, origin, None, position, text)
+                let body =
+                    result.unwrap_or_else(|e| OutgoingMessage::text(format!("指令未完成：{e}")));
+                if body.segments.is_empty() {
+                    return;
+                }
+                match host
+                    .send_message(&msg.key.scope, origin, None, position, body)
                     .await
                 {
-                    tracing::warn!(%error,"command receipt delivery failed");
+                    Ok(SendOutcome::Confirmed { message_seq }) => {
+                        let key = crate::types::MessageKey {
+                            scope: msg.key.scope.clone(),
+                            message_seq,
+                        };
+                        if let Err(error) = handler.after_send(&host, &msg, &key).await {
+                            tracing::warn!(%error,"plugin delivery hook failed");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error,"command receipt delivery failed"),
+                    _ => {}
                 }
             });
             return Ok(());
-        }
-        for observer in host.plugins.observers() {
-            if !observer.accepts(&msg) {
-                continue;
-            }
-            let Some(limit) = self.plugin_limits.get(observer.spec().id) else {
-                continue;
-            };
-            let Ok(permit) = limit.clone().try_acquire_owned() else {
-                continue;
-            };
-            let host = host.clone();
-            let message = msg.clone();
-            self.tasks.spawn(async move {
-                let _permit = permit;
-                if !host.accepts_message(&message).await.unwrap_or(false) {
-                    return;
-                }
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    observer.on_message(&host, &message),
-                )
-                .await;
-                if !matches!(result, Ok(Ok(()))) {
-                    tracing::warn!(
-                        plugin = observer.spec().id,
-                        "plugin event failed or timed out"
-                    );
-                }
-            });
         }
         let Some(conv) = conv else {
             return Ok(());
@@ -497,6 +648,8 @@ impl Router {
     }
 
     pub async fn maintenance(&self) -> Result<()> {
+        crate::bridge::cleanup(&self.host).await;
+        self.host.media.cleanup(&self.host).await;
         let seconds = (self.host.config.limits.retention_days * 86400).min(i64::MAX as u64) as i64;
         let cutoff = now() - seconds;
         self.host
@@ -512,6 +665,7 @@ impl Router {
             })
             .await?;
         self.host.gateway.maintain(seconds).await?;
+        crate::plugins::native::maintain(&self.host.store, cutoff).await?;
         crate::plugins::reminder::maintain(&self.host.store, seconds).await?;
         if self.host.config.plugins.ai.enabled {
             self.chat.compact_idle().await?;
@@ -521,6 +675,11 @@ impl Router {
 
     pub async fn reminders(&self) -> Result<()> {
         use crate::plugins::reminder::{self, Delivery};
+        for plugin in self.host.plugins.enabled_handlers() {
+            if let Err(error) = plugin.tick(&self.host).await {
+                tracing::warn!(plugin=plugin.spec().id,%error,"plugin timer deferred");
+            }
+        }
         if !self.host.config.plugins.reminder.enabled {
             return Ok(());
         }
@@ -571,12 +730,17 @@ impl Router {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.host.cancel.cancel();
         // No store/plugin teardown until a reminder submission has finished its
         // ledger. The normal runtime also drains its reminder scheduler task.
         let _reminders = self.reminder_delivery.lock().await;
         self.chat.shutdown().await;
         self.tasks.close();
         self.tasks.wait().await;
+        self.host.tasks.close();
+        self.host.tasks.wait().await;
+        crate::bridge::cleanup(&self.host).await;
+        self.host.media.cleanup(&self.host).await;
         for plugin in self.host.plugins.enabled_handlers().into_iter().rev() {
             if !matches!(
                 tokio::time::timeout(std::time::Duration::from_secs(15), plugin.stop(&self.host))
@@ -636,7 +800,9 @@ async fn route_command(host: &Host, msg: &crate::types::Incoming, command: &str)
             _ => anyhow::bail!("无效确认操作"),
         }
     }
-    anyhow::bail!("此插件已停用")
+    anyhow::bail!(
+        "此插件未在当前运行配置中启用。请管理员在Web勾选后“保存并应用”，并检查是否存在应用失败提示。"
+    )
 }
 
 fn command_root(text: &str) -> Option<&'static str> {
@@ -664,6 +830,32 @@ pub fn check_plugin(c: &rusqlite::Connection, id: &str, epoch: i64) -> Result<()
         |r| r.get(0),
     )?;
     ensure!(valid, "插件已停用或重启");
+    Ok(())
+}
+
+fn check_source_policy(
+    db: &rusqlite::Connection,
+    scope: &str,
+    origin: &str,
+    position: i64,
+) -> Result<()> {
+    if position <= 0 || origin == "host" {
+        return Ok(());
+    }
+    let (key, owner): (String, Option<String>) = db.query_row(
+        "SELECT key,command_plugin FROM messages WHERE id=?1 AND scope=?2",
+        params![position, scope],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if let Some(owner) = owner {
+        ensure!(owner == origin, "插件发送来源不匹配");
+        crate::catalog::check_message(db, &key, origin)?;
+    } else {
+        ensure!(
+            !crate::catalog::NATIVE_IDS.contains(&origin) && !origin.starts_with("nb_"),
+            "插件缺少触发来源"
+        );
+    }
     Ok(())
 }
 
@@ -711,6 +903,8 @@ mod routing_tests {
                     mentions: vec![1],
                     quote_seq: None,
                     received_at: now(),
+                    raw_message: serde_json::Value::Null,
+                    notification: None,
                 })
                 .await
                 .unwrap();

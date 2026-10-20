@@ -33,7 +33,38 @@ pub trait Plugin: Send + Sync {
     fn accepts(&self, _message: &Incoming) -> bool {
         true
     }
+    fn claims(&self, message: &Incoming) -> bool {
+        message.notification.is_none()
+            && message
+                .text
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| self.spec().commands.contains(&word))
+    }
+    async fn handles_message(&self, _host: &Host, message: &Incoming) -> Result<bool> {
+        Ok(self.claims(message))
+    }
     async fn command(&self, host: &Host, message: &Incoming) -> Result<String>;
+    async fn reply(
+        &self,
+        host: &Host,
+        message: &Incoming,
+    ) -> Result<crate::types::OutgoingMessage> {
+        self.command(host, message)
+            .await
+            .map(crate::types::OutgoingMessage::text)
+    }
+    async fn after_send(
+        &self,
+        _host: &Arc<Host>,
+        _message: &Incoming,
+        _sent: &crate::types::MessageKey,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn tick(&self, _host: &Arc<Host>) -> Result<()> {
+        Ok(())
+    }
     fn observe_messages(&self) -> bool {
         false
     }
@@ -76,6 +107,23 @@ impl PluginRegistry {
                 self.enabled.contains(**id) && handler.spec().commands.contains(&command)
             })
             .map(|(_, handler)| handler.clone())
+    }
+    /// Registered commands retain ownership even when disabled, so they never
+    /// leak into AI context. Stateful matchers are queried only while enabled.
+    pub async fn select(
+        &self,
+        host: &Host,
+        message: &Incoming,
+    ) -> Result<Option<(String, Option<Arc<dyn Plugin>>)>> {
+        for (id, handler) in &self.handlers {
+            let enabled = self.enabled.contains(*id);
+            if handler.claims(message)
+                || (enabled && handler.handles_message(host, message).await?)
+            {
+                return Ok(Some(((*id).to_owned(), enabled.then(|| handler.clone()))));
+            }
+        }
+        Ok(None)
     }
     pub fn observers(&self) -> Vec<Arc<dyn Plugin>> {
         self.handlers

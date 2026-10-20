@@ -1,0 +1,2 @@
+-r requirements-parser.in
+nonebot-plugin-parser[ytdlp]==2.6.10

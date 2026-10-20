@@ -1,0 +1,72 @@
+{
+  "plugins": [
+    {
+      "id": "nb_download",
+      "module": "nonebot_plugin_bilibili_downloader",
+      "name": "B站下载",
+      "description": "调用原版 bilidownloader-woju：下载音频文件、视频文件和封面图。",
+      "enabled": false,
+      "commands": ["/mp3", "/mp4", "/封面图"],
+      "url_hosts": [],
+      "patterns": []
+    },
+    {
+      "id": "nb_ddcheck",
+      "module": "nonebot_plugin_ddcheck",
+      "name": "查成分",
+      "description": "调用原版 ddcheck：按 B站 UID 或用户名生成关注成分图，需要浏览器渲染。",
+      "enabled": false,
+      "commands": ["/查成分"],
+      "url_hosts": [],
+      "patterns": []
+    },
+    {
+      "id": "nb_parser",
+      "module": "nonebot_plugin_parser",
+      "name": "多平台链接解析",
+      "description": "调用原版 parser：B站、抖音、快手、微博、小红书、YouTube、TikTok、X、AcFun、NGA 的图文和媒体解析。",
+      "enabled": false,
+      "commands": ["/bm", "/ym", "/blogin", "/开启解析", "/关闭解析"],
+      "url_hosts": [
+        "bilibili.com", "b23.tv", "bili2233.cn", "douyin.com", "iesdouyin.com",
+        "kuaishou.com", "chenzhongtech.com", "weibo.com", "weibo.cn",
+        "xiaohongshu.com", "xhslink.com", "xhslink.cn", "youtube.com", "youtu.be",
+        "tiktok.com", "x.com", "acfun.cn", "nga.178.com", "ngabbs.com", "bbs.nga.cn"
+      ],
+      "patterns": [
+        "^BV[0-9a-zA-Z]{10}(?:\\s)?(?:\\d{1,3})?$",
+        "^av\\d{6,}(?:\\s)?(?:\\d{1,3})?$"
+      ]
+    },
+    {
+      "id": "nb_acgnshow",
+      "module": "nonebot_plugin_acgnshow",
+      "name": "漫展查询",
+      "description": "调用原版 acgnshow：按地区和页码查展览，查看指定展览详情，需要浏览器渲染。",
+      "enabled": false,
+      "commands": ["展览", "展览详情"],
+      "url_hosts": [],
+      "patterns": ["^(?P<region>.+?)展览\\s*(?P<page>\\d+)?\\s*(?P<date>.+)?$"]
+    },
+    {
+      "id": "nb_witff",
+      "module": "nonebot_plugin_witff",
+      "name": "兽聚查询",
+      "description": "调用原版 WITFF：关键词查询、分页、帮助和文字或图片输出，保存个人输出偏好。",
+      "enabled": false,
+      "commands": ["/兽聚"],
+      "url_hosts": [],
+      "patterns": []
+    },
+    {
+      "id": "nb_music",
+      "module": "nonebot_plugin_voicemusic",
+      "name": "语音点歌",
+      "description": "调用原版 VoiceMusic：从其配置的音乐服务取得音频，以 QQ 语音发送。",
+      "enabled": false,
+      "commands": ["/点歌", "/点一首歌"],
+      "url_hosts": [],
+      "patterns": []
+    }
+  ]
+}

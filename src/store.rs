@@ -67,6 +67,9 @@ impl Store {
         store.migrate("host", 1, HOST_SCHEMA).await?;
         store.migrate("host", 2, MESSAGE_DISPLAY_NAMES).await?;
         store
+            .migrate("catalog", 1, crate::catalog::MIGRATION)
+            .await?;
+        store
             .migrate("scope_access", 1, crate::access::MIGRATION)
             .await?;
         store.call(|c| {

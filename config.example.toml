@@ -73,6 +73,27 @@ enabled = false
 max_active_per_user = 10
 llm_writes_require_confirmation = true  # 首版必须保持 true
 
+[plugins.native]
+# 群/好友默认可用；管理页可分别关闭某插件。戳一戳、禁言游戏按需勾选。
+enabled = ["help", "checkin", "wordle", "kfc", "meal", "daily_partner", "mc_status", "sticker_save", "mock_chat_image", "mock_forward"]
+superusers = []               # QQ号整数；管理食物图片、MC等原插件管理员能力
+image_font_path = ""          # 自动寻找系统中文字体，也可指定 Noto Sans CJK 路径
+meal_cooldown_secs = 10
+meal_daily_limit = 0          # 0 不限制，每天本地时间08:00重置
+mute_max_secs = 360
+mc_servers = []               # [{name="生存",host="mc.example.com",port=25565,kind="java",group_ids=[123456]}]
+
+[nonebot]
+enabled = false              # Python/浏览器仅启用上游插件时需要
+listen = "127.0.0.1:3215"    # 同时用于原生图片临时资源；协议端需能访问本机地址
+token = ""                   # 独立随机令牌，至少32字节；可用QKBOT_NONEBOT_TOKEN覆盖
+task_timeout_secs = 120
+queue_capacity = 32
+media_dir = "data/plugin-media"
+media_max_bytes = 20971520
+# 省略 plugins 时自动载入六项已核对预设，均默认关闭，在 Web 勾选。
+# 显式 plugins = [] 可清空；完整定义见 sidecar/nonebot/catalog.json。
+
 [limits]
 # 保护队列、成本和超时的运行边界，不是内存达标线；可按实际用途调整。
 queued_global = 32

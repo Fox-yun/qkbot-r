@@ -1,0 +1,5 @@
+modules = ["nonebot_plugin_parser"]
+
+[nonebot]
+# Preserve the upstream platform/media defaults. External binaries are documented
+# separately and are never downloaded by this launcher.

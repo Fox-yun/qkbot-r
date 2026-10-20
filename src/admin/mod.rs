@@ -3,6 +3,7 @@ pub mod auth;
 pub mod contacts;
 pub mod memory;
 pub mod models;
+pub mod plugins;
 pub mod qq;
 pub mod qq_service;
 pub mod runtime;
@@ -86,6 +87,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/qq/qrcode", post(qq_qrcode))
         .route("/api/qq/contacts", get(qq_contacts))
         .route("/api/qq/contacts/toggle", post(toggle_contact))
+        .route(
+            "/api/plugins/scope",
+            get(scope_plugins).post(toggle_scope_plugin),
+        )
         .route("/api/budget", get(budget))
         .route("/api/memory/conversations", get(conversations))
         .route("/api/memory/conversations/{id}", get(conversation))
@@ -335,6 +340,35 @@ async fn toggle_contact(
             .unwrap_or_else(|_| Err(anyhow::anyhow!("开关操作异常，请刷新列表核对状态"))),
     )
 }
+async fn scope_plugins(
+    State(s): State<Arc<AdminState>>,
+    Query(query): Query<plugins::ScopeQuery>,
+) -> Response {
+    result(
+        async {
+            Ok(serde_json::to_value(
+                plugins::list(&s.contacts, &s.runtime, query).await?,
+            )?)
+        }
+        .await,
+    )
+}
+async fn toggle_scope_plugin(
+    State(s): State<Arc<AdminState>>,
+    Json(request): Json<plugins::TogglePlugin>,
+) -> Response {
+    result(
+        s.mutations
+            .clone()
+            .spawn(async move {
+                Ok(serde_json::to_value(
+                    plugins::toggle(&s.contacts, &s.runtime, request).await?,
+                )?)
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("插件开关操作异常，请刷新核对状态"))),
+    )
+}
 fn qq_error(e: qq::QqError) -> Response {
     (
         e.status(),
@@ -346,6 +380,13 @@ fn result(r: Result<Value>) -> Response {
     match r {
         Ok(v) => Json(v).into_response(),
         Err(e) => {
+            if let Some(plugin_error) = e.downcast_ref::<plugins::PluginsError>() {
+                return (
+                    plugin_error.status(),
+                    Json(json!({"error":plugin_error.to_string(),"code":plugin_error.code()})),
+                )
+                    .into_response();
+            }
             if let Some(contact_error) = e.downcast_ref::<contacts::ContactsError>() {
                 return (
                     contact_error.status(),

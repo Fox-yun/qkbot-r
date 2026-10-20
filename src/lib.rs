@@ -1,9 +1,12 @@
 pub mod access;
 pub mod admin;
+pub mod bridge;
 pub mod budget;
+pub mod catalog;
 pub mod config;
 pub mod host;
 pub mod llm;
+pub mod media;
 pub mod milky;
 pub mod personas;
 pub mod plugin;

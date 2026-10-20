@@ -168,6 +168,8 @@ fn message(seq: i64, text: &str) -> Incoming {
         mentions: vec![123],
         quote_seq: None,
         received_at: now(),
+        raw_message: serde_json::Value::Null,
+        notification: None,
     }
 }
 
@@ -890,7 +892,10 @@ async fn submitted_send_with_lost_ack_is_unknown_and_not_replayed() {
         })
         .await
         .unwrap();
-    assert_eq!(rows, vec![("unknown".into(), "one-submission-only".into())]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "unknown");
+    let body: qkbot::types::OutgoingMessage = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(body.text_content(), "one-submission-only");
     within(router.shutdown()).await.unwrap();
     assert!(mock.sends.try_recv().is_err());
     drop(host);

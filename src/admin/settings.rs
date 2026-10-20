@@ -42,6 +42,7 @@ pub struct SecretUpdates {
     pub llm_api_key: SecretChange,
     pub milky_access_token: SecretChange,
     pub llbot_token: SecretChange,
+    pub nonebot_token: SecretChange,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +111,7 @@ struct Environment {
     milky_access_token: Option<String>,
     admin_token: Option<String>,
     llbot_token: Option<String>,
+    nonebot_token: Option<String>,
 }
 impl Environment {
     fn read() -> Self {
@@ -118,6 +120,7 @@ impl Environment {
             milky_access_token: std::env::var("QKBOT_MILKY_TOKEN").ok(),
             admin_token: std::env::var("QKBOT_ADMIN_TOKEN").ok(),
             llbot_token: std::env::var("QKBOT_LLBOT_TOKEN").ok(),
+            nonebot_token: std::env::var("QKBOT_NONEBOT_TOKEN").ok(),
         }
     }
     fn apply(&self, config: &mut Config) {
@@ -132,6 +135,9 @@ impl Environment {
         }
         if let Some(value) = &self.llbot_token {
             config.qq_login.token = value.clone();
+        }
+        if let Some(value) = &self.nonebot_token {
+            config.nonebot.token = value.clone();
         }
     }
 }
@@ -374,6 +380,21 @@ fn effective(path: &Path, bytes: &[u8], environment: &Environment) -> Result<Con
             .context("数据库路径不是有效UTF-8")?
             .to_owned();
     }
+    for value in [
+        &mut config.nonebot.media_dir,
+        &mut config.plugins.native.poke.resource_dir,
+        &mut config.plugins.native.image_font_path,
+    ] {
+        if !value.is_empty() && Path::new(value.as_str()).is_relative() {
+            *value = path
+                .parent()
+                .context("配置路径缺少父目录")?
+                .join(value.as_str())
+                .to_str()
+                .context("资源路径不是有效UTF-8")?
+                .to_owned();
+        }
+    }
     validate_readable(&config)?;
     Ok(config)
 }
@@ -392,21 +413,32 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
     // serializing them, including URLs that accidentally contain userinfo secrets.
     validate_readable(&config)?;
     let tool_catalog = crate::plugins::tool_catalog(&config)?;
+    let mut effective_config = config.clone();
+    environment.apply(&mut effective_config);
+    let apply_error = effective_config
+        .validate_activation()
+        .err()
+        .map(|error| error.to_string());
     let secrets = json!({
         "llm_api_key": secret_status(&config.llm.api_key, &environment.llm_api_key),
         "milky_access_token": secret_status(config.milky.access_token.as_deref().unwrap_or(""), &environment.milky_access_token),
         "llbot_token": secret_status(&config.qq_login.token, &environment.llbot_token),
+        "nonebot_token": secret_status(&config.nonebot.token, &environment.nonebot_token),
     });
     config.llm.api_key.clear();
     config.milky.access_token = None;
     config.web.token.clear();
     config.qq_login.token.clear();
+    config.nonebot.token.clear();
+    let plugin_catalog = crate::catalog::features(&config);
     let mut config = serde_json::to_value(config)?;
     config["web"].as_object_mut().unwrap().remove("token");
     Ok(json!({
         "config": config, "revision": revision(bytes), "secrets": secrets,
         "persona_templates": crate::personas::templates(),
         "tool_catalog": tool_catalog,
+        "plugin_catalog":plugin_catalog,
+        "apply_error": apply_error,
     }))
 }
 
@@ -451,11 +483,13 @@ fn save_file_cached(
                 .as_deref()
                 .is_none_or(str::is_empty)
             && config.web.token.is_empty()
-            && config.qq_login.token.is_empty(),
+            && config.qq_login.token.is_empty()
+            && config.nonebot.token.is_empty(),
         "配置正文中的凭据必须为空，请使用secrets的keep/set/clear操作"
     );
     config.llm.api_key = change_secret(&previous.llm.api_key, &request.secrets.llm_api_key)?;
     config.qq_login.token = change_secret(&previous.qq_login.token, &request.secrets.llbot_token)?;
+    config.nonebot.token = change_secret(&previous.nonebot.token, &request.secrets.nonebot_token)?;
     config.web.token = previous.web.token;
     config.milky.access_token = match &request.secrets.milky_access_token {
         SecretChange::Keep => previous.milky.access_token,
@@ -554,6 +588,33 @@ fn validate_stored(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_explains_unconfigured_bridge_without_leaking_its_secret() {
+        let mut config = Config::default();
+        config.plugins.ai.enabled = false;
+        config.nonebot.enabled = true;
+        let bytes = toml::to_string(&config).unwrap();
+        let view = snapshot(bytes.as_bytes(), &Environment::default()).unwrap();
+        let error = view["apply_error"].as_str().unwrap();
+        assert!(error.contains("NoneBot") && error.contains("Rust原生插件"));
+        assert_eq!(view["config"]["nonebot"]["enabled"], true);
+        let environment = Environment {
+            nonebot_token: Some("activation-fixture-secret-longer-than-32-bytes".into()),
+            ..Default::default()
+        };
+        let ready = snapshot(bytes.as_bytes(), &environment).unwrap();
+        assert!(ready["apply_error"].is_null());
+        assert_eq!(ready["secrets"]["nonebot_token"]["effective_set"], true);
+        assert!(!ready.to_string().contains("activation-fixture-secret"));
+        config.nonebot.enabled = false;
+        let disabled = snapshot(
+            toml::to_string(&config).unwrap().as_bytes(),
+            &Environment::default(),
+        )
+        .unwrap();
+        assert!(disabled["apply_error"].is_null());
+    }
 
     #[tokio::test]
     async fn legacy_access_blocks_admin_loading_without_rewriting_the_file() {
@@ -912,6 +973,7 @@ mod tests {
             milky_access_token: Some("env-milky-fixture".into()),
             admin_token: Some("env-admin-fixture-at-least-32-bytes".into()),
             llbot_token: Some("env-login-fixture".into()),
+            nonebot_token: Some("env-nonebot-fixture-at-least-32-bytes".into()),
         };
         let mut update = request(&path, &environment);
         update.secrets.llbot_token = SecretChange::Clear;

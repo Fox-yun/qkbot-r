@@ -786,6 +786,8 @@ mod tests {
             mentions: vec![],
             quote_seq: None,
             received_at: now(),
+            raw_message: serde_json::Value::Null,
+            notification: None,
         };
         let incoming = old.clone();
         store.call(move|db|{db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at) VALUES(?1,?2,'conversation',1,?3,'control','',?4)",params![incoming.key.key(),incoming.key.scope.key(),incoming.sender_id,incoming.received_at])?;Ok(())}).await.unwrap();

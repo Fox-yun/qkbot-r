@@ -1,0 +1,39 @@
+# 帮助、聊天图片与辅助插件核对
+
+核对于 2026-10-20。以下为用户指定项目的固定提交，功能按源码而非菜单名称确定。Rust 绘图使用 `ab_glyph`、`image` 和无损快速 PNG 编码，不启动浏览器；系统中文字体按需加载，TTC 使用第一个字体面，实际用到的字形才解析和绘制。单次绘图最多缓存 512 个字形、1 MiB 位图，菜单各页共用，任务结束释放；两项绘图可同时执行。字体不随仓库分发。[字体集合接口](https://docs.rs/ab_glyph/0.2.32/ab_glyph/struct.FontVec.html#method.try_from_vec_and_index)
+
+## 图片帮助
+
+来源：[PicMenu Next 0.5.0](https://github.com/lgc-NB2Dev/nonebot-plugin-picmenu-next/tree/0dff42994b48147cf38ba70afdde1d3b43ebbf18)，MIT。核对 `__main__.py`、`data_source` 和 README。
+
+上游提供 `help/帮助/菜单 [插件序号或名称] [功能序号或名称]`，按适配器过滤，隐藏 library 项，支持 `-H`、拼音加权模糊搜索、三级图片菜单、Alconna 帮助接管、Markdown、模板和 mixin 扩展。
+
+本项目由 Rust/NoneBot 共用功能目录生成图片，保留入口别名、序号/名称查询、命令详情和超级管理员隐藏项查看。目录只展示当前会话可用插件，关闭后的操作仍由宿主校验；缺少字体时帮助退回完整文字。目录命令从实际 Rust `PluginSpec` 获取，外部插件来自保存的注册配置。
+
+这不是完整 PicMenu 模板引擎的移植：暂不解释其外部 Python mixin、Markdown 模板或拼音模糊搜索；名称使用包含匹配。不能把这几项标成“已完整复刻 PicMenu Next”。
+
+## 模拟聊天图片
+
+来源：[nonebot-plugin-fakepic 0.2.2](https://github.com/lm175/nonebot-plugin-fakepic/tree/0ac846a9e2be400ed138595aa2bf1169c30b9ed1)。核对 `__main__.py`、`config.py`、`draw.py`。
+
+原版的实际入口是 `QQ号【可选昵称】说消息+QQ号说消息`，QQ 号为 5–10 位，`+` 分隔发言人，空格分隔同一人的多条消息。每条消息可以带文字、@、QQ 表情和图片；头像来自 QQ，昵称先从协议获取。它提供自定义分隔符、字体及位置修正，并根据 QQ 号区间显示机器人图标。
+
+本项目实现默认语法，并增加明确的 `/mock-image` 入口；发送真实消息段中的图片，保留头像、昵称、多发言人和多条消息；输出固定标注“模拟对话 · 非真实聊天记录”，不进入 AI 记忆。图片只从 QQ 资源读取，有大小和画布边界。昵称缺失时使用 QQ ID，不把用户文本冒充真实身份。
+
+当前边界：未移植原版任意字体回退列表、像素位置修正、自定义分隔符或装饰等级图片；@ 在图片中显示 QQ 标识。布局是独立原生绘图，不声称像素一致。与 `fakemsg` 的裸命令存在原始冲突，本项目明确消歧：含 `|` 或以真实 @ 开头由模拟转发处理；单条/`+` 默认图片；单条转发使用 `/mock-forward`。
+
+## 权限与运行状态
+
+参考：[access-control 1.2.4](https://github.com/bot-ssttkkl/nonebot-plugin-access-control/tree/df9374cca8c29b1c31ae6f7adc3db999f755a089)。实际实现基于 service/subject、session、ORM 和调用次数令牌；默认权限 `allow`，自动 patch 默认关闭。它并非一个简单“群白名单”。
+
+Rust 负责当前账号的群/好友黑名单以及每个插件的黑名单，缺少记录默认开启。开关带版本号，关闭再开启不会让旧任务恢复有效；NoneBot 的插件权限只可进一步限制，不能越过 Rust 的范围检查。现有 Web 管理页面承担这些操作。本次没有把 access-control 的 ORM/主体表达式/完整命令集移植进 Rust。
+
+参考：[PicStatus 2.3.1](https://github.com/lgc-NB2Dev/nonebot-plugin-picstatus/tree/506d0d486d71f20440e377778b2543f154931169)。它定时收集 CPU、内存、磁盘、网络、进程与消息统计，通过 HTMLRender 输出图片；支持引用图片背景、随机背景预载和可配置网络探测。它展示的是运行 NoneBot 的设备/进程，不等同于 Rust 核心的单独占用。
+
+这个版本要求 `htmlrender >=0.6.7,<0.8`，而目标 `ddcheck 0.4.3` 要求 `<0.5`，不能在同一个默认环境中安装两者。当前使用已有 Web 状态页面；未将冲突的状态图片包冒充为已接入插件。若另选兼容版本，应重新锁定并测试依赖，不应静默忽略解析冲突。
+
+## 资源与可靠性
+
+生成图片/导入文件只存入配置的媒体目录，通过随机、短期资源 URL 提供给本机协议端；HTTP 接口不接收任意文件路径。发送前绑定来源会话与插件，下载时复核账号和开关版本。缓存过期或运行时结束后清理临时资源；管理员保存的图片餐单另行持久保存。
+
+本机 Milky/QQ 客户端需要能访问 `nonebot.listen`。使用容器或远程协议端时，须先安排同一网络环境；不能把 `127.0.0.1` 当作远程客户端可访问的地址。

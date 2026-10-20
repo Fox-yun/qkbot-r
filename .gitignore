@@ -17,3 +17,6 @@
 *.sqlite3-wal
 *.sqlite3-shm
 *.log
+__pycache__/
+*.py[cod]
+.venv/

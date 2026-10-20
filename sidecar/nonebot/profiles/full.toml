@@ -1,0 +1,8 @@
+modules = [
+  "nonebot_plugin_parser",
+  "nonebot_plugin_bilibili_downloader",
+  "nonebot_plugin_ddcheck",
+  "nonebot_plugin_acgnshow",
+  "nonebot_plugin_witff",
+  "nonebot_plugin_voicemusic",
+]

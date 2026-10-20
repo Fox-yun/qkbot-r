@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, fetchModels, renderModels, invalidateModels };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, fetchModels, renderModels, invalidateModels, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -662,4 +662,227 @@ test("tool metadata stays literal, prototype names are safe, and malformed catal
   assert.deepEqual([...h.app.readForm().plugins.ai.defaults.allowed_tools], ["<missing-tool>", "__proto__"]);
   h.app.state.busy = true; h.app.updateControls(); assert.equal(checkbox.disabled, true);
   checkbox.checked = false; await checkbox.emit("change"); assert.equal(checkbox.checked, true); assert.equal({}.polluted, undefined);
+});
+
+function pluginSnapshot(h) {
+  const snapshot = h.snapshot();
+  snapshot.config.plugins.native = { enabled: ["wordle", "retired"], superusers: [], mc_servers: [], today_waifu: { allow_change: true }, poke: { send_text: true } };
+  snapshot.config.nonebot = { enabled: false, token: "", listen: "127.0.0.1:3215", plugins: [{ id: "nb_test", module: "nonebot_plugin_test", name: "兼容插件", description: "", commands: ["/test"], url_hosts: [], enabled: true }], queue_capacity: 32 };
+  snapshot.plugin_catalog = [
+    { id: "wordle", name: "Wordle", description: "共享猜词", runtime: "rust" },
+    { id: "checkin", name: "🦌签到", description: "<img> 只是文字", runtime: "rust" },
+    { id: "nb_test", name: "兼容插件", description: "", runtime: "nonebot" },
+  ];
+  snapshot.secrets.nonebot_token = { file_set: true, effective_set: true }; return snapshot;
+}
+async function preparePlugins(h) {
+  await h.login(); const snapshot = pluginSnapshot(h);
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig(); return snapshot;
+}
+function globalPlugin(h, id) { return h.document.querySelectorAll(`[data-plugin-id="${id}"]`)[0]; }
+function scopePluginResponse(query, enabled = true, revision = 0) {
+  return { ...query, plugins: [{ id: "wordle", name: "Wordle", description: "共享猜词", runtime: "rust", commands: ["/wordle"], group_only: false, globally_enabled: true, enabled, revision }] };
+}
+test("native and NoneBot plugin configuration roundtrips without losing drafts or exposing tokens", async () => {
+  const h = harness(); await preparePlugins(h);
+  assert.equal(globalPlugin(h, "wordle").checked, true); assert.equal(globalPlugin(h, "checkin").checked, false);
+  assert.equal(globalPlugin(h, "retired").checked, true);
+  globalPlugin(h, "wordle").checked = false; await globalPlugin(h, "wordle").emit("change");
+  globalPlugin(h, "checkin").checked = true; await globalPlugin(h, "checkin").emit("change");
+  h.ids.get("nonebot-enabled").checked = true; await h.ids.get("nonebot-enabled").emit("change");
+  const options = JSON.parse(h.ids.get("native-options-json").value); options.superusers = [123456];
+  h.ids.get("native-options-json").value = JSON.stringify(options); await h.ids.get("native-options-json").emit("input");
+  const secret = h.app.secretInputs.get("nonebot_token"); secret.value.value = "temporary-local-fixture-key"; await secret.value.emit("input");
+  let config = h.app.readForm();
+  assert.deepEqual([...config.plugins.native.enabled], ["checkin", "retired"]); assert.deepEqual([...config.plugins.native.superusers], [123456]);
+  assert.equal(config.nonebot.enabled, true); assert.equal(config.nonebot.plugins[0].enabled, true); assert.equal(config.nonebot.token, "");
+  h.app.syncJson(); h.app.adoptJson(); config = h.app.readForm();
+  assert.deepEqual([...config.plugins.native.enabled], ["checkin", "retired"]);
+  assert.equal(h.app.secretInputs.get("nonebot_token").value.value, "temporary-local-fixture-key");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.secretChanges().nonebot_token)), { action: "set", value: "temporary-local-fixture-key" });
+  const bad = structuredClone(config); bad.nonebot.token = "must-not-be-in-json"; h.ids.get("config-json").value = JSON.stringify(bad);
+  assert.throws(() => h.app.adoptJson(), /独立|密钥/u);
+  assert.equal(h.calls.some((call) => call.options.method !== "GET"), false);
+});
+test("new NoneBot definitions stay disabled until selected and invalid advanced edits preserve checkboxes", async () => {
+  const h = harness(); await preparePlugins(h);
+  const defs = JSON.parse(h.ids.get("nonebot-definitions-json").value);
+  defs.push({ id: "nb_new", module: "nonebot_plugin_new", name: "<new>", description: "", commands: ["/new"], url_hosts: [] });
+  h.ids.get("nonebot-definitions-json").value = JSON.stringify(defs);
+  h.app.refreshExternalPlugins();
+  assert.equal(globalPlugin(h, "nb_test").checked, true); assert.equal(globalPlugin(h, "nb_new").checked, false);
+  globalPlugin(h, "nb_new").checked = true; await globalPlugin(h, "nb_new").emit("change");
+  assert.equal(h.app.readForm().nonebot.plugins[1].enabled, true);
+  h.ids.get("native-options-json").value = "{broken";
+  assert.throws(() => h.app.readForm(), /JSON/u); assert.equal(globalPlugin(h, "nb_new").checked, true);
+  h.app.clearSession(); assert.equal(h.app.secretInputs.size, 0); assert.equal(h.document.querySelectorAll("[data-plugin-id]").length, 0);
+});
+test("malformed plugin JSON never replaces the existing draft or pending secret", async () => {
+  const h = harness(); await preparePlugins(h);
+  const key = h.app.secretInputs.get("nonebot_token"); key.value.value = "pending-local-test-token";
+  const original = h.app.state.draft;
+  for (const mutate of [
+    (config) => { config.plugins.native.enabled = {}; },
+    (config) => { config.nonebot.plugins = {}; },
+    (config) => { config.nonebot.plugins = [null]; },
+    (config) => { config.nonebot.plugins.push({ ...config.nonebot.plugins[0] }); },
+  ]) {
+    const config = JSON.parse(JSON.stringify(h.app.readForm())); mutate(config);
+    h.ids.get("config-json").value = JSON.stringify(config);
+    assert.throws(() => h.app.adoptJson(), /JSON 字段/u);
+    assert.equal(h.app.state.draft, original);
+    assert.equal(globalPlugin(h, "wordle").checked, true);
+    assert.equal(h.app.secretInputs.get("nonebot_token").value.value, "pending-local-test-token");
+  }
+});
+test("scope plugin toggles bind account chat and revision, unknown writes require readback", async () => {
+  const h = harness(); await h.login(); h.app.state.contacts.botId = "123";
+  const query = { bot_id: "123", scene: "group", peer_id: "456" };
+  h.setHandler(async (path, options) => ({ body: scopePluginResponse(query, options.method === "GET", options.method === "GET" ? 0 : 1) }));
+  await h.app.openScopePlugins("group", "456", "测试群");
+  await h.app.toggleScopePlugin("wordle", false);
+  const request = h.calls.at(-1); assert.equal(request.path, "/api/plugins/scope");
+  assert.deepEqual(request.body, { ...query, plugin: "wordle", enabled: false, revision: 0 });
+  assert.equal(request.options.headers["X-CSRF-Token"], "csrf-test");
+  assert.equal(h.app.state.scopePlugins.rows[0].enabled, false);
+  h.setHandler(async () => ({ error: new TypeError("connection lost") }));
+  await h.app.toggleScopePlugin("wordle", true);
+  assert.equal(h.app.state.scopePlugins.uncertain, true); const count = h.calls.length;
+  await h.app.toggleScopePlugin("wordle", true); assert.equal(h.calls.length, count);
+  assert.match(h.ids.get("scope-plugins-message").textContent, /不会重复提交/u);
+  h.setHandler(async () => ({ body: scopePluginResponse(query, true, 2) })); await h.app.loadScopePlugins();
+  assert.equal(h.app.state.scopePlugins.uncertain, false); assert.equal(h.app.state.scopePlugins.rows[0].revision, 2);
+});
+test("late scope plugin responses cannot cross contacts or restore a signed-out panel", async () => {
+  const h = harness(); await h.login(); h.app.state.contacts.botId = "123";
+  let resolve; const slow = new Promise((done) => { resolve = done; });
+  h.setHandler(async (path) => path.includes("peer_id=456") ? slow : { body: scopePluginResponse({ bot_id: "123", scene: "group", peer_id: "789" }, false, 4) });
+  const first = h.app.openScopePlugins("group", "456", "A");
+  await h.app.openScopePlugins("group", "789", "B");
+  resolve({ body: scopePluginResponse({ bot_id: "123", scene: "group", peer_id: "456" }) }); await first;
+  assert.equal(h.app.state.scopePlugins.query.peer_id, "789"); assert.equal(h.app.state.scopePlugins.rows[0].revision, 4);
+  h.app.clearSession(); assert.equal(h.ids.get("scope-plugins-dialog").open, false); assert.equal(h.app.state.scopePlugins.query, null);
+});
+
+test("configuration distinguishes drafts, saved revisions, applied runtime and persistent apply blockers", async () => {
+  const h = harness(); const snapshot = await preparePlugins(h);
+  assert.equal(h.ids.get("config-state").textContent, "已保存待应用");
+  h.app.state.status = { phase: "running", applied_revision: "r1", loaded_plugins: ["wordle", "nb_test"] }; h.app.renderStatus();
+  assert.equal(h.ids.get("dirty-label").textContent, "已应用");
+  const loaded = () => h.document.querySelectorAll('[data-plugin-loaded="wordle"]')[0].textContent;
+  assert.equal(loaded(), "当前运行已启用");
+  assert.match(h.document.querySelectorAll('[data-plugin-loaded="nb_test"]')[0].textContent, /桥接.*Python.*另行确认/u);
+  globalPlugin(h, "wordle").checked = false; await globalPlugin(h, "wordle").emit("change");
+  assert.equal(h.ids.get("config-state").textContent, "未保存"); assert.equal(loaded(), "当前运行已启用");
+  snapshot.revision = "r2"; snapshot.config.nonebot.enabled = true;
+  snapshot.apply_error = "NoneBot 缺少连接令牌。只使用 Rust 原生插件时请关闭 NoneBot。";
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  assert.equal(h.ids.get("config-state").textContent, "不可应用");
+  assert.equal(h.ids.get("config-apply-error").hidden, false);
+  assert.match(h.ids.get("config-apply-error").textContent, /缺少连接令牌.*关闭 NoneBot/u);
+  await h.ids.get("dismiss-notice").emit("click"); h.app.renderStatus();
+  assert.equal(h.ids.get("config-apply-error").hidden, false, "blocking detail must survive dismissal and status polling");
+  assert.equal(h.calls.some((call) => call.path === "/api/runtime/apply"), false);
+});
+
+test("save-and-apply rejection preserves saved state and the original failure while the old host remains active", async () => {
+  const h = harness(); const saved = await preparePlugins(h);
+  h.app.state.status = { phase: "running", applied_revision: "r1", loaded_plugins: ["wordle"] };
+  const reason = "NoneBot token 无效；请补充连接令牌或关闭兼容服务。";
+  h.setHandler(async (path, options) => {
+    if (path === "/api/config" && options.method === "PUT") {
+      saved.config = JSON.parse(options.body).config; saved.revision = "r2"; return { body: saved };
+    }
+    if (path === "/api/config") return { body: saved };
+    if (path === "/api/runtime/apply") return { status: 400, body: { error: reason } };
+    return { body: { phase: "running", applied_revision: "r1", loaded_plugins: ["wordle"] } };
+  });
+  globalPlugin(h, "checkin").checked = true; await globalPlugin(h, "checkin").emit("change");
+  await h.app.runAction(() => h.app.saveConfig(true));
+  assert.equal(h.app.state.revision, "r2"); assert.equal(h.app.state.dirty, false);
+  assert.match(h.ids.get("notice-text").textContent, /配置已保存但未生效/u);
+  assert.ok(h.ids.get("notice-text").textContent.includes(reason));
+  assert.equal(h.app.state.applyFailure.message, reason);
+  assert.equal(h.ids.get("config-state").textContent, "应用失败");
+  await h.app.refreshStatus();
+  assert.equal(h.ids.get("config-state").textContent, "应用失败");
+  assert.match(h.document.querySelectorAll('[data-plugin-loaded="checkin"]')[0].textContent, /当前运行未启用/u);
+  assert.equal(globalPlugin(h, "checkin").checked, true);
+  assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
+});
+
+test("known invalid saved config is not applied; fixing it explicitly restores the applied state", async () => {
+  const h = harness(); let saved = await preparePlugins(h), blocked = true;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/config" && options.method === "PUT") {
+      saved = { ...saved, config: JSON.parse(options.body).config, revision: blocked ? "r2" : "r3",
+        apply_error: blocked ? "启用 NoneBot 时必须配置连接令牌。" : null };
+      return { body: saved };
+    }
+    if (path === "/api/config") return { body: saved };
+    return { body: { phase: "running", applied_revision: "r3", loaded_plugins: ["wordle", "checkin"] } };
+  });
+  h.ids.get("nonebot-enabled").checked = true; await h.ids.get("nonebot-enabled").emit("change");
+  await h.app.runAction(() => h.app.saveConfig(true));
+  assert.equal(h.ids.get("config-state").textContent, "不可应用");
+  assert.match(h.ids.get("notice-text").textContent, /配置已保存但未生效.*必须配置连接令牌/u);
+  assert.equal(h.calls.some((call) => call.path === "/api/runtime/apply"), false);
+  h.ids.get("nonebot-enabled").checked = false; await h.ids.get("nonebot-enabled").emit("change");
+  assert.equal(h.ids.get("config-state").textContent, "未保存"); assert.equal(h.ids.get("config-apply-error").hidden, false);
+  blocked = false; await h.app.runAction(() => h.app.saveConfig(true));
+  assert.equal(h.ids.get("config-state").textContent, "已应用");
+  assert.equal(h.ids.get("config-apply-error").hidden, true);
+  assert.equal(h.app.state.applyFailure, null);
+  assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
+});
+
+test("scope permission success never claims an unloaded plugin is running", async () => {
+  const h = harness(); await h.login(); h.app.state.contacts.botId = "123";
+  h.app.state.applyError = "请补充 NoneBot 令牌或关闭兼容服务。";
+  const query = { bot_id: "123", scene: "group", peer_id: "456" };
+  h.setHandler(async (_path, options) => {
+    const result = scopePluginResponse(query, options.method !== "GET", options.method === "GET" ? 0 : 1);
+    result.plugins[0].globally_enabled = false; return { body: result };
+  });
+  await h.app.openScopePlugins("group", "456", "测试群"); await h.app.toggleScopePlugin("wordle", true);
+  assert.equal(h.app.state.scopePlugins.rows[0].enabled, true);
+  assert.match(h.ids.get("scope-plugins-message").textContent, /已允许.*当前运行未启用.*令牌/u);
+  assert.match(h.ids.get("scope-plugins-list").textContent, /会话已允许.*当前运行未启用/u);
+  assert.doesNotMatch(h.ids.get("scope-plugins-message").textContent, /已开启|即时生效/u);
+  assert.equal(h.calls.some((call) => call.path === "/api/runtime/apply"), false);
+});
+
+test("uncertain apply retains its error and does not treat a previous matching revision as success", async () => {
+  const h = harness(); const saved = await preparePlugins(h);
+  h.app.state.status = { phase: "running", applied_revision: "r1", loaded_plugins: ["wordle"] };
+  h.setHandler(async (path) => path === "/api/config" ? { body: saved } : { error: new Error("response interrupted") });
+  await h.app.runAction(() => h.app.saveConfig(true));
+  assert.equal(h.app.state.pendingOperation.kind, "runtime");
+  assert.equal(h.ids.get("config-state").textContent, "已保存待应用");
+  assert.match(h.ids.get("notice-text").textContent, /应用结果尚未确认.*无法连接管理服务/u);
+  assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
+});
+
+test("late runtime status cannot restore plugin state after logout", async () => {
+  const h = harness(); await preparePlugins(h); let resolve;
+  h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const pending = h.app.refreshStatus(); h.app.clearSession();
+  resolve({ body: { phase: "running", applied_revision: "r1", loaded_plugins: ["wordle"] } }); await pending;
+  assert.equal(h.app.state.status, null); assert.equal(h.app.state.applyFailure, null);
+});
+
+test("authoritative polling clears a recovered apply failure but retains the saved configuration blocker", async () => {
+  const h = harness(); await preparePlugins(h);
+  h.app.state.applyFailure = { revision: "r1", message: "上次应用失败。" };
+  h.app.state.status = { phase: "running", applied_revision: "r0", loaded_plugins: [] }; h.app.renderStatus();
+  assert.equal(h.ids.get("config-state").textContent, "应用失败");
+  h.setHandler(async () => ({ body: { phase: "waiting_login", applied_revision: "r1", loaded_plugins: ["wordle"] } }));
+  await h.app.refreshStatus();
+  assert.equal(h.app.state.applyFailure, null); assert.equal(h.ids.get("config-state").textContent, "已应用");
+  h.app.state.applyFailure = { revision: "r1", message: "旧失败。" };
+  h.app.state.applyError = "当前环境中的 NoneBot 令牌无效。";
+  await h.app.refreshStatus();
+  assert.equal(h.app.state.applyFailure, null);
+  assert.equal(h.ids.get("config-state").textContent, "不可应用");
+  assert.match(h.ids.get("config-apply-error").textContent, /当前环境中的 NoneBot 令牌无效/u);
 });

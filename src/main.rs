@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
             "--check" => check = true,
             "--help" | "-h" => {
                 println!(
-                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN"
+                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN、QKBOT_NONEBOT_TOKEN"
                 );
                 return Ok(());
             }

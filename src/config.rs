@@ -19,6 +19,7 @@ pub struct Config {
     pub plugins: PluginsConfig,
     pub web: WebConfig,
     pub qq_login: QqLoginConfig,
+    pub nonebot: NoneBotConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -156,6 +157,218 @@ pub struct PluginsConfig {
     pub ai: AiConfig,
     pub clock: ClockConfig,
     pub reminder: ReminderConfig,
+    pub native: NativeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeConfig {
+    pub enabled: Vec<String>,
+    pub meal_items: Vec<String>,
+    pub meal_cooldown_secs: u64,
+    pub meal_daily_limit: u32,
+    pub mc_servers: Vec<McServerConfig>,
+    pub image_font_path: String,
+    pub mute_max_secs: u64,
+    pub superusers: Vec<i64>,
+    pub today_waifu: TodayWaifuConfig,
+    pub poke: PokeConfig,
+    pub fakemsg: FakeMsgConfig,
+}
+impl Default for NativeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: [
+                "help",
+                "checkin",
+                "wordle",
+                "kfc",
+                "meal",
+                "daily_partner",
+                "mc_status",
+                "sticker_save",
+                "mock_forward",
+                "mock_chat_image",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            meal_items: vec![],
+            meal_cooldown_secs: 10,
+            meal_daily_limit: 0,
+            mc_servers: vec![],
+            image_font_path: String::new(),
+            mute_max_secs: 360,
+            superusers: vec![],
+            today_waifu: TodayWaifuConfig::default(),
+            poke: PokeConfig::default(),
+            fakemsg: FakeMsgConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TodayWaifuConfig {
+    pub allow_change: bool,
+    pub change_limit: u32,
+    pub auto_recall: bool,
+    pub recall_delay_secs: u64,
+    pub auto_pair: bool,
+    pub select_mode: String,
+    pub active_days: u32,
+    pub excluded_ids: Vec<i64>,
+}
+impl Default for TodayWaifuConfig {
+    fn default() -> Self {
+        Self {
+            allow_change: true,
+            change_limit: 2,
+            auto_recall: false,
+            recall_delay_secs: 5,
+            auto_pair: false,
+            select_mode: "random".into(),
+            active_days: 3,
+            excluded_ids: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McServerConfig {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "mc_java_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub group_ids: Vec<i64>,
+}
+fn mc_java_kind() -> String {
+    "java".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FakeMsgConfig {
+    pub user_split: String,
+    pub message_split: String,
+    pub protected_ids: Vec<i64>,
+}
+impl Default for FakeMsgConfig {
+    fn default() -> Self {
+        Self {
+            user_split: "|".into(),
+            message_split: " ".into(),
+            protected_ids: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PokeConfig {
+    pub nickname: String,
+    pub blacklist_mode: bool,
+    pub blocked_groups: Vec<i64>,
+    pub allowed_groups: Vec<i64>,
+    pub send_text: bool,
+    pub send_image: bool,
+    pub send_record: bool,
+    pub send_back: bool,
+    pub resource_dir: String,
+    pub cooldown_secs: u64,
+}
+impl Default for PokeConfig {
+    fn default() -> Self {
+        Self {
+            nickname: "小鱼".into(),
+            blacklist_mode: true,
+            blocked_groups: vec![],
+            allowed_groups: vec![],
+            send_text: true,
+            send_image: false,
+            send_record: false,
+            send_back: false,
+            resource_dir: "data/poke".into(),
+            cooldown_secs: 10,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NoneBotConfig {
+    pub enabled: bool,
+    pub listen: String,
+    pub token: String,
+    pub plugins: Vec<ExternalPluginConfig>,
+    pub task_timeout_secs: u64,
+    pub queue_capacity: usize,
+    pub media_dir: String,
+    pub media_max_bytes: usize,
+}
+impl Default for NoneBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:3215".into(),
+            token: String::new(),
+            plugins: external_plugin_presets(),
+            task_timeout_secs: 120,
+            queue_capacity: 32,
+            media_dir: "data/nonebot-media".into(),
+            media_max_bytes: 20 * 1024 * 1024,
+        }
+    }
+}
+/// Audited optional modules appear in the administrator checklist on upgrade.
+/// Explicit lists in an existing configuration still take precedence.
+pub fn external_plugin_presets() -> Vec<ExternalPluginConfig> {
+    #[derive(Deserialize)]
+    struct Presets {
+        plugins: Vec<ExternalPluginConfig>,
+    }
+    serde_json::from_str::<Presets>(include_str!("../sidecar/nonebot/catalog.json"))
+        .expect("bundled NoneBot catalog is validated by configuration tests")
+        .plugins
+}
+impl std::fmt::Debug for NoneBotConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoneBotConfig")
+            .field("enabled", &self.enabled)
+            .field("listen", &self.listen)
+            .field("token", &"[redacted]")
+            .field("plugins", &self.plugins)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExternalPluginConfig {
+    pub id: String,
+    pub module: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub commands: Vec<String>,
+    pub url_hosts: Vec<String>,
+    pub patterns: Vec<String>,
+}
+impl Default for ExternalPluginConfig {
+    fn default() -> Self {
+        Self {
+            id: "nb_echo".into(),
+            module: "qkbot_echo".into(),
+            name: "桥接测试".into(),
+            description: "验证文本、引用和图片发送".into(),
+            enabled: false,
+            commands: vec!["/nbtest".into()],
+            url_hosts: vec![],
+            patterns: vec![],
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -300,6 +513,9 @@ impl Config {
         if let Ok(token) = std::env::var("QKBOT_LLBOT_TOKEN") {
             self.qq_login.token = token;
         }
+        if let Ok(token) = std::env::var("QKBOT_NONEBOT_TOKEN") {
+            self.nonebot.token = token;
+        }
     }
     pub fn load(path: &Path) -> Result<Self> {
         let mut config = Self::load_raw(path)?;
@@ -307,9 +523,17 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
+    /// Readiness checks for saved settings, without constructing transport clients.
+    pub fn validate_activation(&self) -> Result<()> {
+        ensure!(
+            !self.nonebot.enabled || self.nonebot.token.len() >= 32,
+            "NoneBot尚未配置有效连接令牌（至少32字节），配置无法应用。只使用Rust原生插件时，请关闭“启用NoneBot兼容服务”；需要外部插件时请先设置独立连接令牌。"
+        );
+        self.validate()
+    }
     /// Validate the same local constructors used at startup, without network or database I/O.
     pub fn validate_runtime(&self) -> Result<()> {
-        self.validate()?;
+        self.validate_activation()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -326,6 +550,7 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        crate::catalog::validate_config(self)?;
         ensure!(
             [
                 self.limits.model_user_per_hour,

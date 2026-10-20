@@ -40,6 +40,10 @@ impl Panel {
         let mut config = Config::from_toml(include_str!("../config.example.toml")).unwrap();
         config.app.database = "bot.sqlite3".into();
         config.plugins.ai.enabled = false;
+        let media_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.nonebot.listen = media_listener.local_addr().unwrap().to_string();
+        config.nonebot.media_dir = directory.path().join("media").to_string_lossy().into();
+        drop(media_listener);
         config.web.token = TOKEN.into();
         config.milky.url = offline_url.clone();
         config.milky.access_token = Some(FILE_MILKY.into());

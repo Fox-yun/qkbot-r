@@ -1,0 +1,5 @@
+-r requirements-parser.in
+-r requirements-download.in
+-r requirements-web.in
+-r requirements-music.in
+nonebot-plugin-parser[ytdlp]==2.6.10

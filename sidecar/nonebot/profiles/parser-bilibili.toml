@@ -1,0 +1,11 @@
+modules = ["nonebot_plugin_parser"]
+
+[nonebot]
+parser_render_type = "default"
+parser_disabled_platforms = ["douyin", "kuaishou", "twitter", "youtube", "acfun", "tiktok", "weibo", "xiaohongshu", "nga"]
+parser_duration_maximum = 0
+parser_max_size = 20
+parser_need_upload = false
+parser_use_base64 = false
+parser_append_url = true
+parser_need_forward_contents = false

@@ -1,0 +1,8 @@
+-r requirements.in
+nonebot-adapter-onebot==2.4.6
+nonebot-plugin-ddcheck==0.4.3
+nonebot-plugin-acgnshow==0.3.1
+# The PyPI 0.1.7 wheel contains no plugin module. Use the author's unchanged source.
+nonebot-plugin-witff @ https://github.com/Kelei327/nonebot-plugin-witff/archive/eac461885caaf69591171b2a39fac006f213890b.zip
+# witff imports htmlrender but omits it from its published dependencies.
+nonebot-plugin-htmlrender>=0.4,<0.5

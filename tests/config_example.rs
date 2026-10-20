@@ -1,6 +1,19 @@
 use qkbot::{config::Config, llm::Llm, milky::Milky};
 
 #[test]
+fn external_presets_are_valid_disabled_and_explicit_lists_take_precedence() {
+    let config = Config::default();
+    config.validate().unwrap();
+    assert_eq!(config.nonebot.plugins.len(), 6);
+    assert!(!config.nonebot.enabled && config.nonebot.plugins.iter().all(|plugin| !plugin.enabled));
+    let explicit: Config = toml::from_str("[nonebot]\nplugins = []").unwrap();
+    assert!(explicit.nonebot.plugins.is_empty());
+    let mut large_files = config;
+    large_files.nonebot.media_max_bytes = 500 * 1024 * 1024;
+    large_files.validate().unwrap();
+}
+
+#[test]
 fn shipped_example_parses_and_constructs_clients_without_network() {
     let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
     config.validate().unwrap();

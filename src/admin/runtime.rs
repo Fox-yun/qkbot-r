@@ -23,6 +23,7 @@ pub struct RuntimeStatus {
     pub message: String,
     pub started_at: Option<i64>,
     pub applied_revision: Option<String>,
+    pub loaded_plugins: Vec<String>,
 }
 
 impl Default for RuntimeStatus {
@@ -35,6 +36,7 @@ impl Default for RuntimeStatus {
             message: "机器人已停止，管理页面仍可使用。".into(),
             started_at: None,
             applied_revision: None,
+            loaded_plugins: Vec::new(),
         }
     }
 }
@@ -101,11 +103,23 @@ impl Runtime {
             .await
             .as_ref()
             .is_some_and(|h| h.milky.is_verified());
+        status.loaded_plugins = self.loaded_plugins().await;
         if status.phase == "running" && !status.online {
             status.phase = "waiting_login".into();
             status.message = "QQ / Milky 连接暂不可用，正在自动重连。".into();
         }
         status
+    }
+
+    /// Report initialized handlers, rather than the next configuration being applied.
+    pub async fn loaded_plugins(&self) -> Vec<String> {
+        let active = self.active.read().await;
+        let Some(host) = active.as_ref().filter(|host| !host.cancel.is_cancelled()) else {
+            return Vec::new();
+        };
+        let mut plugins: Vec<_> = host.epochs.keys().cloned().collect();
+        plugins.sort();
+        plugins
     }
 
     pub fn apply(&self, config: Config, revision: String) -> Result<()> {
@@ -320,8 +334,29 @@ impl Runtime {
         revision: String,
         cancel: CancellationToken,
     ) -> Result<()> {
+        // Reserve before changing plugin epochs; a port conflict cannot leave a
+        // partially started runtime. This small listener also serves native PNGs.
+        let bridge_listener = if config.nonebot.enabled || !config.plugins.native.enabled.is_empty()
+        {
+            Some(
+                tokio::net::TcpListener::bind(&config.nonebot.listen)
+                    .await
+                    .context("无法监听插件媒体/NoneBot本机端口")?,
+            )
+        } else {
+            None
+        };
         let host = Host::create_with_store(config, self.data().await?).await?;
         let router = Arc::new(Router::new(host.clone()));
+        if let Some(listener) = bridge_listener {
+            let host = host.clone();
+            host.tasks.clone().spawn(async move {
+                if let Err(error) = crate::bridge::serve(host.clone(), listener).await {
+                    tracing::error!(%error,"plugin gateway stopped");
+                    host.cancel.cancel();
+                }
+            });
+        }
         *self.router.write().await = Some(router.clone());
         *self.active.write().await = Some(host.clone());
         self.status.write().await.applied_revision = Some(revision);
@@ -333,6 +368,7 @@ impl Runtime {
         let bot = loop {
             let result = tokio::select! {
                 _ = cancel.cancelled() => { host.cancel.cancel(); router.shutdown().await?; return Ok(()); },
+                _ = host.cancel.cancelled() => { router.shutdown().await?; return Ok(()); },
                 result = host.milky.login() => result,
             };
             match result {
@@ -388,6 +424,7 @@ impl Runtime {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = host.cancel.cancelled() => break,
                 message = receiver.recv() => match message {
                     Some(message) => if let Err(error) = router.dispatch(message).await {
                         tracing::warn!(%error, "event rejected");

@@ -1,0 +1,93 @@
+[
+  {
+    "source": "nonebot_plugin_wordle/resources/words/CET4.json",
+    "sha256": "e9efe490006a41731afc10ee4009da788c30604553d30a11f79deb82cc0bb8de",
+    "entries": 3450,
+    "output": "assets\\native\\wordle\\CET4.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "0a11612a2a89e335db61596c67584a7c33a8d1c692266de001dfab97ad220a1d"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/CET6.json",
+    "sha256": "f9c24b7ac1420a9e4999e3708cefb58d1e8b147022c114fb7cd2544ea7558608",
+    "entries": 1969,
+    "output": "assets\\native\\wordle\\CET6.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "c99b15b1da657ad1c0406bbc74f067b7c6595692d73850cbcbaf15ce5bbd7994"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/GMAT.json",
+    "sha256": "0e8c628e5eeb1dba387049d52255898e5121f7db9022e7c58e65527fa839bd2b",
+    "entries": 1851,
+    "output": "assets\\native\\wordle\\GMAT.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "2f9650099c1169ac2842f6814379df8e912ca493516e8872a52e3d139677de01"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/GRE.json",
+    "sha256": "733dc469ae029aed9c75b6bbe8295b9b714a5639f4898aa6237d8d3d26e7196d",
+    "entries": 4547,
+    "output": "assets\\native\\wordle\\GRE.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "76dcd14dfdc7053105f44432d51c8f87c0a9efd4b64772a3a9caffc354b31a16"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/IELTS.json",
+    "sha256": "e8d97c9a4c549a5eb45c1d4519f8619f30cc05f2890978c6db41584ee7d60c99",
+    "entries": 2499,
+    "output": "assets\\native\\wordle\\IELTS.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "8db8c14e08b1641d0183f1b9dd3ac35ba599ac4b76ac146c515e66b3257ce7f8"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/SAT.json",
+    "sha256": "76ffb28803c78fae51fa7dcd1f23b5d17c86e6e91eac94a33e3a6812d2ce8bf9",
+    "entries": 2593,
+    "output": "assets\\native\\wordle\\SAT.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "0c7777ba947379936f7bb00702187b48daaf84e2f4ad52d59ee069aef38e4843"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/TOEFL.json",
+    "sha256": "fcb28f11b403f5f9549b86d1857dbc6d67427c373a04c5954fc9af0a867c2e8c",
+    "entries": 5918,
+    "output": "assets\\native\\wordle\\TOEFL.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "5ef25d5e72c8aed21d95ccec12af7bfc874b1eadc50d9767b884a07d47bed9ef"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/专八.json",
+    "sha256": "5e7f3766b1c6c416fdc417d063f0205357842a2dc331a5e9c78c9e82440493f9",
+    "entries": 8673,
+    "output": "assets\\native\\wordle\\专八.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "1d57a59a6ed52fc4cf3680e5d34b4bdf8ecd1d5c81b16e0eb70babc5472f50fd"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/专四.json",
+    "sha256": "cf953908a04f36899131860bc1609c06b04626e56aa6769df5e59482b80a2277",
+    "entries": 3157,
+    "output": "assets\\native\\wordle\\专四.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "ab82eda08e7a90b9f950fd1877294e01aca379f1514353126b52cd69f2aa8d4f"
+  },
+  {
+    "source": "nonebot_plugin_wordle/resources/words/考研.json",
+    "sha256": "263451827471079ddbcd2fb77eacd797d5afe97cf843c148597548c55aca95d2",
+    "entries": 3681,
+    "output": "assets\\native\\wordle\\考研.json",
+    "transformation": "ASCII alphabetic length 3..8; lowercase keys; merge meanings for case collisions",
+    "output_sha256": "e94100badcf5cb7f09a0987ba46ec813266b4d684baff0c7dd5b9ba29cebbbff"
+  },
+  {
+    "source": "pyspellchecker 0.8.1 spellchecker/resources/en.json.gz",
+    "wheel_sha256": "d91e9e1064793ae1ee8e71b06ca40eeb8e5923437c54291a8e041b447792b640",
+    "entries": 55222,
+    "output": "assets/native/wordle/legal.txt"
+  },
+  {
+    "source": "MinatoAquaCrews/nonebot_plugin_crazy_thursday@4734a3a2682d60e8643b4caaed8cd90e8eb664ac/post.json",
+    "sha256": "6db97e8cd39ab1a2bb44c7300eb148a97cde744b4160590997c4954dee95200a",
+    "entries": 196
+  }
+]

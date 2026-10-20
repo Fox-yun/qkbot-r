@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -18,7 +19,10 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{Incoming, MessageKey, Scene, Scope, now, sanitize_display_name};
+use crate::types::{
+    Incoming, MessageKey, NudgeEvent, OutgoingMessage, Scene, Scope, now, sanitize_display_name,
+    validate_media_uri,
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -86,6 +90,36 @@ pub enum SendOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    Confirmed,
+    Deferred,
+    Failed { reason: String },
+    Unknown { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub user_id: i64,
+    pub group_id: i64,
+    pub nickname: String,
+    pub card: String,
+    pub role: String,
+    /// Bound to user_id/group_id above; bridge reads retain standard Milky fields.
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum ApiOutcome {
+    Confirmed(Value),
+    Deferred,
+    Failed,
+    Unknown,
+}
+
+// Ephemeral parser result moved immediately into the ingress channel. Boxing
+// would add an allocation to every message just to shrink the ignored variant.
+#[allow(clippy::large_enum_variant)]
 enum EventAction {
     Incoming(Incoming),
     Ignored,
@@ -279,11 +313,33 @@ impl Milky {
     }
 
     pub async fn get_message(&self, key: &MessageKey) -> Result<Incoming> {
+        let message = self.get_message_raw(key).await?;
+        normalize_message(key.scope.bot_id, &message, now())
+    }
+
+    fn scope_generation(&self, scope: &Scope) -> Result<u64> {
         let generation = self.verification.load(Ordering::Acquire);
         ensure!(
-            generation & 1 == 1 && self.logged_in.load(Ordering::Acquire) == key.scope.bot_id,
-            "Milky account is not verified for this message"
+            scope.bot_id > 0
+                && scope.peer_id > 0
+                && generation & 1 == 1
+                && self.logged_in.load(Ordering::Acquire) == scope.bot_id,
+            "Milky account is not verified for this scope"
         );
+        Ok(generation)
+    }
+
+    fn check_generation(&self, generation: u64) -> Result<()> {
+        ensure!(
+            self.verification.load(Ordering::Acquire) == generation,
+            "Milky account verification expired during request"
+        );
+        Ok(())
+    }
+
+    pub async fn get_message_raw(&self, key: &MessageKey) -> Result<Value> {
+        let generation = self.scope_generation(&key.scope)?;
+        ensure!(key.message_seq >= 0, "notification keys cannot be quoted");
         let data = self
             .call(
                 "get_message",
@@ -291,19 +347,468 @@ impl Milky {
             "peer_id": key.scope.peer_id, "message_seq": key.message_seq}),
             )
             .await?;
-        ensure!(
-            self.verification.load(Ordering::Acquire) == generation,
-            "Milky account verification expired during quote lookup"
-        );
+        self.check_generation(generation)?;
         let message = normalize_message(key.scope.bot_id, &data["message"], now())?;
         ensure!(
             message.key == *key,
             "Milky quote response does not match requested message key"
         );
-        Ok(message)
+        Ok(data["message"].clone())
+    }
+
+    pub async fn get_group_members(
+        &self,
+        scope: &Scope,
+        no_cache: bool,
+    ) -> Result<Vec<GroupMember>> {
+        let generation = self.scope_generation(scope)?;
+        ensure!(
+            scope.scene == Scene::Group,
+            "group members require a group scope"
+        );
+        let data = self
+            .call(
+                "get_group_member_list",
+                json!({"group_id":scope.peer_id,"no_cache":no_cache}),
+            )
+            .await?;
+        self.check_generation(generation)?;
+        let entries = data["members"]
+            .as_array()
+            .context("Milky members list missing")?;
+        ensure!(entries.len() <= 10_000, "Milky members list too large");
+        let mut ids = std::collections::HashSet::new();
+        entries
+            .iter()
+            .map(|entry| {
+                let member = parse_member(entry, scope.peer_id)?;
+                ensure!(
+                    ids.insert(member.user_id),
+                    "Milky members contain duplicate IDs"
+                );
+                Ok(member)
+            })
+            .collect()
+    }
+
+    pub async fn get_member(
+        &self,
+        scope: &Scope,
+        user_id: i64,
+        no_cache: bool,
+    ) -> Result<GroupMember> {
+        let generation = self.scope_generation(scope)?;
+        ensure!(
+            scope.scene == Scene::Group && user_id > 0,
+            "invalid group member lookup"
+        );
+        let data = self
+            .call(
+                "get_group_member_info",
+                json!({"group_id":scope.peer_id,"user_id":user_id,"no_cache":no_cache}),
+            )
+            .await?;
+        self.check_generation(generation)?;
+        let member = parse_member(&data["member"], scope.peer_id)?;
+        ensure!(
+            member.user_id == user_id,
+            "Milky member response identity mismatch"
+        );
+        Ok(member)
+    }
+
+    /// A resource identifier is accepted only when a verified message in this
+    /// scope actually contains it. The returned URL is never fetched here.
+    pub async fn get_resource_temp_url(
+        &self,
+        key: &MessageKey,
+        resource_id: &str,
+    ) -> Result<String> {
+        ensure!(
+            !resource_id.is_empty() && resource_id.len() <= 4096,
+            "invalid resource ID"
+        );
+        let generation = self.scope_generation(&key.scope)?;
+        let message = self.get_message_raw(key).await?;
+        let contains = message["segments"].as_array().is_some_and(|segments| {
+            segments.iter().any(|segment| {
+                matches!(segment["type"].as_str(), Some("image" | "record" | "video"))
+                    && (segment["data"]["resource_id"].as_str() == Some(resource_id)
+                        || segment["data"]["thumb_resource_id"].as_str() == Some(resource_id))
+            })
+        });
+        ensure!(
+            contains,
+            "resource does not belong to the requested message"
+        );
+        let data = self
+            .call("get_resource_temp_url", json!({"resource_id":resource_id}))
+            .await?;
+        self.check_generation(generation)?;
+        let url = data["url"].as_str().context("Milky resource URL missing")?;
+        validate_media_uri(url)?;
+        Ok(url.to_owned())
+    }
+
+    /// Explicit read-only bridge whitelist; arbitrary Milky API names, cookies,
+    /// account writes and moderation are intentionally not proxyable.
+    pub async fn proxy_read(
+        &self,
+        scope: Option<&Scope>,
+        api: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let bot_id = self
+            .verified_bot_id()
+            .context("Milky account is not verified")?;
+        let generation = self.verification.load(Ordering::Acquire);
+        ensure!(generation & 1 == 1, "Milky account is not verified");
+        if let Some(scope) = scope {
+            ensure!(
+                self.scope_generation(scope)? == generation,
+                "Milky account verification expired"
+            );
+        }
+        let params = params
+            .as_object()
+            .context("Milky parameters must be an object")?;
+        let body = match api {
+            "get_login_info" | "get_impl_info" => {
+                ensure!(params.is_empty(), "unexpected Milky parameters");
+                json!({})
+            }
+            "get_group_info" | "get_friend_info" => {
+                let scope = scope.context("this lookup requires a scope")?;
+                self.scope_generation(scope)?;
+                let (scene, id_key) = if api == "get_group_info" {
+                    (Scene::Group, "group_id")
+                } else {
+                    (Scene::Friend, "user_id")
+                };
+                ensure!(
+                    scope.scene == scene
+                        && scope.bot_id == bot_id
+                        && params.get(id_key).and_then(Value::as_i64) == Some(scope.peer_id)
+                        && params.keys().all(|key| key == id_key || key == "no_cache"),
+                    "lookup is outside the bound scope"
+                );
+                let no_cache = match params.get("no_cache") {
+                    None => false,
+                    Some(value) => value.as_bool().context("invalid no_cache")?,
+                };
+                let mut body = json!({"no_cache":no_cache});
+                body[id_key] = json!(scope.peer_id);
+                body
+            }
+            _ => bail!("Milky API is not in the read-only whitelist"),
+        };
+        let data = self.call(api, body).await?;
+        self.check_generation(generation)?;
+        match api {
+            "get_login_info" => ensure!(
+                data["uin"].as_i64() == Some(bot_id),
+                "Milky login identity changed"
+            ),
+            "get_group_info" => ensure!(
+                data["group"]["group_id"].as_i64() == scope.map(|scope| scope.peer_id),
+                "Milky group response identity mismatch"
+            ),
+            "get_friend_info" => ensure!(
+                data["friend"]["user_id"].as_i64() == scope.map(|scope| scope.peer_id),
+                "Milky friend response identity mismatch"
+            ),
+            _ => {}
+        }
+        Ok(data)
+    }
+
+    /// Native moderation only. A caller may request their own timed mute;
+    /// muting another member requires current group administration privileges.
+    pub async fn set_group_member_mute(
+        &self,
+        scope: &Scope,
+        actor_id: i64,
+        user_id: i64,
+        duration: u32,
+        cancel: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        let generation = self.scope_generation(scope)?;
+        ensure!(
+            scope.scene == Scene::Group
+                && actor_id > 0
+                && user_id > 0
+                && user_id != scope.bot_id
+                && duration <= 30 * 24 * 3600,
+            "invalid group mute request"
+        );
+        let bot = self.get_member(scope, scope.bot_id, true).await?;
+        let target = self.get_member(scope, user_id, true).await?;
+        ensure!(
+            outranks(&bot.role, &target.role),
+            "bot cannot moderate this member"
+        );
+        if actor_id != user_id {
+            let actor = self.get_member(scope, actor_id, true).await?;
+            ensure!(
+                outranks(&actor.role, &target.role),
+                "caller cannot moderate this member"
+            );
+        } else {
+            ensure!(
+                target.role == "member",
+                "self mute only applies to ordinary members"
+            );
+        }
+        self.check_generation(generation)?;
+        self.submit_action(
+            "set_group_member_mute",
+            json!({"group_id":scope.peer_id,"user_id":user_id,"duration":duration}),
+            cancel,
+        )
+        .await
+    }
+
+    /// Explicit native administrator command. The trusted caller derives the
+    /// superuser flag from host configuration, never from message text.
+    pub async fn set_group_member_mute_as_admin(
+        &self,
+        scope: &Scope,
+        actor_id: i64,
+        user_id: i64,
+        duration: u32,
+        actor_is_superuser: bool,
+        cancel: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        let generation = self.scope_generation(scope)?;
+        ensure!(
+            scope.scene == Scene::Group
+                && actor_id > 0
+                && user_id > 0
+                && user_id != scope.bot_id
+                && duration <= 30 * 24 * 3600,
+            "invalid administrative mute request"
+        );
+        let bot = self.get_member(scope, scope.bot_id, true).await?;
+        let actor = self.get_member(scope, actor_id, true).await?;
+        let target = self.get_member(scope, user_id, true).await?;
+        ensure!(
+            admin_mute_allowed(&bot.role, &actor.role, &target.role, actor_is_superuser),
+            "administrator or bot cannot moderate this member"
+        );
+        self.check_generation(generation)?;
+        self.submit_action(
+            "set_group_member_mute",
+            json!({"group_id":scope.peer_id,"user_id":user_id,"duration":duration}),
+            cancel,
+        )
+        .await
+    }
+
+    /// Only the bot's own confirmed messages may be recalled by native helpers.
+    pub async fn recall_message(
+        &self,
+        key: &MessageKey,
+        cancel: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        let generation = self.scope_generation(&key.scope)?;
+        let message = self.get_message(key).await?;
+        ensure!(
+            message.sender_id == key.scope.bot_id,
+            "only bot messages can be recalled"
+        );
+        self.check_generation(generation)?;
+        let (api, field) = match key.scope.scene {
+            Scene::Group => ("recall_group_message", "group_id"),
+            Scene::Friend => ("recall_private_message", "user_id"),
+        };
+        let mut body = json!({"message_seq":key.message_seq});
+        body[field] = json!(key.scope.peer_id);
+        self.submit_action(api, body, cancel).await
+    }
+
+    pub async fn send_nudge(
+        &self,
+        scope: &Scope,
+        user_id: i64,
+        cancel: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        let generation = self.scope_generation(scope)?;
+        ensure!(
+            user_id > 0 && user_id != scope.bot_id,
+            "invalid nudge target"
+        );
+        let (api, body) = match scope.scene {
+            Scene::Group => {
+                self.get_member(scope, user_id, true).await?;
+                (
+                    "send_group_nudge",
+                    json!({"group_id":scope.peer_id,"user_id":user_id}),
+                )
+            }
+            Scene::Friend => {
+                ensure!(
+                    user_id == scope.peer_id,
+                    "nudge target is outside friend scope"
+                );
+                (
+                    "send_friend_nudge",
+                    json!({"user_id":user_id,"is_self":false}),
+                )
+            }
+        };
+        self.check_generation(generation)?;
+        self.submit_action(api, body, cancel).await
+    }
+
+    /// Narrow bridge writes. Scope and current account are checked here as well
+    /// as by the gateway's task, access revision and durable operation ledger.
+    pub async fn bridge_action(
+        &self,
+        scope: &Scope,
+        api: &str,
+        body: Value,
+        cancel: &CancellationToken,
+    ) -> Result<ApiOutcome> {
+        let generation = self.scope_generation(scope)?;
+        match api {
+            "send_group_message_reaction" => {
+                ensure!(
+                    scope.scene == Scene::Group && body["group_id"].as_i64() == Some(scope.peer_id),
+                    "reaction scope mismatch"
+                );
+                ensure!(
+                    body["message_seq"].as_i64().is_some_and(|seq| seq > 0),
+                    "invalid reaction target"
+                );
+                ensure!(
+                    body["reaction"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 32),
+                    "invalid reaction"
+                );
+                ensure!(
+                    ["face", "emoji"].contains(&body["reaction_type"].as_str().unwrap_or("face")),
+                    "invalid reaction type"
+                );
+            }
+            "upload_group_file" | "upload_private_file" => {
+                let (scene, key) = if api == "upload_group_file" {
+                    (Scene::Group, "group_id")
+                } else {
+                    (Scene::Friend, "user_id")
+                };
+                ensure!(
+                    scope.scene == scene && body[key].as_i64() == Some(scope.peer_id),
+                    "file destination mismatch"
+                );
+                validate_media_uri(body["file_uri"].as_str().context("file URI missing")?)?;
+                ensure!(
+                    body["file_name"]
+                        .as_str()
+                        .is_some_and(|s| !s.trim().is_empty()
+                            && s.len() <= 240
+                            && !s.contains(['/', '\\'])
+                            && !s.chars().any(char::is_control)),
+                    "invalid file name"
+                );
+                ensure!(
+                    body.get("parent_folder_id")
+                        .is_none_or(|id| id.as_str() == Some("/")),
+                    "custom destination folders are not enabled"
+                );
+            }
+            _ => anyhow::bail!("bridge action not allowed"),
+        }
+        self.check_generation(generation)?;
+        self.submit_data(api, body, cancel).await
+    }
+
+    async fn submit_action(
+        &self,
+        api: &str,
+        body: Value,
+        cancel: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        Ok(match self.submit_data(api, body, cancel).await? {
+            ApiOutcome::Confirmed(_) => ActionOutcome::Confirmed,
+            ApiOutcome::Deferred => ActionOutcome::Deferred,
+            ApiOutcome::Failed => ActionOutcome::Failed {
+                reason: "Milky rejected action before a successful acknowledgement".into(),
+            },
+            ApiOutcome::Unknown => ActionOutcome::Unknown {
+                reason: "Milky action acknowledgement is unknown".into(),
+            },
+        })
+    }
+    async fn submit_data(
+        &self,
+        api: &str,
+        body: Value,
+        cancel: &CancellationToken,
+    ) -> Result<ApiOutcome> {
+        if cancel.is_cancelled() {
+            return Ok(ApiOutcome::Deferred);
+        }
+        let request = self.request(api, body)?;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(ApiOutcome::Unknown),
+            result = request.send() => result,
+        };
+        let response = match result {
+            Ok(response) => response,
+            Err(error) if error.is_connect() || error.is_builder() => {
+                return Ok(ApiOutcome::Failed);
+            }
+            Err(_) => {
+                return Ok(ApiOutcome::Unknown);
+            }
+        };
+        if matches!(
+            response.status().as_u16(),
+            400 | 401 | 403 | 404 | 405 | 415 | 429
+        ) {
+            return Ok(ApiOutcome::Failed);
+        }
+        if !response.status().is_success() {
+            return Ok(ApiOutcome::Unknown);
+        }
+        let bytes = tokio::select! {
+            _ = cancel.cancelled() => return Ok(ApiOutcome::Unknown),
+            result = read_bounded(response, self.config.max_response_bytes) => result,
+        };
+        let value = bytes
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        Ok(match value {
+            Some(value) if check_envelope(&value).is_ok() => {
+                ApiOutcome::Confirmed(value["data"].clone())
+            }
+            Some(value)
+                if value["status"] == "failed"
+                    && value["retcode"].as_i64().is_some_and(|code| code != 0) =>
+            {
+                ApiOutcome::Failed
+            }
+            _ => ApiOutcome::Unknown,
+        })
     }
 
     pub async fn send_text(&self, scope: &Scope, text: &str) -> SendOutcome {
+        self.send_message(
+            scope,
+            &OutgoingMessage::text(text),
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn send_message(
+        &self,
+        scope: &Scope,
+        message: &OutgoingMessage,
+        cancel: &CancellationToken,
+    ) -> SendOutcome {
         if scope.bot_id <= 0
             || self.logged_in.load(Ordering::Acquire) != scope.bot_id
             || scope.peer_id <= 0
@@ -317,16 +822,22 @@ impl Milky {
                 reason: "Milky account is awaiting login verification; nothing was sent".into(),
             };
         }
-        if text.is_empty() || text.len() > 32 * 1024 {
+        let generation = self.verification.load(Ordering::Acquire);
+        if message.validate(32 * 1024).is_err() {
             return SendOutcome::Failed {
-                reason: "outgoing text must be 1..32768 bytes".into(),
+                reason: "outgoing message failed validation".into(),
+            };
+        }
+        if cancel.is_cancelled() {
+            return SendOutcome::Deferred {
+                reason: "send cancelled before submission".into(),
             };
         }
         let (api, destination) = match scope.scene {
             Scene::Group => ("send_group_message", "group_id"),
             Scene::Friend => ("send_private_message", "user_id"),
         };
-        let mut body = json!({"message": [{"type": "text", "data": {"text": text}}]});
+        let mut body = json!({"message": message.segments});
         body[destination] = json!(scope.peer_id);
         let request = match self.request(api, body) {
             Ok(request) => request,
@@ -336,7 +847,17 @@ impl Milky {
                 };
             }
         };
-        let response = match request.send().await {
+        if self.check_generation(generation).is_err() || generation & 1 == 0 {
+            return SendOutcome::Deferred {
+                reason: "Milky verification expired before submission".into(),
+            };
+        }
+        let submitted = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return SendOutcome::Unknown { reason:"send cancelled after submission may have succeeded".into() },
+            result = request.send() => result,
+        };
+        let response = match submitted {
             Ok(response) => response,
             Err(error) if error.is_connect() || error.is_builder() => {
                 return SendOutcome::Failed {
@@ -360,7 +881,11 @@ impl Milky {
                 reason: format!("Milky send returned HTTP {}", status.as_u16()),
             };
         }
-        let bytes = match read_bounded(response, self.config.max_response_bytes).await {
+        let received = tokio::select! {
+            _ = cancel.cancelled() => return SendOutcome::Unknown { reason:"send acknowledgement cancelled".into() },
+            result = read_bounded(response, self.config.max_response_bytes) => result,
+        };
+        let bytes = match received {
             Ok(bytes) => bytes,
             Err(_) => {
                 return SendOutcome::Unknown {
@@ -504,6 +1029,48 @@ impl Milky {
     }
 }
 
+fn outranks(actor: &str, target: &str) -> bool {
+    matches!(
+        (actor, target),
+        ("owner", "admin" | "member") | ("admin", "member")
+    )
+}
+fn admin_mute_allowed(bot: &str, actor: &str, target: &str, superuser: bool) -> bool {
+    outranks(bot, target) && (superuser || outranks(actor, target))
+}
+
+fn parse_member(value: &Value, group_id: i64) -> Result<GroupMember> {
+    let user_id = value["user_id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .context("invalid group member ID")?;
+    ensure!(
+        group_id > 0 && value["group_id"].as_i64() == Some(group_id),
+        "group member scope mismatch"
+    );
+    let role = value["role"]
+        .as_str()
+        .context("missing group member role")?;
+    ensure!(
+        matches!(role, "owner" | "admin" | "member"),
+        "invalid group member role"
+    );
+    let nickname = value["nickname"]
+        .as_str()
+        .context("missing group member nickname")?;
+    let card = value["card"]
+        .as_str()
+        .context("missing group member card")?;
+    Ok(GroupMember {
+        user_id,
+        group_id,
+        nickname: sanitize_display_name(Some(nickname)).unwrap_or_default(),
+        card: sanitize_display_name(Some(card)).unwrap_or_default(),
+        role: role.to_owned(),
+        raw: value.clone(),
+    })
+}
+
 fn check_envelope(value: &Value) -> Result<()> {
     ensure!(
         value["status"] == "ok"
@@ -587,6 +1154,12 @@ fn normalize_event_value(bot_id: i64, value: &Value, received_at: i64) -> Result
         value["self_id"].as_i64() == Some(bot_id),
         "event self_id mismatch"
     );
+    if matches!(
+        value["event_type"].as_str(),
+        Some("group_nudge" | "friend_nudge")
+    ) {
+        return Ok(Some(normalize_nudge(bot_id, value, received_at)?));
+    }
     if value["event_type"] != "message_receive" || value["data"]["message_scene"] == "temp" {
         return Ok(None);
     }
@@ -595,6 +1168,76 @@ fn normalize_event_value(bot_id: i64, value: &Value, received_at: i64) -> Result
         &value["data"],
         received_at,
     )?))
+}
+
+fn normalize_nudge(bot_id: i64, value: &Value, received_at: i64) -> Result<Incoming> {
+    let data = &value["data"];
+    let positive = |field: &str| {
+        data[field]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .context("invalid nudge identity")
+    };
+    let event_type = value["event_type"]
+        .as_str()
+        .context("missing nudge event type")?;
+    ensure!(
+        value["time"].as_i64().is_some_and(|time| time >= 0),
+        "invalid nudge time"
+    );
+    let (scene, peer_id, initiator, target) = match event_type {
+        "group_nudge" => (
+            Scene::Group,
+            positive("group_id")?,
+            positive("sender_id")?,
+            positive("receiver_id")?,
+        ),
+        "friend_nudge" => {
+            let peer = positive("user_id")?;
+            let from_self = data["is_self_send"]
+                .as_bool()
+                .context("invalid nudge sender flag")?;
+            let to_self = data["is_self_receive"]
+                .as_bool()
+                .context("invalid nudge recipient flag")?;
+            (
+                Scene::Friend,
+                peer,
+                if from_self { bot_id } else { peer },
+                if to_self { bot_id } else { peer },
+            )
+        }
+        _ => bail!("unsupported notification"),
+    };
+    // Canonical JSON field order makes retransmission stable. Negative values are
+    // internal-only and cannot collide with a valid nonnegative message sequence.
+    let hash = Sha256::digest(serde_json::to_vec(value)?);
+    let fingerprint =
+        i64::from_be_bytes(hash[..8].try_into().expect("eight hash bytes")) & i64::MAX;
+    Ok(Incoming {
+        key: MessageKey {
+            scope: Scope {
+                bot_id,
+                scene,
+                peer_id,
+            },
+            message_seq: -fingerprint.max(1),
+        },
+        sender_id: initiator,
+        sender_nickname: None,
+        sender_card: None,
+        text: String::new(),
+        mentions: Vec::new(),
+        quote_seq: None,
+        received_at,
+        raw_message: Value::Null,
+        notification: Some(NudgeEvent {
+            event_type: event_type.to_owned(),
+            initiator,
+            target,
+            raw_event: value.clone(),
+        }),
+    })
 }
 
 fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Incoming> {
@@ -690,6 +1333,8 @@ fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Inc
         mentions,
         quote_seq,
         received_at,
+        raw_message: value.clone(),
+        notification: None,
     })
 }
 
@@ -697,6 +1342,288 @@ fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Inc
 pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn verified(url: String) -> Milky {
+        let milky = Milky::new(
+            MilkyConfig {
+                url,
+                ..Default::default()
+            },
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        milky.logged_in.store(123, Ordering::Release);
+        milky.verification.store(1, Ordering::Release);
+        milky
+    }
+    #[test]
+    fn administrator_moderation_never_bypasses_the_bots_actual_group_role() {
+        assert!(admin_mute_allowed("admin", "admin", "member", false));
+        assert!(admin_mute_allowed("owner", "member", "admin", true));
+        assert!(!admin_mute_allowed("admin", "member", "member", false));
+        assert!(!admin_mute_allowed("admin", "owner", "admin", true));
+        assert!(!admin_mute_allowed("member", "owner", "member", true));
+        assert!(!admin_mute_allowed("owner", "owner", "owner", true));
+    }
+    #[tokio::test]
+    async fn administrator_unmute_checks_current_members_before_zero_duration_write() {
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            routing::post,
+        };
+        use std::sync::Mutex;
+        let writes = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        async fn peer(
+            State(writes): State<Arc<Mutex<Vec<Value>>>>,
+            Path(api): Path<String>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let data = if api == "get_group_member_info" {
+                let role = match body["user_id"].as_i64().unwrap() {
+                    123 => "owner",
+                    7 => "admin",
+                    _ => "member",
+                };
+                json!({"member":{"user_id":body["user_id"],"group_id":body["group_id"],"nickname":"fixture","card":"","role":role}})
+            } else if api == "set_group_member_mute" {
+                writes.lock().unwrap().push(body);
+                json!({})
+            } else {
+                panic!("unexpected mock API")
+            };
+            Json(json!({"status":"ok","retcode":0,"data":data}))
+        }
+        let app = Router::new()
+            .route("/api/{api}", post(peer))
+            .with_state(writes.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let milky = verified(url);
+        let scope = Scope {
+            bot_id: 123,
+            scene: Scene::Group,
+            peer_id: 456,
+        };
+        assert!(
+            milky
+                .set_group_member_mute_as_admin(&scope, 8, 9, 0, false, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(matches!(
+            milky
+                .set_group_member_mute_as_admin(&scope, 7, 9, 0, false, &cancel)
+                .await
+                .unwrap(),
+            ActionOutcome::Confirmed
+        ));
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            [json!({"group_id":456,"user_id":9,"duration":0})]
+        );
+        assert!(
+            milky
+                .set_group_member_mute_as_admin(&scope, 7, 123, 0, true, &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1);
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn nudge_uses_negative_dedup_identity_and_never_becomes_ai_text() {
+        let event = json!({"event_type":"group_nudge","self_id":123,"time":12,"data":{"group_id":456,"sender_id":789,"receiver_id":123,"display_action":"不要信任此文本"}});
+        let incoming = normalize_event_value(123, &event, 99).unwrap().unwrap();
+        assert!(incoming.key.message_seq < 0);
+        assert!(
+            incoming.text.is_empty()
+                && incoming.mentions.is_empty()
+                && incoming.quote_seq.is_none()
+        );
+        let nudge = incoming.notification.unwrap();
+        assert_eq!((nudge.initiator, nudge.target), (789, 123));
+        assert_eq!(
+            normalize_event_value(123, &event, 100)
+                .unwrap()
+                .unwrap()
+                .key,
+            incoming.key
+        );
+        assert!(normalize_event_value(124, &event, 99).is_err());
+        let bad = json!({"event_type":"group_nudge","self_id":123,"time":12,"data":{"group_id":"456","sender_id":789,"receiver_id":123}});
+        assert!(normalize_event_value(123, &bad, 99).is_err());
+        let friend = json!({"event_type":"friend_nudge","self_id":123,"time":12,"data":{"user_id":789,"is_self_send":false,"is_self_receive":true}});
+        let message = normalize_event_value(123, &friend, 99).unwrap().unwrap();
+        assert_eq!(message.key.scope.scene, Scene::Friend);
+        assert_eq!(message.notification.unwrap().target, 123);
+    }
+
+    #[test]
+    fn member_roles_and_identity_are_strict_not_inferred_from_names() {
+        let member = json!({"group_id":456,"user_id":789,"nickname":"群主\n","card":"管理员","role":"member"});
+        let parsed = parse_member(&member, 456).unwrap();
+        assert_eq!(parsed.nickname, "群主");
+        assert_eq!(parsed.role, "member");
+        assert!(parse_member(&member, 457).is_err());
+        let mut bad = member.clone();
+        bad["role"] = json!("superadmin");
+        assert!(parse_member(&bad, 456).is_err());
+        assert!(!outranks("admin", "admin") && !outranks("member", "member"));
+        assert!(outranks("owner", "admin") && outranks("admin", "member"));
+    }
+
+    #[tokio::test]
+    async fn structured_send_preserves_wire_segments_and_pre_cancel_is_deferred() {
+        let (url, task) = server(
+            "200 OK",
+            r#"{"status":"ok","retcode":0,"data":{"message_seq":9}}"#,
+        )
+        .await;
+        let milky = verified(url);
+        let scope = Scope {
+            bot_id: 123,
+            scene: Scene::Group,
+            peer_id: 456,
+        };
+        let message: OutgoingMessage = serde_json::from_value(json!({"segments":[
+            {"type":"mention","data":{"user_id":789}},
+            {"type":"image","data":{"uri":"https://example.org/a.png","sub_type":"sticker"}}
+        ]}))
+        .unwrap();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            milky.send_message(&scope, &message, &cancelled).await,
+            SendOutcome::Deferred { .. }
+        ));
+        assert_eq!(
+            milky
+                .send_message(&scope, &message, &CancellationToken::new())
+                .await,
+            SendOutcome::Confirmed { message_seq: 9 }
+        );
+        let request = task.await.unwrap();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["group_id"], 456);
+        assert_eq!(body["message"][0]["type"], "mention");
+        assert_eq!(body["message"][1]["data"]["sub_type"], "sticker");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_http_submission_is_unknown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let milky = verified(format!("http://{}", listener.local_addr().unwrap()));
+        let (seen, received) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut buf = [0; 4096];
+            let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(count > 0);
+            seen.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let cancel = CancellationToken::new();
+        let scope = Scope {
+            bot_id: 123,
+            scene: Scene::Group,
+            peer_id: 456,
+        };
+        let message = OutgoingMessage::text("one submission");
+        let send = milky.send_message(&scope, &message, &cancel);
+        let cancellation = async {
+            received.await.unwrap();
+            cancel.cancel();
+        };
+        let (outcome, _) = tokio::join!(send, cancellation);
+        assert!(matches!(outcome, SendOutcome::Unknown { .. }));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_reads_reject_cross_scope_and_arbitrary_proxy_calls_before_http() {
+        let (url, task) = server(
+            "200 OK",
+            r#"{"status":"ok","retcode":0,"data":{"group":{"group_id":456}}}"#,
+        )
+        .await;
+        let milky = verified(url);
+        let scope = Scope {
+            bot_id: 123,
+            scene: Scene::Group,
+            peer_id: 456,
+        };
+        assert!(
+            milky
+                .proxy_read(Some(&scope), "get_cookies", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            milky
+                .proxy_read(Some(&scope), "get_group_info", json!({"group_id":457}))
+                .await
+                .is_err()
+        );
+        assert!(
+            milky
+                .get_message_raw(&MessageKey {
+                    scope: scope.clone(),
+                    message_seq: -123
+                })
+                .await
+                .is_err()
+        );
+        let data = milky
+            .proxy_read(Some(&scope), "get_group_info", json!({"group_id":456}))
+            .await
+            .unwrap();
+        assert_eq!(data["group"]["group_id"], 456);
+        let request = task.await.unwrap();
+        assert!(request.starts_with("POST /api/get_group_info"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["group_id"], 456);
+    }
+
+    #[tokio::test]
+    async fn members_reject_response_from_another_group() {
+        let (url, task) = server("200 OK", r#"{"status":"ok","retcode":0,"data":{"members":[{"group_id":457,"user_id":789,"nickname":"n","card":"","role":"member"}]}}"#).await;
+        let milky = verified(url);
+        assert!(
+            milky
+                .get_group_members(
+                    &Scope {
+                        bot_id: 123,
+                        scene: Scene::Group,
+                        peer_id: 456
+                    },
+                    false
+                )
+                .await
+                .is_err()
+        );
+        task.await.unwrap();
+    }
 
     pub(crate) async fn server(
         status: &str,

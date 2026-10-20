@@ -1105,6 +1105,8 @@ mod tests {
             mentions: vec![1],
             quote_seq: None,
             received_at: 1,
+            raw_message: serde_json::Value::Null,
+            notification: None,
         }
     }
 
@@ -1423,6 +1425,8 @@ mod tests {
             mentions: vec![],
             quote_seq: Some(5),
             received_at: 1,
+            raw_message: serde_json::Value::Null,
+            notification: None,
         };
         assert!(!triggered(&m, &[]));
         m.mentions.push(1);

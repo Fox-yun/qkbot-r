@@ -4,18 +4,20 @@
   const $ = (id) => document.getElementById(id);
   const state = {
     authenticated: false, csrf: "", setupRequired: false, session: 0, config: null, draft: null, revision: null,
-    secrets: {}, status: null, qq: null, busy: false, dirty: false,
+    secrets: {}, status: null, qq: null, busy: false, dirty: false, applyError: null, applyFailure: null,
     jsonDirty: false, formInvalid: false, stale: false,
     runtimeTimer: null, qqTimer: null, runtimePolling: false, qqPolling: false,
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
     pendingOperation: null,
-    personaTemplates: {}, personaSelected: null, toolCatalog: [],
+    personaTemplates: {}, personaSelected: null, toolCatalog: [], pluginCatalog: [],
+    scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
   const inputs = new Map();
   const secretInputs = new Map();
+  let pluginControls = null;
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const get = (object, path) => path.split(".").reduce((value, key) => value?.[key], object);
   const put = (object, path, value) => {
@@ -461,6 +463,116 @@
     return wrapper;
   }
 
+  function validatePluginCatalog(catalog) {
+    if (!Array.isArray(catalog) || catalog.length > 64) throw new Error("插件目录格式无效。");
+    const ids = new Set();
+    for (const item of catalog) {
+      if (!item || typeof item.id !== "string" || typeof item.name !== "string" || typeof item.description !== "string" || !["rust", "nonebot"].includes(item.runtime) || ids.has(item.id)) throw new Error("插件目录字段缺失或重复。");
+      ids.add(item.id);
+    }
+  }
+  function validatePluginShape(config) {
+    const object = (value) => value && typeof value === "object" && !Array.isArray(value);
+    const native = config.plugins?.native;
+    if (native !== undefined || state.draft?.plugins?.native !== undefined) {
+      if (!object(native) || !Array.isArray(native.enabled) || !native.enabled.every((id) => typeof id === "string")) throw new Error("JSON 字段 plugins.native.enabled 必须为插件 ID 数组。");
+    }
+    const bridge = config.nonebot;
+    if (bridge !== undefined || state.draft?.nonebot !== undefined) {
+      if (!object(bridge) || typeof bridge.enabled !== "boolean" || !Array.isArray(bridge.plugins)) throw new Error("JSON 字段 nonebot 必须包含启用状态和插件数组。");
+      const seen = new Set();
+      for (const item of bridge.plugins) {
+        if (!object(item) || typeof item.id !== "string" || seen.has(item.id) || typeof item.enabled !== "boolean") throw new Error("JSON 字段 nonebot.plugins 缺少唯一 ID 或启用状态。");
+        for (const key of ["module", "name", "description"]) if (Object.hasOwn(item, key) && typeof item[key] !== "string") throw new Error(`JSON 字段 nonebot.plugins.${key} 必须为文字。`);
+        seen.add(item.id);
+      }
+    }
+  }
+  function objectJson(control, label) {
+    let value;
+    try { value = JSON.parse(control.value); } catch { throw new Error(`${label}不是有效的 JSON。`); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}必须为 JSON 对象。`);
+    return value;
+  }
+  function pluginCheck(parent, id, title, hint, enabled, map) {
+    const row = element("label", "plugin-option"), input = document.createElement("input"), copy = element("span");
+    input.type = "checkbox"; input.checked = enabled; input.dataset.pluginId = id;
+    input.setAttribute("aria-label", title + "全局启用"); map.set(id, input);
+    const loaded = element("span", "plugin-load-state"); loaded.dataset.pluginLoaded = id;
+    copy.append(element("strong", "", title), loaded, element("span", "hint", hint));
+    row.append(input, copy); parent.append(row); input.addEventListener("change", markDirty);
+  }
+  function readExternalDefinitions() {
+    let definitions;
+    try { definitions = JSON.parse(pluginControls.definitions.value); } catch { throw new Error("NoneBot 插件定义不是有效的 JSON 数组。"); }
+    if (!Array.isArray(definitions) || definitions.length > 32) throw new Error("NoneBot 插件定义应为最多32项的 JSON 数组。");
+    const seen = new Set();
+    return definitions.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.id !== "string" || seen.has(item.id)) throw new Error("NoneBot 插件定义缺少唯一 id。");
+      if (Object.hasOwn(item, "enabled")) throw new Error("NoneBot 定义中的 enabled 请移除，使用上方勾选控制启用。");
+      seen.add(item.id); return clone(item);
+    });
+  }
+  function refreshExternalPlugins() {
+    const controls = pluginControls, previous = new Map([...controls.external].map(([id, input]) => [id, input.checked]));
+    const definitions = readExternalDefinitions(); controls.external.clear(); controls.externalList.replaceChildren();
+    for (const item of definitions) pluginCheck(controls.externalList, item.id, item.name || item.id, item.module || "请在高级区填写模块名", previous.get(item.id) ?? false, controls.external);
+    if (!definitions.length) controls.externalList.append(element("p", "hint", "尚未配置 NoneBot 插件。在高级区添加插件定义后刷新此列表。"));
+    renderPluginLoadedStates();
+  }
+  function renderPluginConfig(pending) {
+    pluginControls = null;
+    if (!state.draft?.plugins?.native) return;
+    const native = state.draft.plugins.native, bridge = state.draft.nonebot;
+    const card = element("section", "card plugin-config");
+    card.append(element("h2", "", "插件功能"), element("p", "muted", "勾选是待保存的全局配置，实际运行以「当前运行已启用」为准。保存并应用成功后才会生效；会话开关只控制群或好友是否允许使用。"));
+    const nativeList = element("div", "plugin-grid"), nativeChecks = new Map();
+    const known = new Map(state.pluginCatalog.filter((entry) => entry.runtime === "rust").map((entry) => [entry.id, entry]));
+    for (const id of native.enabled || []) if (!known.has(id)) known.set(id, { id, name: id + "（已保存但未注册）", description: "保留原选择，可取消后修复配置。" });
+    for (const item of known.values()) pluginCheck(nativeList, item.id, item.name, item.description, (native.enabled || []).includes(item.id), nativeChecks);
+    card.append(nativeList);
+    const details = element("details", "plugin-advanced"), summary = element("summary", "", "高级参数 · 管理员、MC、群互动与 NoneBot");
+    const advanced = element("div", "plugin-advanced-body"); details.append(summary, advanced);
+    const nativeOptions = clone(native); delete nativeOptions.enabled;
+    const nativeJson = document.createElement("textarea"); nativeJson.rows = 10; nativeJson.spellcheck = false; nativeJson.id = "native-options-json"; nativeJson.value = JSON.stringify(nativeOptions, null, 2);
+    const nativeLabel = element("label", "", "原生插件参数 JSON"); nativeLabel.htmlFor = nativeJson.id;
+    advanced.append(nativeLabel, element("p", "hint", "superusers 为可管理图片餐单的 QQ 号；mc_servers 配置服务器；today_waifu、poke 和 fakemsg 保留各插件参数。此处不填写 enabled。"), nativeJson);
+    const controls = { native: nativeChecks, nativeJson, external: new Map() }; pluginControls = controls;
+    nativeJson.addEventListener("input", markDirty);
+    if (bridge) {
+      const enabled = document.createElement("input"); enabled.type = "checkbox"; enabled.id = "nonebot-enabled"; enabled.checked = Boolean(bridge.enabled);
+      const label = element("label", "plugin-option"); label.append(enabled, element("span", "", "启用 NoneBot 兼容服务"));
+      card.append(label, element("p", "hint", "兼容插件需要启动本机 NoneBot Python 服务。这里只配置已安装模块，不下载或执行任意插件源码。"));
+      card.append(secretField({ secret: "nonebot_token", label: "NoneBot 连接令牌" }, pending.nonebot_token));
+      const externalList = element("div", "plugin-grid"); card.append(externalList);
+      const definitions = document.createElement("textarea"); definitions.id = "nonebot-definitions-json"; definitions.rows = 8; definitions.spellcheck = false;
+      definitions.value = JSON.stringify((bridge.plugins || []).map((entry) => { const item = clone(entry); delete item.enabled; return item; }), null, 2);
+      const options = clone(bridge); delete options.enabled; delete options.token; delete options.plugins;
+      const optionsJson = document.createElement("textarea"); optionsJson.id = "nonebot-options-json"; optionsJson.rows = 6; optionsJson.spellcheck = false; optionsJson.value = JSON.stringify(options, null, 2);
+      const definitionsLabel = element("label", "", "NoneBot 插件定义 JSON"); definitionsLabel.htmlFor = definitions.id;
+      const optionsLabel = element("label", "", "NoneBot 服务参数 JSON"); optionsLabel.htmlFor = optionsJson.id;
+      const refresh = element("button", "button secondary", "采用定义并刷新勾选列表"); refresh.type = "button";
+      advanced.append(definitionsLabel, element("p", "hint", "保留 id、module、name、description、commands、url_hosts 等完整字段；启用状态由上方勾选控制。新添加的定义默认关闭。"), definitions, refresh, optionsLabel, optionsJson);
+      Object.assign(controls, { enabled, externalList, definitions, optionsJson });
+      for (const entry of bridge.plugins || []) controls.external.set(entry.id, { checked: Boolean(entry.enabled) });
+      refreshExternalPlugins();
+      enabled.addEventListener("change", markDirty); definitions.addEventListener("input", markDirty); optionsJson.addEventListener("input", markDirty);
+      refresh.addEventListener("click", () => { try { refreshExternalPlugins(); markDirty(); } catch (error) { report(error); } });
+    }
+    card.append(details); $("config-groups").append(card);
+  }
+  function readPluginConfig(config) {
+    if (!pluginControls) return;
+    const options = objectJson(pluginControls.nativeJson, "原生插件参数");
+    if (Object.hasOwn(options, "enabled")) throw new Error("原生参数中的 enabled 请移除，使用插件勾选列表。");
+    config.plugins.native = { ...options, enabled: [...pluginControls.native].filter(([, input]) => input.checked).map(([id]) => id) };
+    if (pluginControls.enabled) {
+      const bridge = objectJson(pluginControls.optionsJson, "NoneBot 服务参数");
+      for (const key of ["enabled", "token", "plugins"]) if (Object.hasOwn(bridge, key)) throw new Error(`NoneBot 服务参数中的 ${key} 请使用对应的独立控件。`);
+      config.nonebot = { ...bridge, token: "", enabled: pluginControls.enabled.checked, plugins: readExternalDefinitions().map((entry) => ({ ...entry, enabled: pluginControls.external.get(entry.id)?.checked ?? false })) };
+    }
+  }
+
   function renderFields(pending = {}) {
     const personaManager = $("persona-manager"), modelPicker = $("model-picker");
     state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
@@ -478,6 +590,7 @@
       }
       card.append(heading, grid); if (group.personas) card.append(personaManager); $("config-groups").append(card);
     });
+    renderPluginConfig(pending);
     const web = state.config.web || {};
     $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
     renderPersonaLibrary(); renderModels(); refreshToolPickers(); updateControls();
@@ -511,6 +624,7 @@
       }
       put(config, def.path, value);
     }
+    readPluginConfig(config);
     validatePersonaMap(config.plugins.ai.personas); validateImmutable(config);
     return config;
   }
@@ -518,7 +632,7 @@
   function validateImmutable(config) {
     if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("配置必须是 JSON 对象。");
     if (canonical(config.web) !== canonical(state.config.web)) throw new Error("web 分组不能在线修改，请恢复此分组，或通过本机配置文件修改后重启管理服务。");
-    for (const path of ["llm.api_key", "milky.access_token", "qq_login.token"]) {
+    for (const path of ["llm.api_key", "milky.access_token", "qq_login.token", "nonebot.token"]) {
       const value = get(config, path);
       if (value != null && value !== "") throw new Error(`请勿在 JSON 的 ${path} 中填入密钥；使用对应的密钥控件设置。`);
     }
@@ -556,6 +670,7 @@
     try { config = JSON.parse($("config-json").value); } catch { throw new Error("完整 JSON 格式无效，请修正后再采用或保存。"); }
     validateImmutable(config);
     validatePersonaMap(get(config, "plugins.ai.personas"));
+    validatePluginShape(config);
     // Validate represented fields before replacing the UI, so malformed nested
     // objects cannot silently disappear into the editable form.
     for (const group of groups) for (const def of group.fields) {
@@ -576,6 +691,38 @@
     renderFields(pending); syncJson();
   }
 
+  function configApplyFailure() {
+    if (state.applyError) return state.applyError;
+    if (state.applyFailure?.revision === state.revision) return state.applyFailure.message;
+    return state.status?.phase === "error" ? String(state.status.message || "机器人启动失败。") : "";
+  }
+  function renderConfigState() {
+    const failure = configApplyFailure(), unsaved = state.dirty || state.jsonDirty;
+    const applied = state.revision && state.status?.applied_revision === state.revision && ["running", "waiting_login"].includes(state.status?.phase);
+    const pending = state.pendingOperation?.kind === "runtime" && state.pendingOperation.goal === "running";
+    const label = !state.config ? "正在读取配置" : unsaved ? "未保存" : state.stale ? "保存状态待核对" : failure ? state.applyError ? "不可应用" : "应用失败" : applied && !pending ? "已应用" : "已保存待应用";
+    let detail = !state.config ? "等待服务器返回配置。" : unsaved ? "当前修改仅保留在本页；保存和应用成功后才会生效。"
+      : pending ? "配置已保存，应用结果尚未确认；请查询结果，勿重复提交。"
+        : failure ? "配置已保存但未生效。修正下方问题后保存并应用。"
+          : applied ? "当前机器人已应用此版本。" : "已保存到文件，当前机器人尚未应用此版本。";
+    if (state.status?.applied_revision) detail += " 当前运行版本：" + state.status.applied_revision;
+    $("dirty-label").textContent = label; $("config-state").textContent = label;
+    $("config-state").className = "badge " + (failure ? "bad" : applied && !unsaved && !pending ? "good" : "wait");
+    $("config-state-detail").textContent = detail;
+    $("config-apply-error").hidden = !failure;
+    $("config-apply-error").textContent = failure ? "已保存配置的应用问题：" + failure + "\n请按提示修正后保存并应用；当前勾选不代表插件已经加载。" : "";
+    $("revision-state").textContent = label;
+    $("revision-detail").textContent = detail;
+  }
+  function renderPluginLoadedStates() {
+    const loaded = Array.isArray(state.status?.loaded_plugins) ? new Set(state.status.loaded_plugins) : null;
+    document.querySelectorAll("[data-plugin-loaded]").forEach((node) => {
+      const active = loaded?.has(node.dataset.pluginLoaded);
+      const external = state.pluginCatalog.some((entry) => entry.id === node.dataset.pluginLoaded && entry.runtime === "nonebot") || pluginControls?.external.has(node.dataset.pluginLoaded);
+      node.textContent = active == null ? "当前运行状态待确认" : active ? external ? "当前运行已启用桥接；Python 连接另行确认" : "当前运行已启用" : "当前运行未启用";
+      node.className = "plugin-load-state " + (active ? "loaded" : "not-loaded");
+    });
+  }
   function updateControls() {
     const unavailable = state.busy || !state.authenticated || !state.config;
     const pending = Boolean(state.pendingOperation);
@@ -583,7 +730,7 @@
     document.querySelectorAll("[data-memory-write]").forEach((node) => { node.disabled = unavailable || pending || state.memory.conflict || state.memory.settingsDirty; });
     $("config-fields").disabled = unavailable || state.jsonDirty || pending;
     $("config-json").disabled = unavailable || pending || (!state.jsonDirty && state.formInvalid);
-    $("dirty-label").textContent = state.stale ? "请先核对最新配置" : state.dirty || state.jsonDirty ? "有尚未保存的修改" : "配置已同步";
+    renderConfigState(); renderPluginLoadedStates();
     for (const id of ["save-config", "save-config-top", "save-apply"]) $(id).disabled = unavailable || pending || state.stale;
     const modelsBlocked = unavailable || state.jsonDirty || pending || state.stale;
     $("fetch-models").disabled = modelsBlocked || state.models.loading;
@@ -627,11 +774,14 @@
   async function loadConfig() {
     const result = await api("/api/config");
     if (!result.config || typeof result.revision !== "string") throw new Error("配置响应缺少 config 或 revision。");
+    if (result.apply_error != null && typeof result.apply_error !== "string") throw new Error("配置应用校验结果无效。");
     validatePersonaMap(result.persona_templates || {}, false); validatePersonaMap(get(result.config, "plugins.ai.personas"), false);
     validateToolCatalog(result.tool_catalog ?? []); state.toolCatalog = clone(result.tool_catalog ?? []);
     state.personaTemplates = clone(result.persona_templates || {});
+    validatePluginCatalog(result.plugin_catalog || []); state.pluginCatalog = clone(result.plugin_catalog || []);
     state.config = clone(result.config); state.draft = clone(result.config);
-    state.revision = result.revision; state.secrets = result.secrets || {};
+    state.revision = result.revision; state.secrets = result.secrets || {}; state.applyError = result.apply_error || null;
+    if (state.applyFailure?.revision !== state.revision) state.applyFailure = null;
     state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
     resumeQqPolling(); clearQr();
     $("config-warning").hidden = true;
@@ -663,8 +813,7 @@
     $("runtime-message").textContent = String(status.message || "");
     $("bot-id").textContent = status.bot_id == null ? "—" : String(status.bot_id);
     $("started-at").textContent = dateText(status.started_at);
-    $("revision-state").textContent = !status.applied_revision ? "尚未应用" : status.applied_revision === state.revision ? "已应用最新配置" : "有待应用配置";
-    $("revision-detail").textContent = status.applied_revision ? "运行版本：" + status.applied_revision : "保存后点击连接或应用配置";
+    if (state.applyFailure?.revision === state.revision && status.applied_revision === state.revision && ["running", "waiting_login"].includes(status.phase)) state.applyFailure = null;
     $("poll-state").textContent = document.hidden ? "页面隐藏，已暂停轮询" : "自动同步";
     updateControls();
   }
@@ -716,7 +865,11 @@
   async function refreshStatus(manual = false) {
     if (!state.authenticated || state.runtimePolling || document.hidden) return;
     const session = state.session; state.runtimePolling = true;
-    try { state.status = await api("/api/status"); renderStatus(); if (manual) notice("运行状态已更新。"); }
+    try {
+      const result = await api("/api/status");
+      if (session !== state.session || !state.authenticated) return;
+      state.status = result; renderStatus(); if (manual) notice("运行状态已更新。");
+    }
     catch (error) { if (session === state.session && error.status !== -1) { if (manual) report(error); else badge("header-status", "状态暂不可用", "wait"); } }
     finally { if (session === state.session) { state.runtimePolling = false; scheduleRuntime(); } }
   }
@@ -764,6 +917,7 @@
   const contactId = (value) => typeof value === "string" && /^[1-9]\d{0,19}$/u.test(value);
   const contactsCurrent = (version, session) => state.authenticated && state.session === session && state.contacts.version === version && state.view === "contacts";
   function invalidateContacts(message = "进入此页后加载联系人列表。", phase = "idle") {
+    invalidateScopePlugins();
     const c = state.contacts;
     c.version++; c.loading = false; c.saving = null; c.phase = phase; c.message = message;
     c.botId = ""; c.generation = null; c.groups = []; c.friends = []; c.fetchedAt = null; c.page = 1;
@@ -776,6 +930,8 @@
     $("contacts-prev").disabled = blocked || c.loading || c.page <= 1;
     $("contacts-next").disabled = blocked || c.loading || c.page >= c.totalPages;
     document.querySelectorAll("[data-contact-toggle]").forEach((input) => { input.disabled = blocked || (c.phase !== "ready" && !(c.phase === "cached" && input.checked)) || c.loading || Boolean(c.saving); });
+    document.querySelectorAll("[data-contact-plugins]").forEach((input) => { input.disabled = blocked || c.phase !== "ready" || c.loading || Boolean(c.saving); });
+    updateScopePluginControls();
   }
   function renderContacts() {
     const c = state.contacts, name = c.scene === "group" ? "群聊" : "好友";
@@ -805,7 +961,11 @@
       const scene = c.scene, version = c.version;
       input.addEventListener("change", () => { if (version === state.contacts.version) void toggleContact(scene, row.id, input.checked); });
       label.append(input, element("span", "contact-switch-track"), element("span", "contact-switch-label", c.saving === scene + ":" + row.id ? "保存中…" : row.enabled ? "已开启" : "已关闭"));
-      item.append(identity, label); list.append(item);
+      const plugins = element("button", "text-button accent contact-plugins", "插件"); plugins.type = "button"; plugins.dataset.contactPlugins = row.id;
+      plugins.setAttribute("aria-label", title + "（" + row.id + "）插件开关");
+      plugins.addEventListener("click", () => { if (version === state.contacts.version) void openScopePlugins(scene, row.id, title); });
+      const actions = element("div", "contact-actions"); actions.append(plugins, label);
+      item.append(identity, actions); list.append(item);
     }
     $("contacts-page").textContent = `第 ${c.page} / ${c.totalPages} 页 · 共 ${rows.length} 个`;
     updateContactControls();
@@ -819,6 +979,84 @@
         if (!row || !contactId(row.id) || typeof row.name !== "string" || typeof row.remark !== "string" || typeof row.enabled !== "boolean" || seen.has(row.id)) throw new Error("联系人数据不完整或存在重复 ID，请刷新重试。");
         seen.add(row.id);
       }
+    }
+  }
+  function invalidateScopePlugins() {
+    const scope = state.scopePlugins; scope.version++; scope.query = null; scope.rows = []; scope.loading = false; scope.saving = false; scope.uncertain = false;
+    $("scope-plugins-list").replaceChildren(); $("scope-plugins-message").textContent = "";
+    if ($("scope-plugins-dialog").open) $("scope-plugins-dialog").close();
+  }
+  function updateScopePluginControls() {
+    const s = state.scopePlugins, blocked = !state.authenticated || state.busy || s.loading || s.saving;
+    $("refresh-scope-plugins").disabled = blocked || !s.query;
+    document.querySelectorAll("[data-scope-plugin]").forEach((input) => { input.disabled = blocked || s.uncertain; });
+  }
+  function validateScopePlugins(result, query) {
+    if (!result || result.bot_id !== query.bot_id || result.scene !== query.scene || result.peer_id !== query.peer_id || !Array.isArray(result.plugins) || result.plugins.length > 64) throw new Error("插件列表不属于当前选择的账号和会话。");
+    const seen = new Set();
+    for (const row of result.plugins) {
+      if (!row || typeof row.id !== "string" || typeof row.name !== "string" || typeof row.description !== "string" || typeof row.enabled !== "boolean" || typeof row.globally_enabled !== "boolean" || !Number.isSafeInteger(row.revision) || row.revision < 0 || seen.has(row.id)) throw new Error("插件开关数据无效或重复。");
+      seen.add(row.id);
+    }
+  }
+  function renderScopePlugins() {
+    const s = state.scopePlugins, list = $("scope-plugins-list"); list.replaceChildren();
+    for (const row of s.rows) {
+      const label = element("label", "plugin-option"), input = document.createElement("input"), copy = element("span");
+      input.type = "checkbox"; input.checked = row.enabled; input.dataset.scopePlugin = row.id;
+      input.setAttribute("aria-label", row.name + "在此会话启用");
+      const inactive = row.group_only && s.query?.scene !== "group" ? " · 仅群聊生效" : "";
+      const availability = element("span", "plugin-load-state " + (row.globally_enabled ? "loaded" : "not-loaded"),
+        (row.enabled ? "会话已允许" : "会话已禁止") + " · " + (row.globally_enabled ? "当前运行已启用" : "当前运行未启用"));
+      copy.append(element("strong", "", row.name + inactive), availability, element("span", "hint", row.description + (row.runtime === "nonebot" ? " 桥接启用不代表 Python 服务已连接。" : "")));
+      input.addEventListener("change", () => { void toggleScopePlugin(row.id, input.checked); });
+      label.append(input, copy); list.append(label);
+    }
+    updateScopePluginControls();
+  }
+  async function openScopePlugins(scene, peerId, title) {
+    invalidateScopePlugins();
+    state.scopePlugins.query = { bot_id: state.contacts.botId, scene, peer_id: peerId };
+    $("scope-plugins-title").textContent = title + " · 插件";
+    $("scope-plugins-scope").textContent = `QQ ${state.contacts.botId} · ${scene === "group" ? "群" : "好友"} ${peerId}`;
+    $("scope-plugins-dialog").showModal(); await loadScopePlugins();
+  }
+  async function loadScopePlugins() {
+    const s = state.scopePlugins;
+    if (!s.query || s.loading || s.saving || !state.authenticated) return;
+    const query = clone(s.query), version = ++s.version, session = state.session;
+    s.loading = true; $("scope-plugins-message").textContent = "正在读取当前会话的插件开关…"; updateScopePluginControls();
+    try {
+      const result = await api("/api/plugins/scope?" + new URLSearchParams(query).toString());
+      if (version !== s.version || session !== state.session || !$("scope-plugins-dialog").open) return;
+      validateScopePlugins(result, query); s.rows = result.plugins; s.uncertain = false;
+      $("scope-plugins-message").textContent = "会话默认允许插件；取消勾选会立即记入黑名单。允许使用不等于当前运行已启用，未启用的插件需先保存并应用全局配置。";
+    } catch (error) {
+      if (version !== s.version || session !== state.session) return;
+      s.uncertain = true; $("scope-plugins-message").textContent = error.message;
+    } finally {
+      if (version === s.version && session === state.session) { s.loading = false; renderScopePlugins(); }
+    }
+  }
+  async function toggleScopePlugin(plugin, enabled) {
+    const s = state.scopePlugins, row = s.rows.find((item) => item.id === plugin);
+    if (!s.query || !row || s.loading || s.saving || s.uncertain || !state.authenticated || state.busy) return;
+    const query = clone(s.query), version = s.version, session = state.session;
+    s.saving = true; updateScopePluginControls(); $("scope-plugins-message").textContent = "正在保存插件开关…";
+    try {
+      const result = await api("/api/plugins/scope", "POST", { ...query, plugin, enabled, revision: row.revision });
+      if (version !== s.version || session !== state.session || !$("scope-plugins-dialog").open) return;
+      validateScopePlugins(result, query); s.rows = result.plugins;
+      const current = s.rows.find((item) => item.id === plugin);
+      $("scope-plugins-message").textContent = !enabled ? `${row.name} 已在此会话禁止，开关已保存。`
+        : `${row.name} 已允许在此会话使用，开关已保存。` + (current?.globally_enabled ? "当前运行已启用。" + (current.runtime === "nonebot" ? " Python 连接需另行确认。" : "")
+          : "但当前运行未启用；请先修正配置问题，再保存并应用全局配置。" + (configApplyFailure() ? " " + configApplyFailure() : ""));
+    } catch (error) {
+      if (version !== s.version || session !== state.session) return;
+      s.uncertain = true;
+      $("scope-plugins-message").textContent = (uncertain(error) ? "保存结果尚未确认，不会重复提交。请点「刷新核对」查看服务器状态。 " : "开关未能确认，请刷新核对后再操作。 ") + error.message;
+    } finally {
+      if (version === s.version && session === state.session) { s.saving = false; renderScopePlugins(); }
     }
   }
   async function loadContacts(force = false) {
@@ -881,12 +1119,20 @@
   }
   function clearOperation() { state.pendingOperation = null; $("operation-notice").hidden = true; updateControls(); }
   async function applyRuntime(stop = false) {
-    try { await api(stop ? "/api/runtime/stop" : "/api/runtime/apply", "POST", {}); }
+    try {
+      if (!stop && state.applyError) throw new Error(state.applyError);
+      await api(stop ? "/api/runtime/stop" : "/api/runtime/apply", "POST", {});
+      if (!stop) state.applyFailure = null;
+    }
     catch (error) {
-      if (uncertain(error)) { trackOperation({ kind: "runtime", label: stop ? "断开连接" : "应用配置", goal: stop ? "stopped" : "running", revision: state.revision }); return; }
+      if (uncertain(error)) {
+        trackOperation({ kind: "runtime", label: stop ? "断开连接" : "应用配置", goal: stop ? "stopped" : "running", revision: state.revision });
+        notice((stop ? "断开结果待确认。" : "配置已保存，应用结果尚未确认。") + error.message, "warning"); return false;
+      }
+      if (!stop && state.authenticated) { state.applyFailure = { revision: state.revision, message: error.message }; updateControls(); }
       throw error;
     }
-    notice(stop ? "已提交断开请求。" : "已提交应用请求，连接进度会自动更新。"); await refreshStatus();
+    notice(stop ? "已提交断开请求。" : "配置已保存，已提交应用请求；生效状态会自动更新。"); await refreshStatus(); return true;
   }
   async function saveConfig(apply) {
     if (state.jsonDirty) adoptJson();
@@ -899,8 +1145,11 @@
     }
     await loadConfig();
     if (databaseChanged) notice("配置已保存。数据库路径已改变，请重启整个程序后再使用；不会在当前进程中应用。", "warning");
-    else if (apply) { await applyRuntime(); if (logChanged) notice("配置已保存并提交应用。日志过滤级别仍需要重启整个程序。", "warning"); }
-    else notice("配置已保存，应用后生效。" + (logChanged ? " 日志过滤级别需要重启整个程序。" : ""), logChanged ? "warning" : "success");
+    else if (apply) {
+      try { if (await applyRuntime() && logChanged) notice("配置已保存并提交应用。日志过滤级别仍需要重启整个程序。", "warning"); }
+      catch (error) { error.message = "配置已保存但未生效。应用失败：" + error.message; throw error; }
+    } else notice(state.applyError ? "配置已保存但未生效。当前不可应用：" + state.applyError
+      : "配置已保存，应用后生效。" + (logChanged ? " 日志过滤级别需要重启整个程序。" : ""), state.applyError || logChanged ? "warning" : "success");
   }
   async function checkOperation() {
     const operation = state.pendingOperation; if (!operation) return;
@@ -919,7 +1168,10 @@
     } else {
       state.status = await api("/api/status"); renderStatus();
       const done = operation.goal === "stopped" ? state.status.phase === "stopped" : state.status.applied_revision === operation.revision && ["running", "waiting_login"].includes(state.status.phase);
-      if (done || state.status.phase === "error") { clearOperation(); notice(done ? "运行状态已确认。" : String(state.status.message || "运行时应用失败。"), done ? "success" : "error"); }
+      if (done || state.status.phase === "error") {
+        if (done && operation.goal === "running") state.applyFailure = null;
+        clearOperation(); notice(done ? "运行状态已确认。" : String(state.status.message || "运行时应用失败。"), done ? "success" : "error");
+      }
       else notice("当前状态：" + String(state.status.phase) + "。请稍后再次查询。", "warning");
     }
   }
@@ -947,8 +1199,8 @@
   }
   function clearSession(message = "") {
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
-    state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false;
-    state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
+    state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false; state.applyError = null; state.applyFailure = null;
+    state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; state.pluginCatalog = []; pluginControls = null; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     $("config-fields").append($("persona-manager"), $("model-picker"));
@@ -1310,6 +1562,7 @@
   $("refresh-status").addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
   $("refresh-qq").addEventListener("click", () => { void runAction(() => refreshQq(true)); });
   $("refresh-contacts").addEventListener("click", () => { void loadContacts(true); });
+  $("refresh-scope-plugins").addEventListener("click", () => { void loadScopePlugins(); });
   for (const [id, scene] of [["contacts-groups", "group"], ["contacts-friends", "friend"]]) $(id).addEventListener("click", () => { state.contacts.scene = scene; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
   $("contacts-search").addEventListener("input", () => { state.contacts.query = $("contacts-search").value; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
   for (const [id, direction] of [["contacts-prev", -1], ["contacts-next", 1]]) $(id).addEventListener("click", () => { state.contacts.page += direction; renderContacts(); });
