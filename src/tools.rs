@@ -15,10 +15,21 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
     LocalWrite,
+}
+
+/// Administrator display metadata, not an authorization grant or a model tool
+/// definition. Every value comes from the registered implementation's spec.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolCatalogEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub plugin_id: &'static str,
+    pub effect: Effect,
 }
 
 #[derive(Clone)]
@@ -84,6 +95,20 @@ impl ToolRegistry {
     }
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
+    }
+    pub fn catalog(&self) -> Vec<ToolCatalogEntry> {
+        self.tools
+            .values()
+            .map(|tool| {
+                let spec = tool.spec();
+                ToolCatalogEntry {
+                    name: spec.name,
+                    description: spec.description,
+                    plugin_id: spec.plugin,
+                    effect: spec.effect,
+                }
+            })
+            .collect()
     }
     fn get(&self, name: &str) -> Result<Arc<dyn Tool>> {
         self.tools
@@ -690,6 +715,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn displaying_catalog_does_not_grant_tools_or_enable_their_plugins() {
+        let (store, gateway, ctx) = setup().await;
+        let catalog = gateway.registry.catalog();
+        for entry in &catalog {
+            let spec = gateway.registry.get(entry.name).unwrap().spec();
+            assert_eq!(entry.description, spec.description);
+            assert_eq!(entry.plugin_id, spec.plugin);
+            assert_eq!(entry.effect, spec.effect);
+        }
+        let limited = Gateway::new(
+            store.clone(),
+            "UTC",
+            gateway.registry.clone(),
+            vec!["clock_now".into()],
+        )
+        .unwrap();
+        limited.migrate().await.unwrap();
+        let definitions = limited.definitions(&ctx).await.unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0]["function"]["name"], "clock_now");
+        assert!(
+            limited
+                .execute(&ctx, "reminder_list", json!({}))
+                .await
+                .is_err()
+        );
+        store
+            .call(|db| {
+                db.execute("UPDATE plugin_states SET enabled=0 WHERE id='clock'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(limited.definitions(&ctx).await.unwrap().is_empty());
+        assert!(limited.execute(&ctx, "clock_now", json!({})).await.is_err());
+        assert_eq!(limited.registry.catalog(), catalog);
+        let none = Gateway::new(store.clone(), "UTC", gateway.registry.clone(), vec![]).unwrap();
+        none.migrate().await.unwrap();
+        assert!(none.definitions(&ctx).await.unwrap().is_empty());
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn off_on_cycle_cancels_confirmations_and_does_not_replay_accepted_commands() {
         use crate::{
             access::AccessStore,
@@ -712,6 +780,8 @@ mod tests {
                 message_seq: 8,
             },
             sender_id: ctx.actor_id,
+            sender_nickname: None,
+            sender_card: None,
             text: "/remind add 60 旧指令".into(),
             mentions: vec![],
             quote_seq: None,
@@ -983,6 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn committed_reminders_survive_context_reset_and_delivery_is_not_retried() {
         let (store, gateway, ctx) = setup().await;
+        let bot_id = ctx.scope.bot_id;
         gateway
             .direct(
                 ctx.scope,
@@ -1001,10 +1072,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(reminder::claim_due(&store, 2).await.unwrap().len(), 1);
-        assert!(reminder::claim_due(&store, 2).await.unwrap().is_empty());
-        assert_eq!(reminder::recover_interrupted(&store).await.unwrap(), 1);
-        assert!(reminder::claim_due(&store, 2).await.unwrap().is_empty());
+        let due = reminder::claim_due(&store, bot_id).await.unwrap().unwrap();
+        assert!(reminder::claim_due(&store, bot_id).await.unwrap().is_none());
+        store.call(move|db|{
+            db.execute("INSERT INTO outbox(id,scope,origin_plugin,plugin_epoch,body,state,created_at,updated_at) VALUES(?1,?2,'reminder',?3,'x','submitted',0,0)",params![due.outbox_id,due.scope.key(),due.plugin_epoch])?;
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(
+            reminder::recover_interrupted(&store, bot_id).await.unwrap(),
+            1
+        );
+        assert!(reminder::claim_due(&store, bot_id).await.unwrap().is_none());
         store.stop().await.unwrap();
     }
 

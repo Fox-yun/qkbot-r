@@ -157,7 +157,7 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
         "same number in private chat is independent"
     );
     assert!(
-        toggle("101", "group", "999", false)
+        toggle("101", "group", "999", true)
             .send()
             .await
             .unwrap()
@@ -173,7 +173,7 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
             .is_client_error()
     );
     assert_eq!(
-        toggle("303", "group", "202", false)
+        toggle("303", "group", "202", true)
             .send()
             .await
             .unwrap()
@@ -212,6 +212,26 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
         .await
         .unwrap();
     assert_eq!(list["groups"][0]["enabled"], false);
+
+    account.store(0, Ordering::SeqCst);
+    assert!(
+        toggle("101", "group", "202", false)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "an authenticated administrator can keep a bound scope disabled while offline"
+    );
+    assert!(
+        !toggle("101", "group", "202", true)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "enabling still requires verified membership and account"
+    );
 
     cancel.cancel();
     server.await.unwrap();

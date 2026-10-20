@@ -65,6 +65,7 @@ impl Store {
         };
         store.call(|c| { c.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(plugin_id TEXT NOT NULL,version INTEGER NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(plugin_id,version));")?; Ok(()) }).await?;
         store.migrate("host", 1, HOST_SCHEMA).await?;
+        store.migrate("host", 2, MESSAGE_DISPLAY_NAMES).await?;
         store
             .migrate("scope_access", 1, crate::access::MIGRATION)
             .await?;
@@ -211,9 +212,49 @@ CREATE TABLE ai_conversations(
 CREATE TABLE ai_scope_modes(scope TEXT PRIMARY KEY,mode TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0);
 "#;
 
+const MESSAGE_DISPLAY_NAMES: &str = r#"
+ALTER TABLE messages ADD COLUMN sender_nickname TEXT;
+ALTER TABLE messages ADD COLUMN sender_card TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn display_name_migration_preserves_legacy_content_and_is_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        let raw = "旧消息原文\n不改写身份标签";
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(HOST_SCHEMA).unwrap();
+            db.execute_batch("CREATE TABLE schema_migrations(plugin_id TEXT NOT NULL,version INTEGER NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(plugin_id,version));").unwrap();
+            db.execute(
+                "INSERT INTO schema_migrations VALUES('host',1,?1)",
+                [format!("{:x}", Sha256::digest(HOST_SCHEMA.as_bytes()))],
+            )
+            .unwrap();
+            db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at) VALUES('1:group:2:1','1:group:2','conversation',1,3,'user',?1,1)", [raw]).unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&path, 8).await.unwrap();
+            let row: (String,Option<String>,Option<String>,i64) = store.call(|db| Ok(db.query_row("SELECT content,sender_nickname,sender_card,sender_id FROM messages WHERE key='1:group:2:1'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
+            assert_eq!(row, (raw.into(), None, None, 3));
+            let count: i64 = store
+                .call(|db| {
+                    Ok(db.query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE plugin_id='host'",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            store.stop().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn callback_panic_rolls_back_its_transaction_and_preserves_worker() {
         let store = Store::open(":memory:", 8).await.unwrap();

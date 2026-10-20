@@ -5,6 +5,7 @@ pub mod config;
 pub mod host;
 pub mod llm;
 pub mod milky;
+pub mod personas;
 pub mod plugin;
 pub mod plugins;
 pub mod store;

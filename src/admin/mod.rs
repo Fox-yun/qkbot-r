@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod contacts;
 pub mod memory;
+pub mod models;
 pub mod qq;
 pub mod qq_service;
 pub mod runtime;
@@ -11,6 +12,7 @@ use self::{
     auth::{AuthError, AuthGrant, AuthService, TrustedSession},
     contacts::ContactsService,
     memory::{Actor, MemoryAdmin},
+    models::ModelsService,
     qq_service::QqService,
     runtime::Runtime,
     settings::{ConfigStore, SaveRequest},
@@ -37,6 +39,7 @@ pub struct AdminState {
     requests: Arc<Semaphore>,
     qq: QqService,
     contacts: ContactsService,
+    models: ModelsService,
     mutations: tokio_util::task::TaskTracker,
 }
 impl AdminState {
@@ -48,6 +51,7 @@ impl AdminState {
         Arc::new(Self {
             qq: QqService::new(store.clone()),
             contacts: ContactsService::new(store.clone(), runtime.clone()),
+            models: ModelsService::new(store.clone()),
             store,
             runtime,
             auth,
@@ -75,6 +79,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/auth/password", post(password))
         .route("/api/status", get(status))
         .route("/api/config", get(config).put(save))
+        .route("/api/llm/models", post(model_list))
         .route("/api/runtime/apply", post(apply))
         .route("/api/runtime/stop", post(stop))
         .route("/api/qq/status", get(qq_status))
@@ -510,6 +515,24 @@ async fn operation(
     Path(id): Path<String>,
 ) -> Response {
     result(async { s.memories().await?.operation(&actor(a), &id).await }.await)
+}
+
+async fn model_list(
+    State(s): State<Arc<AdminState>>,
+    request: std::result::Result<Json<models::ModelsRequest>, JsonRejection>,
+) -> Response {
+    let result = match request {
+        Ok(Json(request)) => s.models.list(request).await,
+        Err(_) => Err(models::ModelsError::Invalid),
+    };
+    match result {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => (
+            error.status(),
+            Json(json!({"error":error.to_string(),"code":error.code()})),
+        )
+            .into_response(),
+    }
 }
 fn secure_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();

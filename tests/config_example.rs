@@ -14,9 +14,20 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
 }
 
 #[test]
-fn legacy_access_is_readable_but_absent_from_saved_configuration() {
-    let config: Config =
-        toml::from_str("[access]\ngroups = [123]\nfriends = []\nadmins = [456]").unwrap();
+fn legacy_access_cannot_silently_expand_permissions_during_upgrade() {
+    for source in [
+        "[access]\ngroups = [123]\nfriends = []\nadmins = [456]",
+        "[access]",
+        "[plugins.ai]\nenabled = false\n[access]\ngroups = []",
+    ] {
+        let error = toml::from_str::<Config>(source).unwrap_err();
+        assert!(error.to_string().contains("已阻止自动切换访问策略"));
+        let message = Config::from_toml(source).unwrap_err().to_string();
+        assert!(message.contains("手动移除旧 [access]"));
+        assert!(!message.contains("456"));
+    }
+    assert!(serde_json::from_value::<Config>(serde_json::json!({"access":null})).is_err());
+    let config = Config::default();
     assert!(
         serde_json::to_value(&config)
             .unwrap()

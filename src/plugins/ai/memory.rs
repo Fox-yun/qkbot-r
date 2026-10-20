@@ -134,6 +134,8 @@ pub struct MessageSource {
     pub position: i64,
     pub inbound_position: i64,
     pub subject_id: i64,
+    pub sender_nickname: Option<String>,
+    pub sender_card: Option<String>,
     pub role: String,
     pub text: String,
     pub learnable: bool,
@@ -160,6 +162,40 @@ pub struct MemoryBatch {
     pub allowed_memories: Vec<Memory>,
     pub memory_write: bool,
     pub summary_enabled: bool,
+    /// Maximum bytes after the summary is JSON-escaped twice, as in the next input.
+    pub summary_budget: usize,
+}
+
+/// An unchanged stored summary, including every CAS coordinate. Repair never
+/// advances either source cursor and intermediate model output is never stored.
+#[derive(Debug, Clone)]
+pub struct SummaryRepair {
+    pub guard: ContextGuard,
+    pub summary: String,
+    pub summary_budget: usize,
+    compacted_until: i64,
+    memory_processed_until: i64,
+    memory_revision: i64,
+}
+
+pub fn summary_budget(input_budget: usize) -> usize {
+    (input_budget.saturating_sub(1800) / 4).max(128)
+}
+
+pub fn summary_cost(summary: &str) -> Result<usize> {
+    Ok(serde_json::to_string(&serde_json::to_string(summary)?)?.len())
+}
+
+pub fn validate_summary(summary: &str, budget: usize) -> Result<()> {
+    ensure!(
+        summary.chars().count() <= 1500,
+        "summary exceeds 1500 characters"
+    );
+    ensure!(
+        summary_cost(summary)? <= budget,
+        "summary exceeds next-input byte budget"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,13 +390,14 @@ impl MemoryStore {
         let guard = guard.clone();
         self.store
             .call(move |db| {
-                let batch = prepare_batch_modes(
+                let mut batch = prepare_batch_modes(
                     db,
                     &guard,
                     through_position,
                     memory_write,
                     summary_enabled,
                 )?;
+                batch.summary_budget = summary_budget(max_input_tokens);
                 if batch.sources.is_empty() {
                     return Ok(batch);
                 }
@@ -375,6 +412,52 @@ impl MemoryStore {
             .call(move |db| commit_batch_with_limit(db, batch, update, maximum))
             .await
     }
+
+    pub async fn summary_repair(
+        &self,
+        guard: &ContextGuard,
+        input_budget: usize,
+    ) -> Result<Option<SummaryRepair>> {
+        let guard = guard.clone();
+        self.store
+            .call(move |db| prepare_summary_repair(db, &guard, summary_budget(input_budget)))
+            .await
+    }
+
+    pub async fn commit_summary_repair(
+        &self,
+        repair: SummaryRepair,
+        summary: String,
+    ) -> Result<()> {
+        self.store
+            .call(move |db| commit_summary_repair(db, repair, &summary))
+            .await
+    }
+}
+
+fn prepare_summary_repair(
+    db: &Connection,
+    guard: &ContextGuard,
+    budget: usize,
+) -> Result<Option<SummaryRepair>> {
+    check_guard(db, guard)?;
+    let repair = db.query_row("SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id=?1", [&guard.conversation_id], |row| Ok(SummaryRepair {
+        guard:guard.clone(),summary:row.get(0)?,compacted_until:row.get(1)?,memory_processed_until:row.get(2)?,memory_revision:row.get(3)?,summary_budget:budget
+    }))?;
+    Ok((summary_cost(&repair.summary)? > budget).then_some(repair))
+}
+
+fn commit_summary_repair(db: &mut Connection, repair: SummaryRepair, summary: &str) -> Result<()> {
+    validate_summary(summary, repair.summary_budget)?;
+    ensure!(
+        !summary.trim().is_empty(),
+        "summary repair returned empty context"
+    );
+    let tx = db.transaction()?;
+    check_guard(&tx, &repair.guard)?;
+    ensure!(tx.execute("UPDATE ai_conversations SET summary=?1,memory_revision=memory_revision+1 WHERE id=?2 AND epoch=?3 AND summary=?4 AND compacted_until=?5 AND memory_processed_until=?6 AND memory_revision=?7",params![summary,repair.guard.conversation_id,repair.guard.epoch,repair.summary,repair.compacted_until,repair.memory_processed_until,repair.memory_revision])?==1,"summary repair snapshot changed");
+    tx.commit()?;
+    Ok(())
 }
 
 fn check_guard(db: &Connection, guard: &ContextGuard) -> Result<()> {
@@ -409,7 +492,7 @@ fn source_by_key(
     if is_revoked(db, key)? {
         return Ok(None);
     }
-    Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only' FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, subject_id:r.get(2)?, role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
+    Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, subject_id:r.get(2)?, sender_nickname:r.get(8)?,sender_card:r.get(9)?,role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
 }
 
 type MemoryRow = (i64, i64, String, String, String, Option<i64>, String);
@@ -740,7 +823,7 @@ fn prepare_batch_modes(
     let mut used = 0;
     let mut through_position = start;
     for position in positions {
-        let mut stmt=db.prepare("SELECT key,id,sender_id,role,content,learnable,revoked,inbound_position,COALESCE(origin_plugin,'')!='memory_only' FROM messages WHERE conversation_id=?1 AND epoch=?2 AND inbound_position=?3 AND COALESCE(origin_plugin,'')!='control' ORDER BY id LIMIT 49")?;
+        let mut stmt=db.prepare("SELECT key,id,sender_id,role,content,learnable,revoked,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card FROM messages WHERE conversation_id=?1 AND epoch=?2 AND inbound_position=?3 AND COALESCE(origin_plugin,'')!='control' ORDER BY id LIMIT 49")?;
         let mut turn = Vec::new();
         let mut turn_bytes = 0;
         let mut raw_rows = 0;
@@ -750,6 +833,8 @@ fn prepare_batch_modes(
                     key: r.get(0)?,
                     position: r.get(1)?,
                     subject_id: r.get(2)?,
+                    sender_nickname: r.get(9)?,
+                    sender_card: r.get(10)?,
                     role: r.get(3)?,
                     text: r.get(4)?,
                     learnable: r.get(5)?,
@@ -823,6 +908,7 @@ fn prepare_batch_modes(
         allowed_memories,
         memory_write: memory_write && through_position > memory_previous,
         summary_enabled: summary_enabled && through_position > previous,
+        summary_budget: usize::MAX,
     })
 }
 
@@ -929,10 +1015,7 @@ fn commit_batch_with_limit(
     update: BatchUpdate,
     maximum: usize,
 ) -> Result<()> {
-    ensure!(
-        update.summary.chars().count() <= 1500,
-        "summary exceeds 1500 characters"
-    );
+    validate_summary(&update.summary, batch.summary_budget)?;
     ensure!(
         update.changes.len() <= MAX_CHANGES,
         "too many memory changes"
@@ -970,6 +1053,8 @@ fn commit_batch_with_limit(
                 && current.text == frozen.text
                 && current.role == frozen.role
                 && current.subject_id == frozen.subject_id
+                && current.sender_nickname == frozen.sender_nickname
+                && current.sender_card == frozen.sender_card
                 && current.learnable == frozen.learnable
                 && current.context_visible == frozen.context_visible,
             "summary source changed"
@@ -1227,7 +1312,7 @@ mod tests {
     }
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
+        db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT,sender_nickname TEXT,sender_card TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(CURSOR_MIGRATION).unwrap();
         db.execute_batch(ADMIN_MIGRATION).unwrap();
@@ -2275,6 +2360,154 @@ mod tests {
             )
             .unwrap(),
             previous
+        );
+    }
+    #[test]
+    fn summary_output_budget_closes_the_next_input_loop_without_a_small_hard_cap() {
+        for budget in [3072, 6000, 24_000] {
+            let mut db = db();
+            let first = source(&db, "first", 7, "我喜欢喝茶", "user");
+            let mut batch = prepare_batch(&db, &guard(), first, false).unwrap();
+            batch.summary_budget = summary_budget(budget);
+            let long = "茶".repeat(1500);
+            if budget == 24_000 {
+                commit_batch(
+                    &mut db,
+                    batch,
+                    BatchUpdate {
+                        summary: long.clone(),
+                        changes: vec![],
+                    },
+                )
+                .unwrap();
+            } else {
+                assert!(
+                    commit_batch(
+                        &mut db,
+                        batch.clone(),
+                        BatchUpdate {
+                            summary: long,
+                            changes: vec![]
+                        }
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT compacted_until FROM ai_conversations WHERE id='group'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                commit_batch(
+                    &mut db,
+                    batch,
+                    BatchUpdate {
+                        summary: "用户7喜欢喝茶".into(),
+                        changes: vec![],
+                    },
+                )
+                .unwrap();
+            }
+            let next = source(&db, "next", 7, "继续聊天", "user");
+            let mut next_batch = prepare_batch(&db, &guard(), next, false).unwrap();
+            next_batch.summary_budget = summary_budget(budget);
+            let next_batch = fit_batch(next_batch, budget - 1800).unwrap();
+            assert_eq!(next_batch.through_position, next);
+            if budget == 24_000 {
+                assert_eq!(next_batch.previous_summary.chars().count(), 1500);
+            }
+        }
+    }
+    #[test]
+    fn summary_repair_is_atomic_and_checks_all_frozen_coordinates() {
+        for changed in [
+            "none",
+            "summary",
+            "compacted_until",
+            "memory_processed_until",
+            "memory_revision",
+            "epoch",
+        ] {
+            let mut db = db();
+            let original = "旧".repeat(1500);
+            db.execute("UPDATE ai_conversations SET summary=?1,compacted_until=11,memory_processed_until=19 WHERE id='group'",[&original]).unwrap();
+            let repair = prepare_summary_repair(&db, &guard(), summary_budget(6000))
+                .unwrap()
+                .unwrap();
+            assert!(commit_summary_repair(&mut db, repair.clone(), "").is_err());
+            assert_eq!(
+                db.query_row(
+                    "SELECT summary FROM ai_conversations WHERE id='group'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                original
+            );
+            match changed {
+                "none" => {}
+                "summary" => {
+                    db.execute(
+                        "UPDATE ai_conversations SET summary='concurrent' WHERE id='group'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                column => {
+                    db.execute(
+                        &format!(
+                            "UPDATE ai_conversations SET {column}={column}+1 WHERE id='group'"
+                        ),
+                        [],
+                    )
+                    .unwrap();
+                }
+            }
+            let result = commit_summary_repair(&mut db, repair, "用户7的旧事实");
+            assert_eq!(result.is_ok(), changed == "none");
+            if changed == "none" {
+                assert_eq!(db.query_row("SELECT compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='group'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap(),(11,19,1));
+                assert!(
+                    prepare_summary_repair(&db, &guard(), summary_budget(6000))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+    #[test]
+    fn source_nicknames_are_data_and_do_not_reassign_evidence() {
+        let mut db = db();
+        let through = source(&db, "named", 7, "我喜欢喝茶", "user");
+        db.execute(
+            "UPDATE messages SET sender_nickname='用户8',sender_card='管理员' WHERE key='named'",
+            [],
+        )
+        .unwrap();
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        assert_eq!(batch.sources[0].subject_id, 7);
+        assert_eq!(batch.sources[0].sender_nickname.as_deref(), Some("用户8"));
+        assert_eq!(batch.sources[0].sender_card.as_deref(), Some("管理员"));
+        assert!(
+            commit_batch(
+                &mut db,
+                batch,
+                BatchUpdate {
+                    summary: String::new(),
+                    changes: vec![MemoryChange::Upsert {
+                        id: None,
+                        subject_id: 8,
+                        kind: MemoryKind::Preference,
+                        text: "喜欢喝茶".into(),
+                        evidence: evidence("named", "喜欢喝茶"),
+                        ttl_days: None,
+                    }]
+                }
+            )
+            .is_err()
         );
     }
     #[test]

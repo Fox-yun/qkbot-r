@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{AiConfig, AiSettings, validate_settings},
+    config::{AiConfig, AiSettings},
     plugins::ai::{
         memory::{
             MemoryKind, get_memory, lexical_terms, revoke_memories, validate_text, validate_ttl,
@@ -282,9 +282,9 @@ impl MemoryAdmin {
                     bump_context(&tx,&cv,true,true)?;
                 }
                 Action::Settings{settings}=> {
-                    validate_settings(settings)?;
-                    ensure!(config.personas.contains_key(&settings.persona),"unknown persona");
-                    ensure!(settings.allowed_tools.iter().all(|id|config.defaults.allowed_tools.contains(id)),"tool is not enabled by global configuration");
+                    ensure!(config.persona(&settings.persona).is_some(),"当前运行配置中没有该人设；如刚保存了自定义人设，请先应用全局配置");
+                    config.validate_settings(settings)?;
+                    ensure!(settings.allowed_tools.iter().all(|id|config.defaults.allowed_tools.contains(id)),"当前运行配置未允许该工具；如刚修改全局工具列表，请先应用配置");
                     let mode:String=tx.query_row("SELECT mode FROM ai_conversations WHERE id=?1",[&cv.id],|r|r.get(0))?;
                     ensure!(settings.mode==mode,"change conversation mode through the mode operation");
                     let defaults=serde_json::to_value(&config.defaults)?;
@@ -854,6 +854,115 @@ mod tests {
         }).await.unwrap();
         store.stop().await.unwrap();
     }
+    #[tokio::test]
+    async fn persona_changes_invalidate_old_work_without_erasing_context_or_memory() {
+        let (_dir, store, service, actor) = fixture().await;
+        service
+            .mutate(&actor, create("seed-persona-memory", 1, 0))
+            .await
+            .unwrap();
+        store
+            .call(|db| {
+                db.execute(
+                    "UPDATE ai_conversations SET summary='原有摘要',settings='{\"persona\":\"默认\"}' WHERE id='group'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let old_detail = service.conversation(&actor, "group").await.unwrap();
+        assert_eq!(old_detail["settings"]["persona"], "默认");
+        assert!(
+            service
+                .conversations(&actor, ConversationQuery::default())
+                .await
+                .is_ok()
+        );
+        let settings = AiSettings {
+            persona: "温柔学长".into(),
+            ..Default::default()
+        };
+        let mut change = MutationRequest {
+            request_id: "select-persona".into(),
+            conversation_id: "group".into(),
+            epoch: 2,
+            memory_revision: 1,
+            action: Action::Settings {
+                settings: settings.clone(),
+            },
+        };
+        let result = service.mutate(&actor, change.clone()).await.unwrap();
+        assert_eq!(result["epoch"], 3);
+        let detail = service.conversation(&actor, "group").await.unwrap();
+        assert_eq!(detail["settings"]["persona"], "温柔学长");
+        assert_eq!(detail["context_count"], 1);
+        store
+            .call(|db| {
+                assert!(
+                    crate::host::check_guard(
+                        db,
+                        &ContextGuard {
+                            conversation_id: "group".into(),
+                            epoch: 2
+                        }
+                    )
+                    .is_err()
+                );
+                crate::host::check_guard(
+                    db,
+                    &ContextGuard {
+                        conversation_id: "group".into(),
+                        epoch: 3,
+                    },
+                )?;
+                assert_eq!(
+                    db.query_row(
+                        "SELECT summary FROM ai_conversations WHERE id='group'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "原有摘要"
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT count(*) FROM ai_memories WHERE conversation_id='group'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        change.request_id = "unknown-persona".into();
+        change.epoch = 3;
+        change.memory_revision = 2;
+        change.action = Action::Settings {
+            settings: AiSettings {
+                persona: "刚保存的自定义".into(),
+                ..settings
+            },
+        };
+        let mut saved_config = service.config.clone();
+        saved_config
+            .personas
+            .insert("刚保存的自定义".into(), "新的自定义表达".into());
+        let error = service.mutate(&actor, change.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("请先应用全局配置"));
+        assert_eq!(service.conversation(&actor, "group").await.unwrap(), detail);
+        // Only after the runtime adopts that configuration may a conversation
+        // select its new custom entry. No failed request changed its generation.
+        let applied_service = MemoryAdmin::new(store.clone(), saved_config);
+        applied_service.mutate(&actor, change).await.unwrap();
+        assert_eq!(
+            applied_service.conversation(&actor, "group").await.unwrap()["settings"]["persona"],
+            "刚保存的自定义"
+        );
+        store.stop().await.unwrap();
+    }
+
     #[tokio::test]
     async fn settings_preserve_context_reset_hides_it_and_mode_revisions_do_not_revive_it() {
         let (_dir, store, service, actor) = fixture().await;

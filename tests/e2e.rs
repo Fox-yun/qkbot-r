@@ -99,7 +99,7 @@ impl MockServer {
                                 let marker = format!("quoted-{}-{}-{}",body["message_scene"].as_str().unwrap(),body["peer_id"],body["message_seq"]);
                                 json!({"status":"ok","retcode":0,"data":{"message":{
                                     "message_scene":body["message_scene"],"peer_id":body["peer_id"],"message_seq":body["message_seq"],
-                                    "sender_id":789,"time":now(),"segments":[{"type":"text","data":{"text":marker}}]
+                                    "sender_id":789,"time":now(),"group_member":{"user_id":789,"group_id":body["peer_id"],"nickname":"引用昵称","card":"引用名片"},"segments":[{"type":"text","data":{"text":marker}}]
                                 }}})
                             }
                             "/v1/chat/completions" => {
@@ -162,6 +162,8 @@ fn message(seq: i64, text: &str) -> Incoming {
             message_seq: seq,
         },
         sender_id: 789,
+        sender_nickname: None,
+        sender_card: None,
         text: text.into(),
         mentions: vec![123],
         quote_seq: None,
@@ -203,6 +205,67 @@ async fn setup_with(
 }
 
 #[tokio::test]
+async fn nicknames_follow_current_history_and_quoted_messages_without_changing_evidence() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    let mut first = message(1, "原始正文喜欢白茶");
+    first.sender_nickname = Some("账号昵称".into());
+    first.sender_card = Some("旧名片".into());
+    router.dispatch(first).await.unwrap();
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(payload.contains("旧名片"));
+    assert!(payload.contains("789"));
+    request.reply.send(answer("已收到第一条消息")).unwrap();
+    mock.sent().await;
+    let mut next = message(2, "现在改了名片");
+    next.sender_nickname = Some("账号昵称".into());
+    next.sender_card = Some("新名片".into());
+    next.quote_seq = Some(1);
+    router.dispatch(next).await.unwrap();
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(
+        payload.contains("旧名片"),
+        "history must retain its original name snapshot"
+    );
+    assert!(
+        payload.contains("新名片"),
+        "current message must use its new name"
+    );
+    assert!(
+        payload.contains("引用名片"),
+        "quoted messages use the queried member metadata"
+    );
+    request.reply.send(answer("已收到新名片")).unwrap();
+    mock.sent().await;
+    let saved: (String, String, String) = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+        "SELECT content,sender_nickname,sender_card FROM messages WHERE key='123:group:456:1'",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+    )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        saved,
+        (
+            "原始正文喜欢白茶".into(),
+            "账号昵称".into(),
+            "旧名片".into()
+        )
+    );
+    assert_eq!(within(mock.quotes.recv()).await.unwrap()["message_seq"], 1);
+    assert!(mock.quotes.try_recv().is_err());
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
 async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_with(&mock, true, |config| {
@@ -234,6 +297,7 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
     .unwrap();
     assert_eq!(batch["summary_enabled"], false);
     assert_eq!(batch["memory_write"], true);
+    let learned_through = batch["through_position"].as_i64().unwrap();
     request
         .reply
         .send(answer(
@@ -257,7 +321,7 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
         .await
         .unwrap();
     assert_eq!(state.0, 0);
-    assert!(state.1 > 0);
+    assert_eq!(state.1, learned_through);
     assert!(state.2.is_empty());
 
     web_change(
@@ -282,6 +346,7 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
     .unwrap();
     assert_eq!(batch["summary_enabled"], true);
     assert_eq!(batch["memory_write"], false);
+    let summarized_through = batch["through_position"].as_i64().unwrap();
     assert!(
         batch["sources"]
             .as_array()
@@ -300,7 +365,11 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
         "SELECT compacted_until,memory_processed_until,(SELECT count(*) FROM ai_memories) FROM ai_conversations", [],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
     )?)).await.unwrap();
-    assert_eq!(summary_cursor, memory_cursor);
+    // Facts now include recent complete messages independently of summary retention.
+    // Resuming summaries covers only the old prefix and must not move facts backward.
+    assert_eq!(summary_cursor, summarized_through);
+    assert_eq!(memory_cursor, learned_through);
+    assert!(summary_cursor < memory_cursor);
     assert_eq!(memories, 1);
     router
         .dispatch(message(8, "use-restored-summary"))
@@ -312,6 +381,9 @@ async fn facts_continue_with_summary_off_and_summary_resumes_without_relearning(
             .to_string()
             .contains("summary-restored-marker")
     );
+    for recent in ["background-5", "background-6"] {
+        assert!(request.body["messages"].to_string().contains(recent));
+    }
     request
         .reply
         .send(answer("summary-used-successfully"))

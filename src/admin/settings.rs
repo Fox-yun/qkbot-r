@@ -244,6 +244,20 @@ impl ConfigStore {
         Ok((cache.effective.clone(), cache.revision.clone()))
     }
 
+    /// A preview must bind its effective credential and environment notice to
+    /// the same configuration snapshot. The credential never enters a response.
+    pub async fn llm_config_with_revision(&self) -> Result<(crate::llm::LlmConfig, String, bool)> {
+        let cache = self
+            .cached
+            .read()
+            .map_err(|_| anyhow::anyhow!("配置缓存不可用"))?;
+        Ok((
+            cache.effective.llm.clone(),
+            cache.revision.clone(),
+            cache.snapshot["secrets"]["llm_api_key"]["env_set"] == true,
+        ))
+    }
+
     pub async fn effective(&self) -> Result<Config> {
         self.effective_with_revision()
             .await
@@ -338,7 +352,7 @@ fn initialize(path: PathBuf, environment: &Environment) -> Result<PathBuf> {
     }
     let path = fs::canonicalize(path).context("无法定位配置文件")?;
     let bytes = read_file(&path)?;
-    validate_stored(&parse(&bytes)?)?;
+    validate_readable(&parse(&bytes)?)?;
     effective(&path, &bytes, environment)?;
     Ok(path)
 }
@@ -360,7 +374,7 @@ fn effective(path: &Path, bytes: &[u8], environment: &Environment) -> Result<Con
             .context("数据库路径不是有效UTF-8")?
             .to_owned();
     }
-    validate_stored(&config)?;
+    validate_readable(&config)?;
     Ok(config)
 }
 
@@ -376,7 +390,8 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
     let mut config = parse(bytes)?;
     // External editors can bypass save validation. Reject invalid endpoints before
     // serializing them, including URLs that accidentally contain userinfo secrets.
-    validate_stored(&config)?;
+    validate_readable(&config)?;
+    let tool_catalog = crate::plugins::tool_catalog(&config)?;
     let secrets = json!({
         "llm_api_key": secret_status(&config.llm.api_key, &environment.llm_api_key),
         "milky_access_token": secret_status(config.milky.access_token.as_deref().unwrap_or(""), &environment.milky_access_token),
@@ -388,7 +403,11 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
     config.qq_login.token.clear();
     let mut config = serde_json::to_value(config)?;
     config["web"].as_object_mut().unwrap().remove("token");
-    Ok(json!({ "config": config, "revision": revision(bytes), "secrets": secrets }))
+    Ok(json!({
+        "config": config, "revision": revision(bytes), "secrets": secrets,
+        "persona_templates": crate::personas::templates(),
+        "tool_catalog": tool_catalog,
+    }))
 }
 
 fn change_secret(original: &str, change: &SecretChange) -> Result<String> {
@@ -483,6 +502,32 @@ fn save_file_cached(
     Ok(cached)
 }
 
+/// Removed persona/tool selections must remain repairable in the administrator
+/// UI. Only this validation clone is adjusted; original selections remain in
+/// the snapshot and runtime/save validation stays strict.
+fn validate_readable(config: &Config) -> Result<()> {
+    let catalog = crate::plugins::tool_catalog(config)?;
+    let mut validation = config.clone();
+    if validation
+        .plugins
+        .ai
+        .persona(&validation.plugins.ai.defaults.persona)
+        .is_none()
+    {
+        validation.plugins.ai.personas.insert(
+            validation.plugins.ai.defaults.persona.clone(),
+            "unavailable persona; validation only".into(),
+        );
+    }
+    validation
+        .plugins
+        .ai
+        .defaults
+        .allowed_tools
+        .retain(|name| catalog.iter().any(|entry| entry.name == name));
+    validate_stored(&validation)
+}
+
 /// Local shape and safety checks only. An unfinished model setup must not make
 /// its own administration page unavailable or create new HTTP clients on reads.
 fn validate_stored(config: &Config) -> Result<()> {
@@ -509,6 +554,16 @@ fn validate_stored(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_access_blocks_admin_loading_without_rewriting_the_file() {
+        let (_directory, path, _) = fixture();
+        let mut old = std::fs::read_to_string(&path).unwrap();
+        old.push_str("\n[access]\ngroups = [123]\nfriends = []\n");
+        std::fs::write(&path, &old).unwrap();
+        assert!(ConfigStore::open(&path).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+    }
 
     #[tokio::test]
     async fn milky_generation_changes_only_for_transport_changes_and_detects_a_b_a() {
@@ -598,6 +653,201 @@ mod tests {
         let view = snapshot(&read_file(path).unwrap(), environment).unwrap();
         serde_json::from_value(json!({"revision":view["revision"],"config":view["config"]}))
             .unwrap()
+    }
+
+    #[test]
+    fn tool_catalog_lists_disabled_providers_without_mutating_config_or_revision() {
+        let (_directory, path, environment) = fixture();
+        let mut config = Config::load_raw(&path).unwrap();
+        config.plugins.clock.enabled = false;
+        config.plugins.reminder.enabled = false;
+        config.plugins.ai.defaults.allowed_tools.clear();
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let before = read_file(&path).unwrap();
+        let view = snapshot(&before, &environment).unwrap();
+        let catalog = crate::plugins::tool_catalog(&config).unwrap();
+        assert_eq!(view["tool_catalog"], json!(catalog));
+        assert_eq!(catalog.len(), 4);
+        assert_eq!(view["revision"], revision(&before));
+        assert!(view["config"].get("tool_catalog").is_none());
+        assert_eq!(
+            view["config"]["plugins"]["ai"]["defaults"]["allowed_tools"],
+            json!([])
+        );
+        assert!(
+            !view["config"]["plugins"]["clock"]["enabled"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            !view["config"]["plugins"]["reminder"]["enabled"]
+                .as_bool()
+                .unwrap()
+        );
+        for entry in &catalog {
+            assert!(!entry.name.is_empty() && !entry.description.is_empty());
+            assert!(matches!(entry.plugin_id, "clock" | "reminder"));
+            let value = serde_json::to_value(entry).unwrap();
+            assert!(matches!(
+                value["effect"].as_str(),
+                Some("read" | "local_write")
+            ));
+            assert_eq!(value.as_object().unwrap().len(), 4);
+        }
+        assert_eq!(snapshot(&before, &environment).unwrap(), view);
+        assert_eq!(read_file(&path).unwrap(), before);
+        // The display catalog is never accepted as writable configuration.
+        assert!(
+            serde_json::from_value::<SaveRequest>(json!({
+                "revision":view["revision"],"config":view["config"],"tool_catalog":[]
+            }))
+            .is_err()
+        );
+        let update = request(&path, &environment);
+        save_file(&path, update, &environment).unwrap();
+        let saved = Config::load_raw(&path).unwrap();
+        assert!(saved.plugins.ai.defaults.allowed_tools.is_empty());
+        assert!(!saved.plugins.clock.enabled && !saved.plugins.reminder.enabled);
+    }
+
+    #[test]
+    fn removed_tools_are_readable_for_repair_but_cannot_be_saved_or_run() {
+        let (_directory, path, environment) = fixture();
+        let mut config = Config::load_raw(&path).unwrap();
+        config.plugins.ai.defaults.allowed_tools = vec!["clock_now".into(), "removed_tool".into()];
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let before = read_file(&path).unwrap();
+        let view = snapshot(&before, &environment).unwrap();
+        assert_eq!(
+            view["config"]["plugins"]["ai"]["defaults"]["allowed_tools"],
+            json!(["clock_now", "removed_tool"])
+        );
+        assert!(
+            view["tool_catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["name"] != "removed_tool")
+        );
+        assert!(effective(&path, &before, &environment).is_ok());
+        assert!(crate::plugins::assemble(&config).is_err());
+        let update = request(&path, &environment);
+        assert!(save_file(&path, update, &environment).is_err());
+        assert_eq!(read_file(&path).unwrap(), before);
+        let mut repaired = request(&path, &environment);
+        repaired.config.plugins.ai.defaults.allowed_tools = vec!["clock_now".into()];
+        save_file(&path, repaired, &environment).unwrap();
+        let saved = Config::load_raw(&path).unwrap();
+        assert_eq!(saved.plugins.ai.defaults.allowed_tools, ["clock_now"]);
+        assert!(crate::plugins::assemble(&saved).is_ok());
+    }
+
+    #[test]
+    fn persona_catalog_is_read_only_metadata_and_selections_preserve_overrides() {
+        let (_directory, path, environment) = fixture();
+        let mut configured = Config::load_raw(&path).unwrap();
+        configured.plugins.ai.defaults.persona = "我的自定义".into();
+        configured.plugins.ai.personas = std::collections::BTreeMap::from([
+            ("我的自定义".into(), "原有自定义表达".into()),
+            ("清朗青年".into(), "同名自定义表达优先".into()),
+        ]);
+        fs::write(&path, toml::to_string(&configured).unwrap()).unwrap();
+        let original = read_file(&path).unwrap();
+        let view = snapshot(&original, &environment).unwrap();
+        assert_eq!(
+            view["persona_templates"],
+            json!(crate::personas::templates())
+        );
+        assert!(view["config"].get("persona_templates").is_none());
+        assert_eq!(
+            view["config"]["plugins"]["ai"]["defaults"]["persona"],
+            "我的自定义"
+        );
+        assert_eq!(read_file(&path).unwrap(), original);
+        // The catalog is not a required save field and must never overwrite the
+        // configured text when an administrator chooses a built-in by name.
+        let mut update = request(&path, &environment);
+        update.config.plugins.ai.defaults.persona = "清朗青年".into();
+        save_file(&path, update, &environment).unwrap();
+        let stored = Config::load_raw(&path).unwrap();
+        assert_eq!(stored.plugins.ai.defaults.persona, "清朗青年");
+        assert_eq!(stored.plugins.ai.personas, configured.plugins.ai.personas);
+        assert_eq!(
+            stored.plugins.ai.persona("清朗青年"),
+            Some("同名自定义表达优先")
+        );
+        let original = read_file(&path).unwrap();
+        let mut invalid = request(&path, &environment);
+        invalid.config.plugins.ai.defaults.persona = "未定义的人设".into();
+        assert!(save_file(&path, invalid, &environment).is_err());
+        assert_eq!(read_file(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn missing_persona_is_readable_for_repair_but_never_saved_or_run() {
+        let (_directory, path, environment) = fixture();
+        let mut old = Config::load_raw(&path).unwrap();
+        old.plugins.ai.defaults.persona = "默认".into();
+        old.plugins.ai.personas.clear();
+        fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
+        let original = read_file(&path).unwrap();
+        let store = ConfigStore::open(&path).await.unwrap();
+        for view in [
+            store.cached_snapshot().await.unwrap(),
+            store.reload().await.unwrap(),
+        ] {
+            assert_eq!(
+                view["config"]["plugins"]["ai"]["defaults"]["persona"],
+                "默认"
+            );
+            assert_eq!(view["config"]["plugins"]["ai"]["personas"], json!({}));
+            assert_eq!(
+                view["persona_templates"],
+                json!(crate::personas::templates())
+            );
+        }
+        assert_eq!(read_file(&path).unwrap(), original);
+        let effective = store.effective().await.unwrap();
+        assert!(effective.plugins.ai.personas.is_empty());
+        assert!(effective.validate_runtime().is_err());
+        assert!(save_file(&path, request(&path, &environment), &environment).is_err());
+        let mut unknown = request(&path, &environment);
+        unknown.config.plugins.ai.defaults.persona = "still-not-defined".into();
+        unknown.config.plugins.ai.enabled = false;
+        assert!(store.save(unknown).await.is_err());
+        assert_eq!(read_file(&path).unwrap(), original);
+        let mut repaired = request(&path, &environment);
+        repaired.config.plugins.ai.defaults.persona = "雄小鬼".into();
+        store.save(repaired).await.unwrap();
+        store.effective().await.unwrap().validate_runtime().unwrap();
+        assert_eq!(
+            Config::load_raw(&path).unwrap().plugins.ai.defaults.persona,
+            "雄小鬼"
+        );
+        assert!(
+            Config::load_raw(&path)
+                .unwrap()
+                .plugins
+                .ai
+                .personas
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_persona_read_exception_does_not_hide_other_invalid_configuration() {
+        let (_directory, path, environment) = fixture();
+        let mut config = Config::load_raw(&path).unwrap();
+        config.plugins.ai.defaults.persona = "removed".into();
+        config.plugins.ai.personas.clear();
+        config.llm.chat_completions_url = "https://fixture-secret@example.invalid/model".into();
+        let encoded = toml::to_string(&config).unwrap();
+        let error = snapshot(encoded.as_bytes(), &environment).unwrap_err();
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert!(effective(&path, encoded.as_bytes(), &environment).is_err());
+        config.llm.chat_completions_url = "https://api.example.invalid/chat/completions".into();
+        config.plugins.ai.defaults.input_budget = 0;
+        assert!(snapshot(toml::to_string(&config).unwrap().as_bytes(), &environment).is_err());
     }
 
     #[test]

@@ -10,6 +10,8 @@
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
     pendingOperation: null,
+    personaTemplates: {}, personaSelected: null, toolCatalog: [],
+    models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
   const inputs = new Map();
@@ -38,10 +40,10 @@
   // Definitions build ordinary DOM elements; configuration and server data never become HTML.
   const field = (path, label, type = "text", hint = "", options = {}) => ({ path, label, type, hint, ...options });
   const groups = [
-    { title: "模型接口", description: "兼容 Chat Completions 的远程 API；管理台不会自动发送试聊请求。", fields: [
-      field("llm.chat_completions_url", "完整 API 地址", "text", "填写完整路径，例如 https://服务商/v1/chat/completions。", { full: true, placeholder: "https://…/v1/chat/completions" }),
-      field("llm.model", "模型名称", "text", "使用服务商提供的准确模型 ID。"),
+    { title: "模型接口", description: "兼容 Chat Completions 的远程 API；获取模型列表不会保存密钥或发送聊天请求。", models: true, fields: [
+      field("llm.chat_completions_url", "API 地址", "text", "可填写基础地址或 /v1 后获取模型列表，成功后补全聊天接口路径。直接手填模型时，请使用服务商的完整聊天接口地址。", { full: true, placeholder: "https://…/v1 或 https://…/v1/chat/completions" }),
       { secret: "llm_api_key", label: "模型 API 密钥" },
+      field("llm.model", "手动填写模型名称", "text", "使用服务商提供的准确模型 ID；获取列表不会替换当前模型。"),
       field("llm.max_concurrent_requests", "最大并发请求", "number", "前台聊天和后台整理共用请求额度。", { min: 1 }),
       field("llm.request_timeout_secs", "单次请求超时（秒）", "number", "", { min: 1 }),
       field("llm.tool_calling", "启用原生工具调用", "check", "模型需支持工具调用；工具仍由宿主检查权限和执行结果。"),
@@ -60,14 +62,15 @@
     { title: "会话与触发", description: "真实 @机器人、私聊或关键词可触发聊天。每个会话的 Bot 开关在「群与好友」中管理。", fields: [
       field("plugins.ai.keywords", "关键词触发", "lines", "每行一个；子串匹配。清空后仍可通过真实 @或私聊触发。"),
       field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有会话在「记忆与上下文」中单独管理。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
-      field("plugins.ai.defaults.persona", "默认人设名称", "text", "必须与下方人设表中的名称对应。"),
-      field("plugins.ai.personas", "人设表", "json", "JSON 对象：名称对应人设文本。所有名称和文本均可编辑。", { full: true }),
+    ] },
+    { title: "人设", description: "从列表选择默认人设，也可编辑自定义内容。会话可单独选择已保存的人设。", personas: true, fields: [
+      field("plugins.ai.defaults.persona", "默认人设", "persona", "选择后随配置一起保存；下方可预览模板和编辑自定义人设。", { full: true }),
     ] },
     { title: "上下文与记忆", description: "摘要、长期记忆读取和写入分别控制；输入预算采用保守字节估算。", fields: [
       field("plugins.ai.defaults.input_budget", "输入预算（估算）", "number", "", { min: 1024, max: 262144 }),
       field("plugins.ai.defaults.output_budget", "回复 token 上限", "number", "同时受模型及消息长度限制。", { min: 64, max: 32768 }),
       field("plugins.ai.defaults.recent_messages", "最近历史消息数", "number", "设为 0 时不载入最近原文。", { min: 0, max: 4096 }),
-      field("plugins.ai.defaults.allowed_tools", "允许模型使用的工具", "lines", "每行一个已注册工具名，例如 clock_now。"),
+      field("plugins.ai.defaults.allowed_tools", "允许模型使用的工具", "tools", "自动读取已注册工具，保存并应用后生效。不勾选即禁用全部工具；关闭插件会保留已有选择。", { full: true }),
       field("plugins.ai.defaults.summary", "生成并使用历史摘要", "check", "关闭后不生成或注入摘要，按历史条数读取原文。"),
       field("plugins.ai.defaults.memory_read", "检索长期记忆", "check", "将相关的、属于当前会话和用户的记忆加入回答。"),
       field("plugins.ai.defaults.memory_write", "自动提炼长期记忆", "check", "只接受带有效原文证据的事实变更。"),
@@ -177,12 +180,12 @@
   }
 
   function secretSnapshot() {
-    return Object.fromEntries([...secretInputs].map(([name, controls]) => [name, { action: controls.action.value, value: controls.value.value }]));
+    return Object.fromEntries([...secretInputs].map(([name, controls]) => [name, { clear: controls.clear, value: controls.value.value, undoValue: controls.undoValue }]));
   }
 
   function describeSecret(name) {
     const meta = state.secrets[name];
-    if (!meta) return "未读取到密钥状态；保持原值不会修改现有配置。";
+    if (!meta) return "未读取到密钥状态。";
     if (meta.env_set) return "当前由环境变量提供。文件中的修改不会覆盖环境变量。";
     if (meta.file_set) return "配置文件已设置；密钥不会回传到页面。";
     if (meta.effective_set) return `当前已配置（来源：${String(meta.source || "服务端")}）。`;
@@ -193,30 +196,219 @@
     const wrapper = element("div", "field");
     const id = `secret-${definition.secret}`;
     const label = element("label", "", definition.label);
-    label.htmlFor = `${id}-action`;
+    label.htmlFor = id;
     wrapper.append(label);
-    const row = element("div", "secret-row");
-    const action = document.createElement("select");
-    action.id = `${id}-action`;
-    for (const [value, title] of [["keep", "保持原值"], ["set", "设置新值"], ["clear", "清除文件值"]]) {
-      const option = element("option", "", title); option.value = value; action.append(option);
-    }
     const input = document.createElement("input");
     input.id = id; input.type = "password"; input.autocomplete = "off";
     input.spellcheck = false; input.setAttribute("aria-label", `${definition.label}新值`);
-    input.placeholder = "选择设置新值后输入";
-    action.value = pending?.action || "keep"; input.value = pending?.value || "";
-    input.disabled = action.value !== "set";
-    row.append(action, input);
-    wrapper.append(row, element("p", "hint secret-state", describeSecret(definition.secret)));
-    secretInputs.set(definition.secret, { action, value: input, label: definition.label });
-    action.addEventListener("change", () => {
-      input.disabled = action.value !== "set";
-      if (action.value !== "set") input.value = "";
-      markDirty();
+    input.placeholder = "留空保持原密钥，填写即更新"; input.value = pending?.value || "";
+    const clearButton = element("button", "text-button secret-clear", "清除已保存密钥"); clearButton.type = "button";
+    const status = element("p", "hint secret-state");
+    const controls = { value: input, clear: Boolean(pending?.clear), undoValue: pending?.undoValue || "", clearButton, status, label: definition.label };
+    const refresh = () => {
+      clearButton.textContent = controls.clear ? "撤销清除" : "清除已保存密钥";
+      status.textContent = describeSecret(definition.secret) + (controls.clear ? " 已标记清除文件中的密钥，保存后生效。" : " 留空保持原密钥，输入后随配置保存。");
+    };
+    wrapper.append(input, clearButton, status); secretInputs.set(definition.secret, controls); refresh();
+    const changed = () => { if (definition.secret === "llm_api_key") invalidateModels(); refresh(); markDirty(); };
+    clearButton.addEventListener("click", () => {
+      if (controls.clear) { controls.clear = false; input.value = controls.undoValue; controls.undoValue = ""; }
+      else { controls.clear = true; controls.undoValue = input.value; input.value = ""; }
+      changed();
     });
-    input.addEventListener("input", markDirty);
+    input.addEventListener("input", () => { controls.clear = false; controls.undoValue = ""; changed(); });
     return wrapper;
+  }
+
+  function secretChange(controls) {
+    if (controls.clear) return { action: "clear" };
+    const value = controls.value.value;
+    if (!value) return { action: "keep" };
+    if (!value.trim()) throw new Error(`「${controls.label}」不能只包含空白；留空可保持原密钥。`);
+    return { action: "set", value };
+  }
+
+  function invalidateModels() {
+    state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
+    renderModels();
+  }
+  function renderModels() {
+    const model = inputs.get("llm.model"), list = $("model-list"), current = model?.control.value || "";
+    list.replaceChildren();
+    if (!state.models.items.includes(current)) {
+      const option = element("option", "", current ? `当前手动值：${current}` : "请选择模型（保留空值直到选择）"); option.value = current; list.append(option);
+    }
+    for (const id of state.models.items) { const option = element("option", "", id); option.value = id; list.append(option); }
+    list.value = current;
+    $("models-select-row").hidden = !state.models.items.length;
+    $("manual-model").textContent = state.models.manual ? "收起手动输入" : "手动输入模型名称";
+    if (model) model.wrapper.hidden = !state.models.manual && Boolean(state.models.items.length);
+    $("models-message").textContent = state.models.message || (state.models.loading ? "正在获取模型列表…" : "按需获取，可继续手动填写模型。列表中的模型是否支持聊天，以服务商说明为准。");
+    $("models-message").className = "hint models-message" + (state.models.kind === "error" ? " error-text" : "");
+    $("fetch-models").textContent = state.models.loading ? "获取中…" : "获取模型列表";
+    updateControls();
+  }
+  function modelsCurrent(request) {
+    try {
+      return state.authenticated && state.session === request.session && state.models.version === request.version && state.revision === request.revision
+        && inputs.get("llm.chat_completions_url")?.control.value.trim() === request.url
+        && canonical(secretChange(secretInputs.get("llm_api_key"))) === request.key;
+    } catch { return false; }
+  }
+  async function fetchModels() {
+    if (!state.authenticated || !state.config || state.models.loading || state.busy || state.jsonDirty || state.pendingOperation || state.stale) return;
+    let request;
+    try {
+      const url = inputs.get("llm.chat_completions_url").control.value.trim(), key = secretChange(secretInputs.get("llm_api_key"));
+      if (!url) throw new Error("请先填写 API 地址。");
+      request = { session: state.session, version: state.models.version, revision: state.revision, url, key: canonical(key) };
+      state.models.loading = true; state.models.message = ""; state.models.kind = ""; renderModels();
+      const result = await api("/api/llm/models", "POST", { revision: request.revision, url, api_key: key });
+      if (!modelsCurrent(request)) return;
+      const ids = result.models;
+      if (!Array.isArray(ids) || ids.length > 4096 || ids.some((id) => typeof id !== "string" || !id || id.trim() !== id || new TextEncoder().encode(id).length > 256 || /[\p{Cc}]/u.test(id))) throw new Error("服务返回的模型列表格式无效，请手动填写模型名称。");
+      const endpoint = new URL(result.chat_completions_url), origin = new URL(url);
+      if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.origin !== origin.origin || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error("服务返回的聊天接口地址无效，原地址已保留。");
+      state.models.items = [...new Set(ids)]; state.models.manual = !ids.length;
+      const control = inputs.get("llm.chat_completions_url").control;
+      if (control.value !== result.chat_completions_url) { control.value = result.chat_completions_url; markDirty(); }
+      const source = { temporary: "本次使用填写的新密钥。", environment: "本次使用环境变量中的密钥。", file: "本次使用已保存密钥。", none: "本次未使用密钥。" }[result.key_source] || "";
+      state.models.message = (ids.length ? `已获取 ${state.models.items.length} 个模型，请从列表选择；当前模型保持不变。` : "服务未返回可用模型，请手动填写模型名称。") + source
+        + (result.environment_overrides_saved_key ? " 保存后，环境变量仍优先于文件中的密钥。" : "");
+    } catch (error) {
+      if (request && !modelsCurrent(request)) return;
+      if (error.status === -1 || error.code === "auth_required") return;
+      state.models.message = error.message || "未能获取模型列表，请手动填写模型名称。"; state.models.kind = "error";
+      if (error.code === "models_stale") state.models.message += " 请先保留本页草稿，再重新载入配置。";
+      if (error.code === "csrf_invalid") report(error);
+    } finally {
+      state.models.loading = false; renderModels();
+    }
+  }
+
+  function validatePersonaMap(value, requireText = true) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.entries(value).some(([name, text]) => !name.trim() || typeof text !== "string" || (requireText && !text.trim()))) throw new Error("自定义人设需要有效名称和非空正文。");
+  }
+
+  function validateToolCatalog(value) {
+    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "local_write"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
+  }
+  function toolUnavailable(tool, mode) {
+    if (!tool) return "未注册的旧工具，可取消选择";
+    const config = mode === "global" ? state.draft : state.config;
+    const plugins = config?.plugins;
+    const configured = plugins && Object.hasOwn(plugins, tool.plugin_id) && plugins[tool.plugin_id]?.enabled === true;
+    const enabled = mode === "global" ? inputs.get(`plugins.${tool.plugin_id}.enabled`)?.control.checked ?? configured : configured;
+    if (!enabled) return "所属插件已关闭";
+    if (mode === "conversation" && !config?.plugins?.ai?.defaults?.allowed_tools?.includes(tool.name)) return "未在已保存的全局配置中启用";
+    return "";
+  }
+  function toolPickerBlocked(mode) {
+    return state.busy || !state.authenticated || !state.config || Boolean(state.pendingOperation)
+      || (mode === "global" ? state.jsonDirty : !state.memory.detail || state.memory.conflict);
+  }
+  function updateToolPicker(control) {
+    const picker = control.toolPicker; if (!picker) return;
+    for (const [name, row] of picker.rows) row.checkbox.disabled = toolPickerBlocked(picker.mode) || (Boolean(row.unavailable) && !picker.selected.has(name));
+    const unavailable = [...picker.selected].filter((name) => picker.rows.get(name)?.unavailable).length;
+    picker.summary.textContent = picker.selected.size ? `已勾选 ${picker.selected.size} 项` + (unavailable ? `，其中 ${unavailable} 项当前不可用；已有选择保留，可取消。` : "。") : "未勾选任何工具：禁用全部工具。";
+    const toolCalling = picker.mode === "global" ? inputs.get("llm.tool_calling")?.control.checked ?? state.draft?.llm?.tool_calling : state.config?.llm?.tool_calling;
+    if (toolCalling === false) picker.summary.textContent += " 原生工具调用已关闭，勾选项暂不会用于模型调用。";
+  }
+  function renderToolPicker(control, selected, mode) {
+    const selection = new Set(selected ?? control.toolPicker?.selected ?? []);
+    const catalog = new Map(state.toolCatalog.map((tool) => [tool.name, tool]));
+    const names = [...catalog.keys(), ...[...selection].filter((name) => !catalog.has(name))];
+    const rows = new Map(), summary = element("p", "hint tool-summary"); summary.setAttribute("aria-live", "polite");
+    control.toolPicker = { selected: selection, mode, rows, summary }; control.replaceChildren();
+    for (const name of names) {
+      const tool = catalog.get(name), unavailable = toolUnavailable(tool, mode);
+      const label = element("label", "tool-option" + (unavailable ? " unavailable" : ""));
+      const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.checked = selection.has(name); checkbox.dataset.toolName = name;
+      checkbox.setAttribute("aria-label", name + (unavailable ? "，" + unavailable : ""));
+      const copy = element("span", "tool-copy"); copy.append(element("strong", "tool-name", name));
+      if (tool) {
+        copy.append(element("span", "tool-meta", `${tool.effect === "read" ? "只读" : "本地写入"} · ${tool.plugin_id}`));
+        copy.append(element("span", "tool-description", tool.description));
+      }
+      if (unavailable) copy.append(element("span", "tool-warning", unavailable));
+      label.append(checkbox, copy); control.append(label); rows.set(name, { checkbox, unavailable });
+      checkbox.addEventListener("change", () => {
+        if (toolPickerBlocked(mode) || (checkbox.checked && toolUnavailable(catalog.get(name), mode))) { checkbox.checked = selection.has(name); updateToolPicker(control); return; }
+        if (checkbox.checked) selection.add(name); else selection.delete(name);
+        updateToolPicker(control);
+        if (mode === "global") markDirty(); else { state.memory.settingsDirty = true; updateControls(); }
+      });
+    }
+    if (!names.length) control.append(element("p", "hint", "当前没有已注册的工具。"));
+    control.append(summary); updateToolPicker(control);
+  }
+  function refreshToolPickers() {
+    const global = inputs.get("plugins.ai.defaults.allowed_tools")?.control;
+    if (global) renderToolPicker(global, undefined, "global");
+    const conversation = settingInputs.get("allowed_tools")?.input;
+    if (conversation) renderToolPicker(conversation, undefined, "conversation");
+  }
+  function readToolPicker(control) { return [...control.toolPicker.selected]; }
+  function personaChoices(config) {
+    return new Map([...Object.entries(state.personaTemplates), ...Object.entries(config?.plugins?.ai?.personas || {})]);
+  }
+  function requirePersona(config, name, label = "人设") {
+    if (!personaChoices(config).has(name)) throw new Error(`「${label}」已失效，请从列表重新选择。`);
+  }
+  function fillPersonaSelect(control, selected, config) {
+    const choices = personaChoices(config); control.replaceChildren();
+    if (!choices.has(selected)) {
+      const missing = element("option", "", selected ? `已失效：${selected}（请重新选择）` : "请选择人设");
+      missing.value = selected ?? ""; missing.disabled = true; control.append(missing);
+    }
+    for (const name of choices.keys()) {
+      const custom = Object.hasOwn(config?.plugins?.ai?.personas || {}, name);
+      const option = element("option", "", name + (custom ? " · 自定义" : " · 内置模板")); option.value = name; control.append(option);
+    }
+    control.value = selected ?? ""; control.setAttribute("aria-invalid", String(!choices.has(selected)));
+  }
+  function refreshPersonaSelectors() {
+    const defaults = inputs.get("plugins.ai.defaults.persona")?.control;
+    if (defaults) fillPersonaSelect(defaults, defaults.value, state.draft);
+    const conversation = settingInputs.get("persona")?.input;
+    if (conversation) fillPersonaSelect(conversation, conversation.value, state.config);
+  }
+  function renderPersonaLibrary() {
+    const choices = personaChoices(state.draft), list = $("persona-list"); list.replaceChildren();
+    if (!choices.has(state.personaSelected)) state.personaSelected = choices.has(state.draft?.plugins?.ai?.defaults?.persona) ? state.draft.plugins.ai.defaults.persona : choices.keys().next().value ?? null;
+    for (const name of choices.keys()) {
+      const custom = Object.hasOwn(state.draft.plugins.ai.personas, name);
+      const option = element("option", "", name + (custom ? " · 自定义" : " · 内置模板")); option.value = name; list.append(option);
+    }
+    list.value = state.personaSelected ?? ""; renderPersonaPreview();
+  }
+  function renderPersonaPreview() {
+    const name = state.personaSelected, choices = personaChoices(state.draft);
+    const custom = name != null && Object.hasOwn(state.draft?.plugins?.ai?.personas || {}, name);
+    $("persona-title").textContent = name == null ? "人设正文" : name;
+    $("persona-text").value = choices.get(name) ?? "";
+    badge("persona-source", name == null ? "选择人设" : custom ? "自定义" : "内置模板", custom ? "good" : "neutral");
+    $("persona-editor-hint").textContent = custom ? "编辑内容会保留在本页草稿，切换人设不会丢失。随配置保存并应用后生效。" : "内置模板可直接使用；需要调整时，先另存为自定义。";
+    updateControls();
+  }
+  function createPersona(copy = false) {
+    if (!state.draft || state.busy || state.jsonDirty || state.pendingOperation) return;
+    const name = $("persona-new-name").value.trim(), choices = personaChoices(state.draft);
+    if (!name) throw new Error("请填写新自定义人设的名称。");
+    if (Object.hasOwn(state.draft.plugins.ai.personas, name)) throw new Error("同名自定义人设已存在，请从列表选择编辑，或换一个名称。");
+    if (copy && !choices.has(state.personaSelected)) throw new Error("请先选择要另存的人设。");
+    if (choices.has(name) && !window.confirm("保存同名自定义后将优先使用自定义正文。确定继续？")) return;
+    Object.defineProperty(state.draft.plugins.ai.personas, name, { value: copy ? choices.get(state.personaSelected) : "", enumerable: true, writable: true, configurable: true });
+    state.personaSelected = name; $("persona-new-name").value = ""; $("persona-error").textContent = "";
+    renderPersonaLibrary(); refreshPersonaSelectors(); markDirty();
+  }
+  function deletePersona() {
+    const name = state.personaSelected;
+    if (!state.draft || state.busy || state.jsonDirty || state.pendingOperation || !Object.hasOwn(state.draft.plugins.ai.personas, name)) return;
+    if (!window.confirm(`删除自定义人设「${name}」？${Object.hasOwn(state.personaTemplates, name) ? "同名内置模板将恢复使用。" : "引用它的默认或会话人设需要重新选择。"}保存并应用配置后生效。`)) return;
+    delete state.draft.plugins.ai.personas[name]; $("persona-error").textContent = "";
+    renderPersonaLibrary(); refreshPersonaSelectors(); markDirty();
   }
 
   function configField(definition) {
@@ -224,10 +416,15 @@
     const id = `field-${definition.path.replaceAll(".", "-")}`;
     const label = element("label", "", definition.label); label.htmlFor = id;
     let control;
-    if (["lines", "ids", "json"].includes(definition.type)) {
+    if (definition.type === "tools") {
+      control = element("div", "tool-choices"); control.setAttribute("role", "group"); control.setAttribute("aria-label", definition.label);
+    } else if (["lines", "ids", "json"].includes(definition.type)) {
       control = document.createElement("textarea");
       control.rows = definition.type === "json" ? 5 : 3;
       control.spellcheck = false;
+    } else if (definition.type === "persona") {
+      control = document.createElement("select"); control.required = true;
+      fillPersonaSelect(control, get(state.draft, definition.path), state.draft);
     } else if (definition.type === "select") {
       control = document.createElement("select");
       for (const [value, title] of definition.choices) {
@@ -244,7 +441,8 @@
     control.id = id; control.autocomplete = "off";
     if (definition.placeholder) control.placeholder = definition.placeholder;
     const value = get(state.draft, definition.path);
-    if (definition.type === "check") control.checked = Boolean(value);
+    if (definition.type === "tools") renderToolPicker(control, value, "global");
+    else if (definition.type === "check") control.checked = Boolean(value);
     else if (definition.type === "json") control.value = JSON.stringify(value ?? {}, null, 2);
     else if (["lines", "ids"].includes(definition.type)) control.value = Array.isArray(value) ? value.join("\n") : "";
     else control.value = value == null ? "" : String(value);
@@ -252,12 +450,20 @@
     hint.id = `${id}-hint`; control.setAttribute("aria-describedby", hint.id);
     if (definition.type === "check") { const copy = element("div"); copy.append(label, hint); wrapper.append(control, copy); }
     else { wrapper.append(label, control); if (definition.hint) wrapper.append(hint); }
-    inputs.set(definition.path, { control, definition });
-    control.addEventListener("input", markDirty);
+    inputs.set(definition.path, { control, definition, wrapper });
+    control.addEventListener("input", () => {
+      if (definition.path === "llm.chat_completions_url") invalidateModels();
+      if (definition.path === "llm.model") renderModels();
+      if (definition.path.startsWith("plugins.") && definition.path.endsWith(".enabled")) refreshToolPickers();
+      markDirty();
+    });
+    if (definition.type === "persona") control.addEventListener("change", () => { control.setAttribute("aria-invalid", String(!personaChoices(state.draft).has(control.value))); markDirty(); });
     return wrapper;
   }
 
   function renderFields(pending = {}) {
+    const personaManager = $("persona-manager"), modelPicker = $("model-picker");
+    state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
     inputs.clear(); secretInputs.clear();
     $("config-groups").replaceChildren();
     groups.forEach((group, index) => {
@@ -266,19 +472,24 @@
       heading.append(element("span", "section-number", String(index + 1).padStart(2, "0")));
       const title = element("div"); title.append(element("h2", "", group.title), element("p", "", group.description)); heading.append(title);
       const grid = element("div", "field-grid");
-      for (const definition of group.fields) grid.append(definition.secret ? secretField(definition, pending[definition.secret]) : configField(definition));
-      card.append(heading, grid); $("config-groups").append(card);
+      for (const definition of group.fields) {
+        grid.append(definition.secret ? secretField(definition, pending[definition.secret]) : configField(definition));
+        if (group.models && definition.path === "llm.model") grid.append(modelPicker);
+      }
+      card.append(heading, grid); if (group.personas) card.append(personaManager); $("config-groups").append(card);
     });
     const web = state.config.web || {};
     $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
-    updateControls();
+    renderPersonaLibrary(); renderModels(); refreshToolPickers(); updateControls();
   }
 
   function readForm() {
     const config = clone(state.draft);
     for (const { control, definition: def } of inputs.values()) {
+      if (def.type === "tools") { put(config, def.path, readToolPicker(control)); continue; }
       let value = control.value.trim();
-      if (def.type === "check") value = control.checked;
+      if (def.type === "persona") { value = control.value; requirePersona(config, value, def.label); }
+      else if (def.type === "check") value = control.checked;
       else if (def.type === "number" || def.type === "nullableNumber") {
         if (def.type === "nullableNumber" && value === "") value = null;
         else {
@@ -300,7 +511,7 @@
       }
       put(config, def.path, value);
     }
-    validateImmutable(config);
+    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config);
     return config;
   }
 
@@ -318,13 +529,7 @@
 
   function secretChanges() {
     const changes = {};
-    for (const [name, controls] of secretInputs) {
-      const action = controls.action.value;
-      if (action === "set") {
-        if (!controls.value.value.trim()) throw new Error(`请填写「${controls.label}」新值，或选择保持原值。`);
-        changes[name] = { action, value: controls.value.value };
-      } else changes[name] = { action };
-    }
+    for (const [name, controls] of secretInputs) changes[name] = secretChange(controls);
     return changes;
   }
 
@@ -350,6 +555,7 @@
     let config;
     try { config = JSON.parse($("config-json").value); } catch { throw new Error("完整 JSON 格式无效，请修正后再采用或保存。"); }
     validateImmutable(config);
+    validatePersonaMap(get(config, "plugins.ai.personas"));
     // Validate represented fields before replacing the UI, so malformed nested
     // objects cannot silently disappear into the editable form.
     for (const group of groups) for (const def of group.fields) {
@@ -359,7 +565,7 @@
         : def.type === "number" ? Number.isSafeInteger(value)
           : def.type === "nullableNumber" ? value === null || Number.isSafeInteger(value)
             : def.type === "ids" ? Array.isArray(value) && value.every((entry) => Number.isSafeInteger(entry) && entry > 0)
-              : def.type === "lines" ? Array.isArray(value) && value.every((entry) => typeof entry === "string")
+              : ["lines", "tools"].includes(def.type) ? Array.isArray(value) && value.every((entry) => typeof entry === "string")
                 : def.type === "json" ? value && typeof value === "object" && !Array.isArray(value) && Object.values(value).every((entry) => typeof entry === "string")
                   : typeof value === "string";
       if (!valid) throw new Error(`JSON 字段 ${def.path} 的类型不正确。`);
@@ -378,7 +584,10 @@
     $("config-fields").disabled = unavailable || state.jsonDirty || pending;
     $("config-json").disabled = unavailable || pending || (!state.jsonDirty && state.formInvalid);
     $("dirty-label").textContent = state.stale ? "请先核对最新配置" : state.dirty || state.jsonDirty ? "有尚未保存的修改" : "配置已同步";
-    for (const id of ["save-config", "save-apply"]) $(id).disabled = unavailable || pending || state.stale;
+    for (const id of ["save-config", "save-config-top", "save-apply"]) $(id).disabled = unavailable || pending || state.stale;
+    const modelsBlocked = unavailable || state.jsonDirty || pending || state.stale;
+    $("fetch-models").disabled = modelsBlocked || state.models.loading;
+    $("model-list").disabled = modelsBlocked; $("manual-model").disabled = modelsBlocked;
     for (const id of ["connect-runtime", "apply-runtime", "stop-runtime"]) $(id).disabled = unavailable || pending || ["starting", "stopping"].includes(state.status?.phase);
     $("stop-runtime").disabled ||= state.status?.phase === "stopped";
     $("get-qr").disabled = unavailable || !canPollQq() || Boolean(state.qq?.online);
@@ -405,19 +614,29 @@
     document.querySelectorAll("#memory-editor-form input,#memory-editor-form select,#memory-editor-form textarea").forEach((node) => { node.disabled = state.busy || pending; });
     $("edit-memory-subject").disabled ||= Boolean(state.memory.editing?.id);
     $("edit-memory-locked").disabled ||= !state.memory.editing?.id;
+    const personaBlocked = unavailable || state.jsonDirty || pending;
+    const customPersona = state.draft?.plugins?.ai?.personas && Object.hasOwn(state.draft.plugins.ai.personas, state.personaSelected);
+    $("persona-list").disabled = personaBlocked; $("persona-new-name").disabled = personaBlocked;
+    $("persona-text").disabled = personaBlocked; $("persona-text").readOnly = !customPersona;
+    $("persona-new").disabled = personaBlocked; $("persona-copy").disabled = personaBlocked || !personaChoices(state.draft).has(state.personaSelected);
+    $("persona-delete").disabled = personaBlocked || !customPersona;
+    for (const control of [inputs.get("plugins.ai.defaults.allowed_tools")?.control, settingInputs.get("allowed_tools")?.input]) if (control) updateToolPicker(control);
     updateContactControls();
   }
 
   async function loadConfig() {
     const result = await api("/api/config");
     if (!result.config || typeof result.revision !== "string") throw new Error("配置响应缺少 config 或 revision。");
+    validatePersonaMap(result.persona_templates || {}, false); validatePersonaMap(get(result.config, "plugins.ai.personas"), false);
+    validateToolCatalog(result.tool_catalog ?? []); state.toolCatalog = clone(result.tool_catalog ?? []);
+    state.personaTemplates = clone(result.persona_templates || {});
     state.config = clone(result.config); state.draft = clone(result.config);
     state.revision = result.revision; state.secrets = result.secrets || {};
     state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
     resumeQqPolling(); clearQr();
     $("config-warning").hidden = true;
     $("saved-revision").textContent = "已保存版本：" + state.revision;
-    renderFields(); syncJson(); renderStatus(); renderQq(); scheduleQq(0);
+    renderFields(); refreshPersonaSelectors(); syncJson(); renderStatus(); renderQq(); scheduleQq(0);
   }
 
   function badge(id, text, kind) { $(id).textContent = text; $(id).className = "badge " + kind; }
@@ -508,14 +727,21 @@
   }
   async function refreshQq(manual = false) {
     if (!state.authenticated || !canPollQq() || document.hidden) return;
+    const previous = state.qq;
     if (manual) resumeQqPolling();
     if (state.qqPolling || state.qqPollingPaused) return;
     const version = state.qqQueryVersion, session = state.session; state.qqPolling = true;
     try {
       const result = await api("/api/qq/status" + (manual ? "?force=true" : ""));
       if (version !== state.qqQueryVersion) return;
-      const previous = state.qq;
-      if (state.contacts.botId && previous?.online && String(previous.uin) === state.contacts.botId && (!result.online || String(result.uin) !== state.contacts.botId)) invalidateContacts("QQ 登录状态或账号已变化，请登录后刷新联系人列表。", "offline");
+      if (state.contacts.botId) {
+        if (result.online && String(result.uin) !== state.contacts.botId) invalidateContacts("QQ 账号已变化，请刷新联系人列表。", "offline");
+        else if (!result.online && previous?.online && String(previous.uin) === state.contacts.botId) {
+          const c = state.contacts;
+          if (c.saving) invalidateContacts("QQ 已离线，开关结果需要恢复连接后刷新确认。", "offline");
+          else { c.version++; c.loading = false; c.phase = "cached"; c.message = "QQ 已离线，显示该账号的上次列表；仍可关闭 Bot，恢复连接并刷新后才能开启。"; renderContacts(); }
+        }
+      }
       state.qq = result; state.qqError = ""; state.qqFailures = 0;
       state.qqInterval = Math.max(result.online ? 30000 : 1000, Math.min(60000, Number(result.poll_interval_ms) || 5000));
       renderQq();
@@ -549,11 +775,11 @@
     $("contacts-search").disabled = !state.authenticated || c.loading;
     $("contacts-prev").disabled = blocked || c.loading || c.page <= 1;
     $("contacts-next").disabled = blocked || c.loading || c.page >= c.totalPages;
-    document.querySelectorAll("[data-contact-toggle]").forEach((input) => { input.disabled = blocked || c.phase !== "ready" || c.loading || Boolean(c.saving); });
+    document.querySelectorAll("[data-contact-toggle]").forEach((input) => { input.disabled = blocked || (c.phase !== "ready" && !(c.phase === "cached" && input.checked)) || c.loading || Boolean(c.saving); });
   }
   function renderContacts() {
     const c = state.contacts, name = c.scene === "group" ? "群聊" : "好友";
-    $("contacts-account").textContent = c.botId ? "QQ " + c.botId : "尚未读取";
+    $("contacts-account").textContent = c.botId ? (c.phase === "cached" ? "上次读取 QQ " : "QQ ") + c.botId : "尚未读取";
     $("contacts-updated").textContent = c.fetchedAt == null ? "按需读取 · 手动刷新" : "更新于 " + dateText(c.fetchedAt);
     for (const [id, scene, rows, title] of [["contacts-groups", "group", c.groups, "群聊"], ["contacts-friends", "friend", c.friends, "好友"]]) {
       const active = scene === c.scene;
@@ -599,6 +825,7 @@
     const c = state.contacts;
     if (!state.authenticated || state.view !== "contacts" || c.loading || c.saving) return;
     const session = state.session, version = ++c.version;
+    const previous = ["ready", "cached"].includes(c.phase) && c.botId ? { botId: c.botId, groups: c.groups, friends: c.friends, fetchedAt: c.fetchedAt, generation: c.generation } : null;
     c.loading = true; c.phase = "loading"; c.message = ""; c.generation = state.status?.runtime_generation ?? null;
     c.groups = []; c.friends = []; c.botId = ""; c.fetchedAt = null; renderContacts();
     try {
@@ -610,13 +837,17 @@
       if (!contactsCurrent(version, session)) return;
       c.phase = [502, 503].includes(error.status) ? "offline" : "error";
       c.message = (c.phase === "offline" ? "暂时无法读取 QQ 联系人。请确认 QQ 已登录且 Milky 可连接，再手动刷新。 " : "联系人列表未能加载。 ") + error.message;
+      if (previous && previous.generation === c.generation && ([502, 503].includes(error.status) || error.status === 0)) {
+        Object.assign(c, previous); c.phase = "cached";
+        c.message = "连接暂不可用，显示该账号的上次列表；仍可关闭 Bot，恢复连接并刷新后才能开启。";
+      }
     } finally {
       if (contactsCurrent(version, session)) { c.loading = false; renderContacts(); }
     }
   }
   async function toggleContact(scene, peerId, enabled) {
     const c = state.contacts;
-    if (state.view !== "contacts" || !state.authenticated || state.busy || c.phase !== "ready" || c.loading || c.saving || typeof enabled !== "boolean") { renderContacts(); return; }
+    if (state.view !== "contacts" || !state.authenticated || state.busy || (c.phase !== "ready" && !(c.phase === "cached" && enabled === false)) || c.loading || c.saving || typeof enabled !== "boolean") { renderContacts(); return; }
     const row = (scene === "group" ? c.groups : scene === "friend" ? c.friends : []).find((item) => item.id === peerId);
     if (!row || row.enabled === enabled) return;
     const version = c.version, session = state.session, botId = c.botId, previous = row.enabled;
@@ -625,7 +856,7 @@
       const result = await api("/api/qq/contacts/toggle", "POST", { bot_id: botId, scene, peer_id: peerId, enabled });
       if (!contactsCurrent(version, session)) return;
       if (result.bot_id !== botId || result.scene !== scene || result.peer_id !== peerId || result.enabled !== enabled) throw new Error("开关响应与当前账号或会话不一致。");
-      c.message = `${row.remark || row.name || row.id} 的 Bot 已${enabled ? "开启" : "关闭"}，即时生效。`;
+      c.message = `${row.remark || row.name || row.id} 的 Bot 已${enabled ? "开启" : "关闭"}，即时生效。` + (c.phase === "cached" ? " 当前显示上次列表；恢复连接并刷新后才能开启。" : "");
     } catch (error) {
       if (!contactsCurrent(version, session)) return;
       row.enabled = previous;
@@ -717,9 +948,12 @@
   function clearSession(message = "") {
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
     state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false;
+    state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
+    $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
+    invalidateModels();
     clearMemorySelection(); state.memory.list = []; $("conversation-list").replaceChildren(); $("budget-usage").replaceChildren();
     document.querySelectorAll("dialog").forEach((dialog) => { if (dialog.open) dialog.close(); });
     document.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
@@ -744,11 +978,11 @@
 
   const settingInputs = new Map();
   const settingDefinitions = [
-    field("persona", "人设名称", "text", "对应已保存配置中的人设表。"),
+    field("persona", "会话人设", "persona", "选择已保存的自定义人设或内置模板，不受配置页未保存草稿影响。"),
     field("input_budget", "输入预算（保守估算）", "number", "", { min: 1024, max: 262144 }),
     field("output_budget", "输出 token 上限", "number", "", { min: 64, max: 32768 }),
     field("recent_messages", "最近历史条数", "number", "", { min: 0, max: 4096 }),
-    field("allowed_tools", "允许的工具", "lines", "每行一个工具名，例如 clock_now。"),
+    field("allowed_tools", "允许的工具", "tools", "只可勾选全局允许且所属插件已启用的工具。不勾选即禁用全部工具；修改全局工具或插件后，请先保存并应用，再配置会话。"),
     field("summary", "生成并使用摘要", "check", "关闭后不生成或注入摘要；保留原文按历史条数读取。"),
     field("memory_read", "读取长期记忆", "check", "将当前范围内相关记忆加入回复上下文。"),
     field("memory_write", "自动提炼记忆", "check", "与摘要开关独立，只处理有效的人类消息证据。"),
@@ -825,12 +1059,14 @@
   function renderSettings() {
     settingInputs.clear(); const box = $("conversation-settings-grid"); box.replaceChildren();
     for (const def of settingDefinitions) {
-      const wrapper = element("div", "field" + (def.type === "check" ? " check-field" : ""));
+      const wrapper = element("div", "field" + (def.type === "check" ? " check-field" : def.type === "tools" ? " full" : ""));
       const label = element("label", "", def.label); label.htmlFor = "setting-" + def.path;
-      const input = document.createElement(def.type === "lines" ? "textarea" : "input"); input.id = label.htmlFor;
-      if (def.type !== "lines") input.type = def.type === "check" ? "checkbox" : def.type;
+      const input = document.createElement(def.type === "tools" ? "div" : def.type === "persona" ? "select" : def.type === "lines" ? "textarea" : "input"); input.id = label.htmlFor;
+      if (!["lines", "persona", "tools"].includes(def.type)) input.type = def.type === "check" ? "checkbox" : def.type;
       input.autocomplete = "off"; const value = state.memory.detail.settings[def.path];
-      if (def.type === "check") input.checked = Boolean(value);
+      if (def.type === "tools") { input.className = "tool-choices"; input.setAttribute("role", "group"); input.setAttribute("aria-label", def.label); renderToolPicker(input, value, "conversation"); }
+      else if (def.type === "persona") fillPersonaSelect(input, value, state.config);
+      else if (def.type === "check") input.checked = Boolean(value);
       else input.value = def.type === "lines" ? (value || []).join("\n") : String(value ?? "");
       if (def.type === "number") { input.min = String(def.min); input.max = String(def.max); input.step = "1"; input.required = true; }
       if (def.path === "persona") input.required = true;
@@ -838,13 +1074,16 @@
       if (def.type === "check") { const copy = element("div"); copy.append(label, hint); wrapper.append(input, copy); }
       else wrapper.append(label, input, hint);
       input.addEventListener("input", () => { state.memory.settingsDirty = true; updateControls(); });
+      if (def.type === "persona") input.addEventListener("change", () => { input.setAttribute("aria-invalid", String(!personaChoices(state.config).has(input.value))); state.memory.settingsDirty = true; updateControls(); });
       settingInputs.set(def.path, { input, def }); box.append(wrapper);
     }
   }
   function readSettings() {
     const result = clone(state.memory.detail.settings);
     for (const [key, { input, def }] of settingInputs) {
-      if (def.type === "check") result[key] = input.checked;
+      if (def.type === "tools") result[key] = readToolPicker(input);
+      else if (def.type === "persona") { requirePersona(state.config, input.value, "会话人设"); result[key] = input.value; }
+      else if (def.type === "check") result[key] = input.checked;
       else if (def.type === "number") {
         const number = Number(input.value);
         if (!input.value || !Number.isSafeInteger(number) || number < def.min || number > def.max) throw new Error("「" + def.label + "」超出允许范围。");
@@ -1061,6 +1300,13 @@
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelector(".brand").addEventListener("click", (event) => { event.preventDefault(); showView("overview"); });
   $("config-form").addEventListener("submit", (event) => event.preventDefault());
+  $("persona-list").addEventListener("change", () => { state.personaSelected = $("persona-list").value; $("persona-error").textContent = ""; renderPersonaPreview(); });
+  $("persona-text").addEventListener("input", () => {
+    if (state.busy || state.jsonDirty || state.pendingOperation || !Object.hasOwn(state.draft?.plugins?.ai?.personas || {}, state.personaSelected)) return;
+    Object.defineProperty(state.draft.plugins.ai.personas, state.personaSelected, { value: $("persona-text").value, enumerable: true, writable: true, configurable: true });
+    $("persona-error").textContent = ""; markDirty();
+  });
+  for (const [id, action] of [["persona-copy", () => createPersona(true)], ["persona-new", () => createPersona(false)], ["persona-delete", deletePersona]]) $(id).addEventListener("click", () => { try { action(); } catch (error) { $("persona-error").textContent = error.message; } });
   $("refresh-status").addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
   $("refresh-qq").addEventListener("click", () => { void runAction(() => refreshQq(true)); });
   $("refresh-contacts").addEventListener("click", () => { void loadContacts(true); });
@@ -1079,10 +1325,17 @@
     void runAction(loadConfig);
   });
   $("save-config").addEventListener("click", () => { void runAction(() => saveConfig(false)); });
+  $("save-config-top").addEventListener("click", () => { void runAction(() => saveConfig(false)); });
+  $("fetch-models").addEventListener("click", () => { void fetchModels(); });
+  $("model-list").addEventListener("change", () => {
+    if (!state.models.items.includes($("model-list").value)) return;
+    inputs.get("llm.model").control.value = $("model-list").value; markDirty();
+  });
+  $("manual-model").addEventListener("click", () => { state.models.manual = !state.models.manual; renderModels(); });
   $("save-apply").addEventListener("click", () => { void runAction(() => saveConfig(true)); });
   $("get-qr").addEventListener("click", () => { void runAction(getQr); });
   $("advanced").addEventListener("toggle", () => { if ($("advanced").open && !state.jsonDirty && state.config) syncJson(); });
-  $("config-json").addEventListener("input", () => { state.jsonDirty = true; state.dirty = true; $("json-state").textContent = "JSON 有未采用修改，分组表单已暂时锁定。"; updateControls(); });
+  $("config-json").addEventListener("input", () => { state.jsonDirty = true; state.dirty = true; invalidateModels(); $("json-state").textContent = "JSON 有未采用修改，分组表单已暂时锁定。"; updateControls(); });
   $("adopt-json").addEventListener("click", () => { try { adoptJson(); notice("JSON 已采用到分组表单，尚未保存。"); } catch (error) { report(error); } });
   $("discard-json").addEventListener("click", () => {
     if (state.jsonDirty && !window.confirm("放弃完整 JSON 中尚未采用的编辑？")) return;

@@ -194,18 +194,20 @@ impl Drop for Panel {
 async fn sessions_csrf_logout_and_offline_web_memory_transactions() {
     let panel = Panel::start().await;
     panel.phase("waiting_login", None).await;
-    let response = panel
-        .client
-        .post(format!("{}/api/runtime/stop", panel.url))
-        .header("cookie", &panel.cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["code"],
-        "csrf_invalid"
-    );
+    for path in ["/api/runtime/stop", "/api/llm/models"] {
+        let response = panel
+            .client
+            .post(format!("{}{path}", panel.url))
+            .header("cookie", &panel.cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["code"],
+            "csrf_invalid"
+        );
+    }
     let response = panel
         .request(Method::POST, "/api/auth/setup")
         .json(&json!({"code":TOKEN,"password":"another password 123"}))
@@ -341,6 +343,7 @@ async fn offline_bot_keeps_panel_available_and_every_api_requires_authentication
         (Method::GET, "/api/status"),
         (Method::GET, "/api/config"),
         (Method::PUT, "/api/config"),
+        (Method::POST, "/api/llm/models"),
         (Method::POST, "/api/runtime/apply"),
         (Method::POST, "/api/runtime/stop"),
         (Method::GET, "/api/qq/status"),

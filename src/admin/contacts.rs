@@ -276,9 +276,31 @@ impl ContactsService {
             scene: request.scene,
             peer_id,
         };
+        // Disabling only narrows access to this explicitly named account/chat.
+        // It must work during a protocol outage, even while a list request is
+        // waiting on the network. Enabling below still requires live membership.
+        if !request.enabled {
+            let access = AccessStore::new(
+                self.runtime
+                    .data()
+                    .await
+                    .map_err(|_| ContactsError::Offline)?,
+            );
+            access
+                .set_enabled(scope.clone(), false)
+                .await
+                .map_err(|_| ContactsError::Offline)?;
+            self.runtime.cancel_scopes(&[scope.key()]).await;
+            return Ok(ToggleView {
+                bot_id: bot_id.to_string(),
+                scene: request.scene,
+                peer_id: peer_id.to_string(),
+                enabled: false,
+            });
+        }
         let mut state = self.state.lock().await;
         let (client, version) = self.client(&mut state).await?;
-        // Never authorize a write from a cached list: the account may have left
+        // Never authorize enabling from a cached list: the account may have left
         // a group, removed a friend, or switched since the UI was rendered.
         let contacts = client.contacts(true).await.map_err(transport_error)?;
         if contacts.bot_id != bot_id {
@@ -577,6 +599,7 @@ mod tests {
             .service
             .set_enabled(ToggleRequest {
                 peer_id: "99999".into(),
+                enabled: true,
                 ..request.clone()
             })
             .await
@@ -586,7 +609,14 @@ mod tests {
             Some(&ContactsError::Invalid)
         );
         fixture.mock.account.store(999, Ordering::SeqCst);
-        let error = fixture.service.set_enabled(request).await.unwrap_err();
+        let error = fixture
+            .service
+            .set_enabled(ToggleRequest {
+                enabled: true,
+                ..request
+            })
+            .await
+            .unwrap_err();
         assert_eq!(
             error.downcast_ref::<ContactsError>(),
             Some(&ContactsError::Stale)
@@ -603,6 +633,91 @@ mod tests {
         );
         let forced = fixture.mock.forced.lock().unwrap().clone();
         assert!(forced.iter().skip(2).all(|force| *force));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn disabling_works_during_a_blocked_membership_request_and_offline() {
+        let fixture = Fixture::new().await;
+        fixture.service.list(false).await.unwrap();
+        let permit = fixture.mock.gate.acquire().await.unwrap();
+        let service = fixture.service.clone();
+        let loading = tokio::spawn(async move { service.list(true).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.mock.groups.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let request = ToggleRequest {
+            bot_id: "123".into(),
+            scene: Scene::Group,
+            peer_id: "456".into(),
+            enabled: false,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.service.set_enabled(request.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result.enabled);
+        assert_eq!(fixture.mock.groups.load(Ordering::SeqCst), 2);
+        let access = AccessStore::new(fixture.runtime.data().await.unwrap());
+        assert!(
+            !access
+                .enabled(&Scope {
+                    bot_id: 123,
+                    scene: Scene::Group,
+                    peer_id: 456
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .enabled(&Scope {
+                    bot_id: 999,
+                    scene: Scene::Group,
+                    peer_id: 456
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            access
+                .enabled(&Scope {
+                    bot_id: 123,
+                    scene: Scene::Friend,
+                    peer_id: 456
+                })
+                .await
+                .unwrap()
+        );
+        drop(permit);
+        assert!(!loading.await.unwrap().unwrap().groups[0].enabled);
+        fixture.mock.account.store(0, Ordering::SeqCst);
+        assert!(fixture.service.list(true).await.is_err());
+        assert!(
+            !fixture
+                .service
+                .set_enabled(request.clone())
+                .await
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            fixture
+                .service
+                .set_enabled(ToggleRequest {
+                    enabled: true,
+                    ..request
+                })
+                .await
+                .is_err()
+        );
         fixture.finish().await;
     }
 

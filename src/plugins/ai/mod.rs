@@ -57,7 +57,7 @@ pub async fn change_settings(
     conversation: &Conversation,
     new: AiSettings,
 ) -> Result<ContextGuard> {
-    crate::config::validate_settings(&new)?;
+    host.config.plugins.ai.validate_settings(&new)?;
     let g = conversation.guard.clone();
     let defaults = serde_json::to_value(&host.config.plugins.ai.defaults)?;
     let mut values = serde_json::to_value(&new)?;

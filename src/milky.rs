@@ -18,7 +18,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{Incoming, MessageKey, Scene, Scope, now};
+use crate::types::{Incoming, MessageKey, Scene, Scope, now, sanitize_display_name};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -269,6 +269,13 @@ impl Milky {
 
     pub fn is_verified(&self) -> bool {
         self.verification.load(Ordering::Acquire) & 1 == 1
+    }
+
+    pub fn verified_bot_id(&self) -> Option<i64> {
+        let generation = self.verification.load(Ordering::Acquire);
+        let id = self.logged_in.load(Ordering::Acquire);
+        (generation & 1 == 1 && id > 0 && self.verification.load(Ordering::Acquire) == generation)
+            .then_some(id)
     }
 
     pub async fn get_message(&self, key: &MessageKey) -> Result<Incoming> {
@@ -553,10 +560,13 @@ fn parse_contacts(
                     .as_str()
                     .context("Milky contact name missing")?
                     .to_owned(),
-                remark: entry["remark"]
-                    .as_str()
-                    .context("Milky contact remark missing")?
-                    .to_owned(),
+                remark: match entry.get("remark") {
+                    None => String::new(),
+                    Some(value) => value
+                        .as_str()
+                        .context("Milky contact remark invalid")?
+                        .to_owned(),
+                },
             })
         })
         .collect()
@@ -639,6 +649,31 @@ fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Inc
         }
         ensure!(text.len() <= 32 * 1024, "incoming text exceeds limit");
     }
+    // Milky's member/friend object is metadata for a specific identity, not an
+    // alternate source of identity. Missing or mismatched labels degrade to ID.
+    let (sender_nickname, sender_card) = match scene {
+        Scene::Group => {
+            let member = &value["group_member"];
+            if member["user_id"].as_i64() == Some(sender_id)
+                && member["group_id"].as_i64() == Some(peer_id)
+            {
+                (
+                    sanitize_display_name(member["nickname"].as_str()),
+                    sanitize_display_name(member["card"].as_str()),
+                )
+            } else {
+                (None, None)
+            }
+        }
+        Scene::Friend => {
+            let friend = &value["friend"];
+            if peer_id == sender_id && friend["user_id"].as_i64() == Some(sender_id) {
+                (sanitize_display_name(friend["nickname"].as_str()), None)
+            } else {
+                (None, None)
+            }
+        }
+    };
     Ok(Incoming {
         key: MessageKey {
             scope: Scope {
@@ -649,6 +684,8 @@ fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Inc
             message_seq,
         },
         sender_id,
+        sender_nickname,
+        sender_card,
         text,
         mentions,
         quote_seq,
@@ -750,11 +787,108 @@ pub(crate) mod tests {
             json!({"groups":[{"group_id":"123","group_name":"name","remark":""}]}),
             json!({"groups":[{"group_id":0,"group_name":"name","remark":""}]}),
             json!({"groups":[{"group_id":123,"remark":""}]}),
-            json!({"groups":[{"group_id":123,"group_name":"name"}]}),
+            json!({"groups":[{"group_id":123,"group_name":"name","remark":null}]}),
+            json!({"groups":[{"group_id":123,"group_name":"name","remark":4}]}),
             json!({"groups":[{"group_id":123,"group_name":"one","remark":""},{"group_id":123,"group_name":"two","remark":""}]}),
         ] {
             assert!(parse_contacts(&data, "groups", "group_id", "group_name").is_err());
         }
+    }
+
+    #[test]
+    fn absent_contact_remark_is_compatible_with_older_milky_entities() {
+        for (data, field, id_key, name_key) in [
+            (
+                json!({"groups":[{"group_id":123,"group_name":"群"}]}),
+                "groups",
+                "group_id",
+                "group_name",
+            ),
+            (
+                json!({"friends":[{"user_id":456,"nickname":"好友"}]}),
+                "friends",
+                "user_id",
+                "nickname",
+            ),
+        ] {
+            let list = parse_contacts(&data, field, id_key, name_key).unwrap();
+            assert_eq!(list.len(), 1);
+            assert!(list[0].remark.is_empty());
+        }
+    }
+
+    #[test]
+    fn group_sender_labels_require_matching_member_and_group_and_are_bounded() {
+        let mut value = event(json!([{"type":"text","data":{"text":"原文\n不改"}}]));
+        value["data"]["group_member"] =
+            json!({"user_id":789,"group_id":456,"nickname":"公开\n昵称","card":"群\u{202e}名片"});
+        let incoming = normalize_message(123, &value["data"], 99).unwrap();
+        assert_eq!(incoming.sender_nickname.as_deref(), Some("公开昵称"));
+        assert_eq!(incoming.sender_card.as_deref(), Some("群名片"));
+        assert_eq!(incoming.text, "原文\n不改");
+        for (user, group) in [
+            (json!(788), json!(456)),
+            (json!(789), json!(455)),
+            (json!("789"), json!(456)),
+            (json!(789), json!("456")),
+        ] {
+            value["data"]["group_member"]["user_id"] = user;
+            value["data"]["group_member"]["group_id"] = group;
+            let message = normalize_message(123, &value["data"], 99).unwrap();
+            assert!(message.sender_nickname.is_none() && message.sender_card.is_none());
+            assert_eq!(message.sender_id, 789);
+        }
+        value["data"]["group_member"] =
+            json!({"user_id":789,"group_id":456,"nickname":"鱼".repeat(100),"card":"\n\t"});
+        let message = normalize_message(123, &value["data"], 99).unwrap();
+        assert_eq!(message.sender_nickname.unwrap().chars().count(), 64);
+        assert!(message.sender_card.is_none());
+        value["data"]["group_member"] = json!(null);
+        assert!(
+            normalize_message(123, &value["data"], 99)
+                .unwrap()
+                .sender_nickname
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn friend_labels_never_use_private_remarks_or_mismatched_sender() {
+        let mut value = json!({"message_scene":"friend","peer_id":789,"sender_id":789,"message_seq":1,"segments":[],"friend":{"user_id":789,"nickname":"公开昵称","remark":"仅本机可见的备注"}});
+        let message = normalize_message(123, &value, 99).unwrap();
+        assert_eq!(message.sender_nickname.as_deref(), Some("公开昵称"));
+        assert!(message.sender_card.is_none());
+        value["friend"]["nickname"] = json!(null);
+        let missing = normalize_message(123, &value, 99).unwrap();
+        assert!(missing.sender_nickname.is_none() && missing.sender_card.is_none());
+        value["friend"]["nickname"] = json!("公开昵称");
+        value["friend"]["user_id"] = json!(999);
+        assert!(
+            normalize_message(123, &value, 99)
+                .unwrap()
+                .sender_nickname
+                .is_none()
+        );
+        value["friend"]["user_id"] = json!(789);
+        value["sender_id"] = json!(123);
+        assert!(
+            normalize_message(123, &value, 99)
+                .unwrap()
+                .sender_nickname
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verified_account_getter_never_returns_unverified_or_empty_identity() {
+        let milky = Milky::new(MilkyConfig::default(), reqwest::Client::new()).unwrap();
+        assert_eq!(milky.verified_bot_id(), None);
+        milky.verification.store(1, Ordering::Release);
+        assert_eq!(milky.verified_bot_id(), None);
+        milky.logged_in.store(123, Ordering::Release);
+        assert_eq!(milky.verified_bot_id(), Some(123));
+        milky.invalidate_account();
+        assert_eq!(milky.verified_bot_id(), None);
     }
 
     #[tokio::test]

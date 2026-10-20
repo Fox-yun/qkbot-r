@@ -5,10 +5,19 @@ pub mod reminder;
 use crate::{
     config::Config,
     plugin::{PluginRegistry, PluginSpec},
-    tools::ToolRegistry,
+    tools::{ToolCatalogEntry, ToolRegistry},
 };
 use anyhow::Result;
 use std::collections::BTreeSet;
+
+/// Show every registered tool, even when its provider is disabled or an old
+/// allow-list names a removed tool. This clone never grants runtime permission.
+pub fn tool_catalog(config: &Config) -> Result<Vec<ToolCatalogEntry>> {
+    let mut display = config.clone();
+    display.plugins.ai.defaults.allowed_tools.clear();
+    let (_, tools, _) = assemble(&display)?;
+    Ok(tools.catalog())
+}
 
 pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeSet<String>)> {
     let mut plugins = PluginRegistry::new();

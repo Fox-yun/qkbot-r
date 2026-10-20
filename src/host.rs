@@ -79,7 +79,6 @@ impl Host {
         let gateway = Gateway::new(store.clone(), &config.app.timezone, registry, allowed)?;
         gateway.migrate().await?;
         crate::plugins::reminder::migrate(&store).await?;
-        crate::plugins::reminder::recover_interrupted(&store).await?;
         let host = Arc::new(Self {
             config: Arc::new(config),
             access: AccessStore::new(store.clone()),
@@ -112,7 +111,8 @@ impl Host {
             .await
     }
 
-    /// Persist intent before submission. An ambiguous send is never retried here.
+    /// Persist intent before submission. Err means no HTTP send was started;
+    /// once submitted, return the actual SendOutcome even if ledger storage fails.
     pub async fn send(
         &self,
         scope: &Scope,
@@ -120,6 +120,27 @@ impl Host {
         guard: Option<ContextGuard>,
         inbound_position: i64,
         text: String,
+    ) -> Result<SendOutcome> {
+        self.send_with_id(
+            scope,
+            plugin,
+            guard,
+            inbound_position,
+            text,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    /// A durable task supplies the persisted attempt ID used by its outbox record.
+    pub(crate) async fn send_with_id(
+        &self,
+        scope: &Scope,
+        plugin: &str,
+        guard: Option<ContextGuard>,
+        inbound_position: i64,
+        text: String,
+        id: String,
     ) -> Result<SendOutcome> {
         let scope_key = scope.key();
         let access_revision = self
@@ -150,7 +171,6 @@ impl Host {
             .epochs
             .get(plugin)
             .ok_or_else(|| anyhow::anyhow!("plugin disabled"))?;
-        let id = uuid::Uuid::new_v4().to_string();
         let hourly = self.config.limits.sends_per_hour as i64;
         let cooldown = if plugin == "ai" {
             self.config.limits.send_cooldown_secs as i64
@@ -199,7 +219,7 @@ impl Host {
             tx.commit()?;Ok(())
         }).await;
         if let Err(e) = submit {
-            let why = e.to_string();
+            let why = format!("not submitted: {e}");
             self.store.call(move|c|{c.execute("UPDATE outbox SET state='failed',detail=?2,updated_at=?3 WHERE id=?1 AND state='prepared'",params![id,why,now()])?;Ok(())}).await?;
             return Err(e);
         }
@@ -269,6 +289,7 @@ pub struct Router {
     controls: Arc<tokio::sync::Semaphore>,
     plugin_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     tasks: tokio_util::task::TaskTracker,
+    reminder_delivery: tokio::sync::Mutex<()>,
 }
 impl Router {
     pub fn new(host: Arc<Host>) -> Self {
@@ -285,6 +306,7 @@ impl Router {
             host,
             plugin_limits,
             tasks: tokio_util::task::TaskTracker::new(),
+            reminder_delivery: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -335,7 +357,9 @@ impl Router {
             let role=if incoming.is_self(){"self_unknown"}else if keep||learn{"user"}else{"control"};
             let text=if keep||learn{incoming.text.as_str()}else{""};
             let origin=if command.is_some(){Some("control")}else if learn&&!keep {Some("memory_only")}else{None};
-            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable,access_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn,access_revision])?;
+            let nickname=crate::types::sanitize_display_name(incoming.sender_nickname.as_deref());
+            let card=crate::types::sanitize_display_name(incoming.sender_card.as_deref());
+            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable,access_revision,sender_nickname,sender_card) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn,access_revision,nickname,card])?;
             if changed==0{return Ok(None);}
             let id=tx.last_insert_rowid();tx.execute("UPDATE messages SET inbound_position=id WHERE id=?1",[id])?;
             tx.commit()?;Ok(Some(id))
@@ -481,7 +505,7 @@ impl Router {
                 // Never expire unresolved sends or active conversation work as ordinary logs.
                 c.execute("DELETE FROM messages WHERE received_at<?1", [cutoff])?;
                 c.execute(
-                    "DELETE FROM outbox WHERE created_at<?1 AND state IN('confirmed','failed')",
+                    "DELETE FROM outbox WHERE created_at<?1 AND state IN('confirmed','failed') AND NOT EXISTS(SELECT 1 FROM reminder_jobs r WHERE r.status='dispatching' AND r.outbox_id=outbox.id)",
                     [cutoff],
                 )?;
                 Ok(())
@@ -500,51 +524,56 @@ impl Router {
         if !self.host.config.plugins.reminder.enabled {
             return Ok(());
         }
-        if !self.host.milky.is_verified() {
+        // Recovery must never race a still-active attempt, including a send that
+        // holds its scope delivery guard while awaiting the protocol response.
+        let Ok(_delivery) = self.reminder_delivery.try_lock() else {
             return Ok(());
-        }
-        for due in reminder::claim_due(&self.host.store, 4).await? {
-            if self.host.cancel.is_cancelled() {
-                reminder::release_claim(&self.host.store, &due.id).await?;
-                continue;
+        };
+        let Some(bot_id) = self.host.milky.verified_bot_id() else {
+            return Ok(());
+        };
+        reminder::recover_interrupted(&self.host.store, bot_id).await?;
+        for _ in 0..4 {
+            if self.host.cancel.is_cancelled() || self.host.milky.verified_bot_id() != Some(bot_id)
+            {
+                break;
             }
+            let Some(due) = reminder::claim_due(&self.host.store, bot_id).await? else {
+                break;
+            };
             if self.host.epochs.get("reminder") != Some(&due.plugin_epoch) {
-                reminder::finish_delivery(
-                    &self.host.store,
-                    &due.id,
-                    Delivery::KnownFailure,
-                    Some("plugin changed before submission"),
-                )
-                .await?;
-                continue;
+                reminder::release_claim(&self.host.store, &due).await?;
+                break;
             }
             let text = format!("提醒 用户 {}：{}\nID：{}", due.actor_id, due.text, due.id);
-            let result = self.host.send(&due.scope, "reminder", None, 0, text).await;
-            if result.as_ref().is_err_and(|error| {
-                error
-                    .downcast_ref::<crate::access::AccessDisabled>()
-                    .is_some()
-            }) || (result.is_err() && self.host.cancel.is_cancelled())
-            {
-                reminder::release_claim(&self.host.store, &due.id).await?;
-                continue;
-            }
+            let result = self
+                .host
+                .send_with_id(&due.scope, "reminder", None, 0, text, due.outbox_id.clone())
+                .await;
             let (state, error) = match result {
                 Ok(SendOutcome::Deferred { .. }) => {
-                    reminder::release_claim(&self.host.store, &due.id).await?;
-                    continue;
+                    reminder::release_claim(&self.host.store, &due).await?;
+                    break;
                 }
                 Ok(SendOutcome::Confirmed { .. }) => (Delivery::Sent, None),
                 Ok(SendOutcome::Failed { reason }) => (Delivery::KnownFailure, Some(reason)),
                 Ok(SendOutcome::Unknown { reason }) => (Delivery::Unknown, Some(reason)),
-                Err(error) => (Delivery::KnownFailure, Some(error.to_string())),
+                // Host::send returns Err only before external submission. Queue
+                // pressure, shutdown or an access change must not consume a job.
+                Err(error) => {
+                    reminder::release_claim(&self.host.store, &due).await?;
+                    return Err(error);
+                }
             };
-            reminder::finish_delivery(&self.host.store, &due.id, state, error.as_deref()).await?;
+            reminder::finish_delivery(&self.host.store, &due, state, error.as_deref()).await?;
         }
         Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // No store/plugin teardown until a reminder submission has finished its
+        // ledger. The normal runtime also drains its reminder scheduler task.
+        let _reminders = self.reminder_delivery.lock().await;
         self.chat.shutdown().await;
         self.tasks.close();
         self.tasks.wait().await;
@@ -676,6 +705,8 @@ mod routing_tests {
                         message_seq: index as i64 + 1,
                     },
                     sender_id: 7,
+                    sender_nickname: None,
+                    sender_card: None,
                     text: text.into(),
                     mentions: vec![1],
                     quote_seq: None,

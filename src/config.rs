@@ -12,7 +12,7 @@ pub struct Config {
     #[serde(
         rename = "access",
         skip_serializing,
-        deserialize_with = "ignore_legacy_access"
+        deserialize_with = "reject_legacy_access"
     )]
     _legacy_access: Option<()>,
     pub limits: Limits,
@@ -94,11 +94,13 @@ impl Default for AppConfig {
     }
 }
 
-fn ignore_legacy_access<'de, D: serde::Deserializer<'de>>(
+const LEGACY_ACCESS_ERROR: &str = "检测到旧 [access] 白名单，已阻止自动切换访问策略。请先核对群与好友的黑名单设置，明确接受未关闭的会话默认开启后，再手动移除旧 [access] 配置。";
+
+fn reject_legacy_access<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<()>, D::Error> {
     let _ = serde::de::IgnoredAny::deserialize(d)?;
-    Ok(None)
+    Err(serde::de::Error::custom(LEGACY_ACCESS_ERROR))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +206,7 @@ impl Default for AiSettings {
             input_budget: 6000,
             output_budget: 800,
             recent_messages: 24,
-            persona: "默认".into(),
+            persona: "雄小鬼".into(),
             memory_read: true,
             memory_write: true,
             summary: true,
@@ -247,18 +249,24 @@ impl Default for AiConfig {
             max_memories_per_conversation: 256,
             memory_recall_limit: 5,
             memory_recall_budget: 1000,
-            personas: BTreeMap::from([
-                (
-                    "默认".into(),
-                    "你是群聊助手小鱼。自然、简洁地用中文回答；记清谁说了什么。不确定时直说。"
-                        .into(),
-                ),
-                (
-                    "温柔".into(),
-                    "你是小鱼，用温柔、简洁的中文回答，不改变已知事实和权限。".into(),
-                ),
-            ]),
+            personas: BTreeMap::new(),
         }
+    }
+}
+impl AiConfig {
+    /// File-defined expressions override a built-in of the same name. Resolving
+    /// a template never inserts it into the user's configuration.
+    pub fn persona(&self, name: &str) -> Option<&str> {
+        self.personas
+            .get(name)
+            .map(String::as_str)
+            .or_else(|| crate::personas::find(name))
+    }
+
+    pub fn validate_settings(&self, settings: &AiSettings) -> Result<()> {
+        validate_settings(settings)?;
+        ensure!(self.persona(&settings.persona).is_some(), "人设不存在");
+        Ok(())
     }
 }
 
@@ -271,7 +279,13 @@ impl Config {
     }
     pub fn from_toml(data: &str) -> Result<Self> {
         // TOML errors can quote the offending source line, including a credential.
-        toml::from_str(data).map_err(|_| anyhow::anyhow!("TOML 配置无效，请检查语法和字段类型"))
+        toml::from_str(data).map_err(|error: toml::de::Error| {
+            anyhow::anyhow!(if error.message() == LEGACY_ACCESS_ERROR {
+                LEGACY_ACCESS_ERROR
+            } else {
+                "TOML 配置无效，请检查语法和字段类型"
+            })
+        })
     }
     pub fn apply_environment(&mut self) {
         if let Ok(key) = std::env::var("QKBOT_API_KEY") {
@@ -398,19 +412,16 @@ impl Config {
             (1..=10).contains(&self.plugins.reminder.max_active_per_user),
             "reminder max_active_per_user must be 1..10"
         );
-        if self.plugins.ai.enabled {
-            let ai = &self.plugins.ai;
-            validate_settings(&ai.defaults)?;
-            ensure!(
-                ai.personas.contains_key(&ai.defaults.persona),
-                "default persona not defined"
-            );
-            ensure!(
-                ai.personas
-                    .values()
-                    .all(|s| !s.is_empty() && s.len() <= 8192),
-                "persona must be 1..8192 bytes"
-            );
+        let ai = &self.plugins.ai;
+        ensure!(ai.persona(&ai.defaults.persona).is_some(), "人设不存在");
+        ensure!(
+            ai.personas
+                .values()
+                .all(|s| !s.is_empty() && s.len() <= 8192),
+            "persona must be 1..8192 bytes"
+        );
+        if ai.enabled {
+            ai.validate_settings(&ai.defaults)?;
             ensure!(
                 ai.keywords
                     .iter()
@@ -461,6 +472,49 @@ pub fn validate_settings(s: &AiSettings) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn built_in_personas_are_selectable_without_copying_them_into_config() {
+        let mut config = Config::default();
+        assert_eq!(config.plugins.ai.defaults.persona, "雄小鬼");
+        assert!(config.plugins.ai.personas.is_empty());
+        for (name, expression) in crate::personas::templates() {
+            assert!(!expression.is_empty() && expression.len() <= 8192);
+            config.plugins.ai.defaults.persona = name.clone();
+            config.validate().unwrap();
+            assert_eq!(config.plugins.ai.persona(&name), Some(expression.as_str()));
+        }
+        assert!(config.plugins.ai.personas.is_empty());
+        for removed in ["默认", "温柔", "does-not-exist"] {
+            config.plugins.ai.defaults.persona = removed.into();
+            assert!(config.validate().is_err());
+        }
+        config.plugins.ai.enabled = false;
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn custom_personas_override_templates_and_survive_existing_config_roundtrip() {
+        let original = r#"
+[plugins.ai.defaults]
+persona = "我的自定义"
+[plugins.ai.personas]
+"我的自定义" = "保留现有的称呼和表达。"
+"雄小鬼" = "此名称使用管理员自定义表达。"
+"#;
+        let config = Config::from_toml(original).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.plugins.ai.defaults.persona, "我的自定义");
+        assert_eq!(
+            config.plugins.ai.persona("雄小鬼"),
+            Some("此名称使用管理员自定义表达。")
+        );
+        assert!(config.plugins.ai.persona("清朗青年").is_some());
+        assert_eq!(config.plugins.ai.personas.len(), 2);
+        let saved = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(saved.plugins.ai.defaults.persona, "我的自定义");
+        assert_eq!(saved.plugins.ai.personas, config.plugins.ai.personas);
+    }
 
     #[test]
     fn web_and_login_defaults_and_address_validation() {

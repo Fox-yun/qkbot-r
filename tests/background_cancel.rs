@@ -89,19 +89,26 @@ async fn completed(task: JoinHandle<anyhow::Result<()>>) {
 async fn disabled_scope_releases_background_slot_without_cancelling_other_scopes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/model", listener.local_addr().unwrap());
+    let milky_url = format!("http://{}", listener.local_addr().unwrap());
     let (requests, mut observed) = mpsc::channel(8);
     let app = Router::new()
         .route("/model", post(model))
+        .route(
+            "/api/get_login_info",
+            post(|| async { Json(json!({"status":"ok","retcode":0,"data":{"uin":1}})) }),
+        )
         .with_state(requests);
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut config = Config::default();
     config.app.database = ":memory:".into();
     config.llm.chat_completions_url = endpoint;
+    config.milky.url = milky_url;
     config.llm.model = "mock".into();
     config.llm.max_concurrent_requests = 1;
     config.plugins.ai.defaults.recent_messages = 2;
     config.plugins.ai.defaults.memory_write = false;
     let host = Host::create(config).await.unwrap();
+    host.milky.login().await.unwrap();
     host.store
         .call(|db| {
             for peer in [2, 3, 4] {
