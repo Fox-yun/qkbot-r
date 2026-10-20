@@ -1,0 +1,40 @@
+# Optional LLBot companion. Persist configuration and accounts in workspace.
+# Prepare the official image and private files before starting this unit.
+[Unit]
+Description=LLBot QQ protocol for qkbot-r
+
+[Quadlet]
+DefaultDependencies=false
+
+[Container]
+Image=docker.io/linyuchen/llbot:8.3.2
+Pull=never
+ContainerName=llbot
+Network=host
+WorkingDir=/app/llbot
+# The upstream startup.sh changes webui.host to a public listener.
+Entrypoint=/bin/sh
+Exec=/usr/local/bin/qkbot-llbot-entrypoint
+Volume=%h/workspace/llbot/data:/app/llbot/data
+Volume=%h/workspace/llbot/default_config.json:/app/llbot/default_config.json:ro
+Volume=%h/workspace/llbot/deploy/entrypoint.sh:/usr/local/bin/qkbot-llbot-entrypoint:ro
+# LLBot recognizes this marker and persists its session-encryption machine ID.
+Volume=%h/workspace/llbot/deploy/container.marker:/.dockerenv:ro
+ReadOnly=true
+DropCapability=all
+NoNewPrivileges=true
+Environment=TZ=Asia/Shanghai
+# The native signing module copies a shared library into TMPDIR before loading it.
+Environment=TMPDIR=/app/llbot/data/tmp
+StopSignal=SIGTERM
+StopTimeout=30
+LogDriver=journald
+Label=io.github.fox-yun.qkbot=llbot
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

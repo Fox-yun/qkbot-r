@@ -8,7 +8,7 @@ Debian 13 示例：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs git
+sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs git python3
 sudo loginctl enable-linger "$USER"
 podman info --format 'rootless={{.Host.Security.Rootless}} cgroup={{.Host.CgroupsVersion}}'
 mkdir -p ~/workspace
@@ -86,10 +86,149 @@ podman build -f Containerfile -t localhost/qkbot-r:latest \
 
 ## 4. 第一次访问和 QQ 登录
 
+### 4.1 部署独立 LLBot
+
+本次核对的稳定版为 **8.3.2**，官方安装器使用 `linyuchen/llbot` 镜像仓库；这里固定为 `docker.io/linyuchen/llbot:8.3.2`，不使用滚动 `latest`。[官方安装器](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/script/install-llbot-docker.sh)、[官方安装说明](https://luckylillia.com/guide/choice_install)
+
+```bash
+podman pull docker.io/linyuchen/llbot:8.3.2
+```
+
+腾讯云内网无法直接拉取 Docker Hub 时，可使用其内网缓存，再标记回 Quadlet 使用的官方镜像名：
+
+```bash
+podman pull mirror.ccs.tencentyun.com/linyuchen/llbot:8.3.2
+podman tag mirror.ccs.tencentyun.com/linyuchen/llbot:8.3.2 \
+  docker.io/linyuchen/llbot:8.3.2
+```
+
+缓存仅适用于腾讯云内网；保留明确版本和 TLS 校验。[腾讯云镜像加速说明](https://cloud.tencent.com/document/product/213/8623)
+
+本方案采用 **Linux host 网络和 LLBot 直连模式**，工作目录为 `/app/llbot`，配置与登录数据全部放在宿主 `~/workspace/llbot`：
+
+| 宿主文件或目录 | 用途 |
+| --- | --- |
+| `default_config.json` | 首次登录的配置模板，只读挂载给容器 |
+| `data/` | 账号配置、会话、机器标识、授权及协议端数据，整体持久化 |
+| `data/webui_token.txt` | LLBot WebUI 原始密码，对应小鱼的“QQ 登录管理 / WebUI 密码” |
+| `data/milky_token.txt` | 本部署保存的 Milky 令牌副本；LLBot 实际从配置的 `milky.http.accessToken` 读取 |
+| `data/auth_token.txt` | LLBot 签名授权凭据，与 WebUI 密码、Milky 令牌均不同 |
+| `data/auto_login_qq` | 可选的自动恢复账号选择，填写已扫码成功的本人 QQ 号 |
+| `data/tmp/` | 原生签名模块装载临时共享库所需的可写目录 |
+| `deploy/llbot.container`、`deploy/entrypoint.sh`、`deploy/container.marker` | 本地 Quadlet 配置、启动脚本及容器识别标记 |
+| `backups/` | 停机备份 |
+
+下面是**新安装**的初始化方法，需要 Python 3 作为一次性配置工具；它不参与机器人运行。脚本从固定版本镜像读取完整默认模板，生成两份独立随机凭据，拒绝覆盖已有配置或登录数据：
+
+```bash
+umask 077
+python3 - <<'PY'
+import json
+import secrets
+import subprocess
+from pathlib import Path
+
+base = Path.home() / "workspace" / "llbot"
+data = base / "data"
+if (base / "default_config.json").exists() or (data.exists() and any(data.iterdir())):
+    raise SystemExit("已有 LLBot 配置或数据，请保留并检查，不执行首次初始化。")
+template = subprocess.check_output([
+    "podman", "run", "--rm", "--entrypoint", "/bin/cat",
+    "docker.io/linyuchen/llbot:8.3.2", "/app/llbot/default_config.json",
+])
+config = json.loads(template)
+webui_token, milky_token = secrets.token_hex(32), secrets.token_hex(32)
+config["webui"].update(enable=True, host="127.0.0.1", port=3080)
+config["milky"]["enable"] = True
+config["milky"]["http"].update(host="127.0.0.1", port=3010, prefix="", accessToken=milky_token)
+config["satori"]["enable"] = False
+config["ob11"]["enable"] = False
+config["ffmpeg"] = "/usr/bin/ffmpeg"
+for directory in (base, data, data / "tmp", base / "deploy", base / "backups"):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+for destination, content in (
+    (base / "default_config.json", json.dumps(config, ensure_ascii=False, indent=2) + "\n"),
+    (data / "webui_token.txt", webui_token),
+    (data / "milky_token.txt", milky_token),
+):
+    with destination.open("x", encoding="utf-8") as file:
+        file.write(content)
+    destination.chmod(0o600)
+print("LLBot 配置已生成；凭据保存在私有 data 目录，不输出到日志。")
+PY
+```
+
+这里按 v8.3.2 的分协议 `host` 字段设置回环监听；不要套用旧文档的 `onlyLocalhost`。WebUI 密码从 `data/webui_token.txt` 读取，不是 `webui.password`；关闭 Satori 使用 `satori.enable`。[该版本默认配置](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/src/main/config/default_config.json)
+
+签名授权另按 LLBot 官方流程获取。首次安装可在服务器交互终端写入；已有有效文件时保留它：
+
+```bash
+cd ~/workspace/llbot
+umask 077
+if [ ! -s data/auth_token.txt ]; then
+  read -r -s -p 'LLBot Auth Token: ' llbot_auth_token
+  printf '\n'
+  test -n "$llbot_auth_token" || { echo '未输入授权凭据。'; exit 1; }
+  printf '%s' "$llbot_auth_token" > data/auth_token.txt
+  unset llbot_auth_token
+fi
+```
+
+该值来自 [LLBot 授权页面](https://auth.luckylillia.com)，不能用随机生成的 WebUI 或 Milky 令牌替代。小鱼管理员密码是另一套凭据，不应填进这三个文件。
+
+复制并连接本项目的 LLBot Quadlet。所有可变部署配置仍位于 `~/workspace/llbot`；已有同名文件或链接时先检查，不强制覆盖：
+
+```bash
+mkdir -p ~/workspace/llbot/deploy ~/.config/containers/systemd
+cp -n ~/workspace/qkbot-r/deploy/llbot.container \
+  ~/workspace/llbot/deploy/llbot.container
+cp -n ~/workspace/qkbot-r/deploy/llbot-entrypoint.sh \
+  ~/workspace/llbot/deploy/entrypoint.sh
+chmod 600 ~/workspace/llbot/deploy/entrypoint.sh
+touch ~/workspace/llbot/deploy/container.marker
+chmod 600 ~/workspace/llbot/deploy/container.marker
+ln -s "$HOME/workspace/llbot/deploy/llbot.container" \
+  "$HOME/.config/containers/systemd/llbot.container"
+systemctl --user daemon-reload
+systemctl --user start llbot.service
+systemctl --user is-active llbot.service
+```
+
+单元通过 `/bin/sh` 运行只读挂载的本项目启动脚本，默认 `exec node --enable-source-maps ./llbot.js`，保持 LLBot CLI 默认登录行为，并只读挂载配置模板。官方 `docker/startup.sh` 会把 `webui.host` 从 `127.0.0.1` 改为空，本方案避免该改写，保持 3080 只监听回环；Milky 的 3010 也明确设为回环，不需要 `-p` 或防火墙开放协议端口。[本项目启动脚本](../deploy/llbot-entrypoint.sh)、[官方固定版本启动脚本](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/docker/startup.sh)
+
+空 `container.marker` 以只读方式挂载到 `/.dockerenv`。该版本只用这个路径判断 Docker 环境，Podman 需显式提供，才能使用预期的容器内机器标识持久化路径。保留整个 `data/`，包括 `machine_guid.bin` 和账号会话，不要仅搬运账号 JSON 或在换容器时重新生成标识。[容器识别源码](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/src/common/utils/environment.ts)
+
+首次登录会从 `default_config.json` 创建账号自己的 `data/config_<QQ号>.json`。已有账号使用其账号配置，修改模板不会自动覆盖它；检查实际账号配置的监听地址和 Milky 令牌。[官方配置说明](https://luckylillia.com/guide/config)
+
+登录后检查监听地址，3080 与启用后的 3010 都应是 `127.0.0.1`，不能出现 `0.0.0.0` 或 `[::]`：
+
+```bash
+ss -ltn '( sport = :3080 or sport = :3010 )'
+```
+
+升级、迁移或备份 LLBot 时先停止它，保存完整数据与部署配置，再启动：
+
+```bash
+systemctl --user stop llbot.service
+umask 077
+mkdir -p "$HOME/workspace/llbot/backups"
+tar -C "$HOME/workspace/llbot" -czf \
+  "$HOME/workspace/llbot/backups/llbot-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  data default_config.json deploy
+systemctl --user start llbot.service
+```
+
+备份包含授权、私有令牌和登录态，保存在权限受限的 `backups/` 中。镜像升级还应显式修改单元中的固定版本，拉取对应镜像后 `daemon-reload` 并重启，不依赖自动更新标签。仓库更新不会自动替换 `~/workspace/llbot/deploy/` 中已部署的单元和启动脚本；更新时先核对差异，再停机替换对应文件。
+
+恢复时先停止 `llbot.service`，将当前 `data/`、`default_config.json` 和 `deploy/` 移到 workspace 内另一个备份目录保留，再把归档中的这三项完整解压回 `~/workspace/llbot/`。核对目录为 `700`、凭据和配置文件为 `600`，确认用户 Quadlet 链接仍指向恢复后的 `deploy/llbot.container`，拉取单元指定的镜像后执行 `systemctl --user daemon-reload` 和 `systemctl --user start llbot.service`。不要混合两份不同时间的机器标识与账号会话；恢复后通过管理页核对在线状态，失效会话需重新扫码。
+
+### 4.2 通过小鱼管理页扫码
+
 在自己的电脑建立转发，使用 13210 避免与本机服务冲突：
 
 ```bash
-ssh -N -L 13210:127.0.0.1:3210 你的SSH主机别名
+ssh -N -L 127.0.0.1:13210:127.0.0.1:3210 你的SSH主机别名
 ```
 
 打开 http://127.0.0.1:13210：
@@ -101,7 +240,24 @@ ssh -N -L 13210:127.0.0.1:3210 你的SSH主机别名
 5. 选择人设、插件与工具，点击“保存并应用”。
 6. 核对运行状态、账号与实际加载的插件，再用自己的 QQ 测试。
 
-LLBot 需按 [官方文档](https://luckylillia.com/guide/config) 单独安装与授权。本镜像不包含 QQ、签名服务或授权。协议端未就绪时管理页仍可初始化；不要让新旧两份小鱼同时连接同一账号，以免重复响应。
+按上节部署后，Milky 地址填写 `http://127.0.0.1:3010`，访问令牌使用 `data/milky_token.txt` 的值；QQ 登录管理地址填写 `http://127.0.0.1:3080`，WebUI 密码使用 `data/webui_token.txt` 的值。先保存这些接入参数，再在 QQ 登录页获取二维码并由账号本人扫码确认。签名授权 `auth_token.txt` 留在 LLBot 数据目录，不填入这两项。
+
+扫码由小鱼服务端代理 LLBot WebUI，电脑只需转发 3210；无须把 3080 或 3010 开放到公网，也不必把它们另行转发。LLBot 需按 [官方文档](https://luckylillia.com/guide/config) 单独安装与授权。Rust 镜像不包含 QQ、签名服务或授权；协议端未就绪时管理页仍可初始化。不要让新旧两份小鱼同时连接同一账号，以免重复响应。
+
+扫码成功后，如需下次启动自动恢复这个账号，可在服务器保存**本人刚刚登录成功的 QQ 号**：
+
+```bash
+cd ~/workspace/llbot
+umask 077
+read -r -p '已扫码成功的本人 QQ 号（仅数字）：' llbot_qq
+printf '%s\n' "$llbot_qq" > data/auto_login_qq
+chmod 600 data/auto_login_qq
+unset llbot_qq
+```
+
+文件必须是 1–20 位数字；启动脚本遇到空值或非法字符会拒绝启动。存在有效文件时，脚本给 LLBot 加上 `-q <QQ号>`，使用持久化的会话尝试恢复；写入文件不会打断当前已登录实例，下次重启才读取它。没有该文件时保持 LLBot 原生默认行为，重启后通过小鱼重新扫码，或在 LLBot 原 WebUI 选择快速登录。该文件只选择账号，不替代 `data/` 登录态和签名授权；会话失效后仍需重新扫码。
+
+2026-10-20 实机已验证：用户完成扫码后，小鱼管理页显示 QQ 已登录，运行状态为 `running`，Milky 返回的登录账号与实际账号一致。保留完整 `data/` 和 `auto_login_qq`、重新创建 LLBot 容器后，签名授权仍有效，账号自动恢复在线，Milky 继续只监听 `127.0.0.1:3010`，用户服务没有异常重启。同日从宿主使用已保存的模型配置完成两次合成请求，验证了工具调用、回传工具结果和最终文本回复；两次均返回 HTTP 200。该检查没有向 QQ 发送消息，完整的 QQ 聊天链路仍需由账号本人试聊确认。
 
 “保存当前配置”仅保存；“保存并应用”才启动新配置。原生插件不依赖 NoneBot。误开未配置独立令牌的 NoneBot 会阻止整份配置应用，旧实例仍使用旧设置。
 

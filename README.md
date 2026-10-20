@@ -38,12 +38,14 @@ sh deploy/podman.sh logs
 管理页默认仅在服务器本机监听。远程电脑运行：
 
 ```bash
-ssh -N -L 13210:127.0.0.1:3210 你的SSH主机别名
+ssh -N -L 127.0.0.1:13210:127.0.0.1:3210 你的SSH主机别名
 ```
 
 浏览器打开 **http://127.0.0.1:13210**，用容器日志中的一次性初始化码设置管理员密码。在页面填写 Milky、模型 API 和 LLBot 登录管理配置。**LLBot 尚未部署时，管理页仍可初始化，QQ 聊天需等待协议端就绪。**
 
 完整流程见 **[Podman 部署与升级](docs/deployment.md)**：包含 Debian 安装、同 Pod 部署、密钥、首次登录、持久化、systemd 自启动、备份恢复及从原生版本迁移。可选 Python 部分见 **[NoneBot 容器部署](sidecar/nonebot/README.md#podman-部署可选)**。
+
+还未安装 QQ 协议端时，可按部署文档的 **LLBot 8.3.2** 章节安装配套容器：配置和登录态集中在 `~/workspace/llbot/`，由小鱼管理页代理扫码。提供独立 Quadlet 和登录恢复入口；WebUI、Milky 均只监听回环，通过 SSH 转发访问管理页。
 
 > Windows/macOS 的 Podman 使用 Linux 虚拟机，`--network host` 指向虚拟机，不是 Windows/macOS 宿主。不要直接把 Windows 上 LLBot 的 `127.0.0.1` 配置照搬到 Linux 容器；Rust、NoneBot、LLBot 的回环地址需要处于同一个网络空间。
 
