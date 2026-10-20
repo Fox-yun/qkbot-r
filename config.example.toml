@@ -1,4 +1,5 @@
-# 复制为 config.toml；填写模型、允许的群/好友后启动，在网页设置管理员密码。
+# 复制为 config.toml；填写模型后启动，在网页设置管理员密码。
+# 群与好友默认开启 Bot，可在管理页分别关闭；开关按登录账号保存到数据库。
 # 密钥可放 QKBOT_API_KEY / QKBOT_MILKY_TOKEN / QKBOT_ADMIN_TOKEN / QKBOT_LLBOT_TOKEN 环境变量。
 # 网页保存配置不会把环境变量中的密钥写回文件。
 
@@ -34,15 +35,10 @@ max_concurrent_requests = 2
 request_timeout_secs = 60
 max_response_bytes = 262144
 
-[access]
-# 空列表表示不接收该类会话；请替换为实际 QQ 群号/好友 QQ 号。
-groups = []
-friends = []
-
 [plugins.ai]
 enabled = true
 keywords = ["小鱼"]            # 群内真实 @ 或关键词触发；好友私聊直接触发
-read_group_background = true   # 允许的群内闲聊可作为短期背景
+read_group_background = true   # 已开启 Bot 的群内闲聊可作为短期背景
 learn_all_group_messages = false
 compact_after_messages = 40
 compact_idle_secs = 600

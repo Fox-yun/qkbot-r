@@ -191,7 +191,6 @@ async fn setup_with(
     config.llm.model = "mock".into();
     config.llm.api_key = "synthetic".into();
     config.llm.max_concurrent_requests = 1;
-    config.access.groups = vec![456];
     config.plugins.ai.enabled = enable_ai;
     config.plugins.ai.defaults.allowed_tools = vec!["clock_now".into(), "reminder_create".into()];
     config.plugins.reminder.enabled = true;
@@ -663,7 +662,6 @@ async fn global_queue_counts_other_sessions_waiting_for_turn_capacity() {
     let (_temp, host, router) = setup_with(&mock, true, |config| {
         config.limits.queued_per_conversation = 1;
         config.limits.queued_global = 2;
-        config.access.groups = vec![456, 654, 655, 656];
     })
     .await;
     router
@@ -706,8 +704,6 @@ async fn user_mode_separates_people_groups_and_private_conversations() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_with(&mock, true, |config| {
         config.plugins.ai.defaults.mode = "user".into();
-        config.access.groups = vec![456, 654];
-        config.access.friends = vec![789];
     })
     .await;
     let original = message(1, "owner-group-secret");
@@ -757,11 +753,7 @@ async fn user_mode_separates_people_groups_and_private_conversations() {
 #[tokio::test]
 async fn quoted_same_sequence_is_resolved_with_full_scene_and_peer_key() {
     let mut mock = MockServer::start().await;
-    let (_temp, host, router) = setup_with(&mock, true, |config| {
-        config.access.groups = vec![456, 654];
-        config.access.friends = vec![789];
-    })
-    .await;
+    let (_temp, host, router) = setup_with(&mock, true, |_| {}).await;
     let mut previous = Vec::new();
     for (scene, peer) in [
         (Scene::Group, 456),

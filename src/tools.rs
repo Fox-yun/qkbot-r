@@ -103,6 +103,7 @@ pub struct ToolContext {
     pub turn_id: String,
     pub received_at: i64,
     pub cancel: CancellationToken,
+    pub access_revision: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,8 @@ struct BoundContext {
     guard: Option<ContextGuard>,
     ai_epoch: Option<i64>,
     provider_epoch: i64,
+    #[serde(default)]
+    access_revision: i64,
 }
 
 const MIGRATION: &str = "
@@ -173,6 +176,7 @@ fn apply_and_record(
     cancel: &CancellationToken,
 ) -> Result<ToolOutcome> {
     let spec = tool.spec();
+    authorize(&tx, bound, spec.plugin)?;
     ensure!(
         tool.permits(&bound.scope, bound.actor_id),
         "tool is not permitted in this context"
@@ -188,6 +192,7 @@ fn apply_and_record(
             "tool permission changed before commit"
         );
         ensure!(!cancel.is_cancelled(), "turn cancelled");
+        authorize(&tx, bound, spec.plugin)?;
         ensure!(
             serde_json::to_string(&result.value)?.len() <= spec.max_output_bytes,
             "tool result exceeds output limit"
@@ -235,6 +240,7 @@ fn plugin_epoch(tx: &Transaction<'_>, id: &str) -> Result<i64> {
 }
 
 fn authorize(tx: &Transaction<'_>, ctx: &BoundContext, plugin: &str) -> Result<()> {
+    crate::access::check_revision(tx, &ctx.scope.key(), ctx.access_revision)?;
     ensure!(
         plugin_epoch(tx, plugin)? == ctx.provider_epoch,
         "plugin changed; operation cancelled"
@@ -342,6 +348,11 @@ impl Gateway {
         cancel: CancellationToken,
     ) -> Result<ToolContext> {
         let epochs = self.epochs()?.clone();
+        let key = scope.key();
+        let access_revision = self
+            .store
+            .call(move |db| crate::access::require_enabled(db, &key))
+            .await?;
         Ok(ToolContext {
             scope,
             actor_id,
@@ -351,6 +362,7 @@ impl Gateway {
             turn_id,
             received_at,
             cancel,
+            access_revision,
         })
     }
 
@@ -374,6 +386,7 @@ impl Gateway {
                 guard: Some(ctx.guard.clone()),
                 ai_epoch: Some(ctx.ai_epoch),
                 provider_epoch: *epoch,
+                access_revision: ctx.access_revision,
             };
             if check_runtime(self.epochs()?, &bound, spec.plugin).is_err() {
                 continue;
@@ -413,6 +426,7 @@ impl Gateway {
             guard: Some(ctx.guard.clone()),
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: *epoch,
+            access_revision: ctx.access_revision,
         };
         let normalized = tool.prepare(
             args,
@@ -442,6 +456,45 @@ impl Gateway {
         args: Value,
         received_at: i64,
     ) -> Result<ToolOutcome> {
+        self.direct_bound(scope, actor, name, args, received_at, None)
+            .await
+    }
+
+    /// Binds commands to the ingress permission revision, including an off/on cycle.
+    pub async fn direct_message(
+        &self,
+        message: &crate::types::Incoming,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolOutcome> {
+        self.direct_bound(
+            message.key.scope.clone(),
+            message.sender_id,
+            name,
+            args,
+            message.received_at,
+            Some(message.key.key()),
+        )
+        .await
+    }
+
+    async fn direct_bound(
+        &self,
+        scope: Scope,
+        actor: i64,
+        name: &str,
+        args: Value,
+        received_at: i64,
+        source_key: Option<String>,
+    ) -> Result<ToolOutcome> {
+        let key = scope.key();
+        let access_revision = self
+            .store
+            .call(move |db| match source_key {
+                Some(source) => crate::access::message_revision(db, &key, &source),
+                None => crate::access::require_enabled(db, &key),
+            })
+            .await?;
         let tool = self.registry.get(name)?;
         let spec = tool.spec();
         ensure!(
@@ -459,6 +512,7 @@ impl Gateway {
             guard: None,
             ai_epoch: None,
             provider_epoch: epoch,
+            access_revision,
         };
         self.run(
             tool,
@@ -561,6 +615,7 @@ impl Gateway {
         let token = token.to_owned();
         self.store.call(move |conn| {
             let tx=conn.transaction()?;
+            crate::access::require_enabled(&tx,&scope.key())?;
             let context=tx.query_row("SELECT context_json FROM tool_runs WHERE token=?1", [&token], |r|r.get::<_,String>(0)).optional()?.context("confirmation token not found")?;
             let bound:BoundContext=serde_json::from_str(&context)?;
             ensure!(bound.scope==scope && bound.actor_id==actor,"confirmation belongs to another user or chat");
@@ -632,6 +687,104 @@ mod tests {
             } => (operation_id, token),
             _ => panic!("expected confirmation"),
         }
+    }
+
+    #[tokio::test]
+    async fn off_on_cycle_cancels_confirmations_and_does_not_replay_accepted_commands() {
+        use crate::{
+            access::AccessStore,
+            types::{Incoming, MessageKey},
+        };
+        let (store, gateway, ctx) = setup().await;
+        let (_, token) = pending(
+            gateway
+                .execute(
+                    &ctx,
+                    "reminder_create",
+                    json!({"after_seconds":60,"text":"旧待确认"}),
+                )
+                .await
+                .unwrap(),
+        );
+        let old = Incoming {
+            key: MessageKey {
+                scope: ctx.scope.clone(),
+                message_seq: 8,
+            },
+            sender_id: ctx.actor_id,
+            text: "/remind add 60 旧指令".into(),
+            mentions: vec![],
+            quote_seq: None,
+            received_at: now(),
+        };
+        let incoming = old.clone();
+        store.call(move|db|{db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at) VALUES(?1,?2,'conversation',1,?3,'control','',?4)",params![incoming.key.key(),incoming.key.scope.key(),incoming.sender_id,incoming.received_at])?;Ok(())}).await.unwrap();
+        let access = AccessStore::new(store.clone());
+        access.set_enabled(ctx.scope.clone(), false).await.unwrap();
+        assert!(
+            gateway
+                .direct(
+                    ctx.scope.clone(),
+                    ctx.actor_id,
+                    "clock_now",
+                    json!({}),
+                    now()
+                )
+                .await
+                .is_err()
+        );
+        assert!(gateway.definitions(&ctx).await.unwrap().is_empty());
+        access.set_enabled(ctx.scope.clone(), true).await.unwrap();
+        assert!(
+            gateway
+                .confirm(&ctx.scope, ctx.actor_id, &token)
+                .await
+                .is_err()
+        );
+        assert!(gateway.execute(&ctx, "clock_now", json!({})).await.is_err());
+        assert!(
+            gateway
+                .direct_message(
+                    &old,
+                    "reminder_create",
+                    json!({"after_seconds":60,"text":"旧指令"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            gateway
+                .direct(
+                    ctx.scope.clone(),
+                    ctx.actor_id,
+                    "clock_now",
+                    json!({}),
+                    now()
+                )
+                .await
+                .unwrap(),
+            ToolOutcome::Completed { .. }
+        ));
+        store
+            .call(|db| {
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM reminder_jobs", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT status FROM tool_runs WHERE token IS NOT NULL",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "rejected"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.stop().await.unwrap();
     }
 
     #[tokio::test]

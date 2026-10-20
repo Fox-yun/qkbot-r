@@ -147,6 +147,7 @@ struct Cached {
     revision: String,
     snapshot: Value,
     qq_version: u64,
+    milky_version: u64,
 }
 impl Cached {
     fn read(path: &Path, environment: &Environment) -> Result<Self> {
@@ -159,6 +160,7 @@ impl Cached {
             revision: revision(bytes),
             snapshot: snapshot(bytes, environment)?,
             qq_version: 0,
+            milky_version: 0,
         })
     }
 }
@@ -170,6 +172,11 @@ fn publish_cache(cache: &RwLock<Cached>, mut next: Cached) -> Result<Value> {
     let changed = serde_json::to_vec(&previous.effective.qq_login)?
         != serde_json::to_vec(&next.effective.qq_login)?;
     next.qq_version = previous.qq_version.wrapping_add(u64::from(changed));
+    let milky_changed = serde_json::to_vec(&previous.effective.milky)?
+        != serde_json::to_vec(&next.effective.milky)?;
+    next.milky_version = previous
+        .milky_version
+        .wrapping_add(u64::from(milky_changed));
     let snapshot = next.snapshot.clone();
     *previous = next;
     Ok(snapshot)
@@ -268,6 +275,14 @@ impl ConfigStore {
             .read()
             .map_err(|_| anyhow::anyhow!("配置缓存不可用"))?;
         Ok((cache.effective.qq_login.clone(), cache.qq_version))
+    }
+
+    pub async fn milky_config_version(&self) -> Result<(crate::milky::MilkyConfig, u64)> {
+        let cache = self
+            .cached
+            .read()
+            .map_err(|_| anyhow::anyhow!("配置缓存不可用"))?;
+        Ok((cache.effective.milky.clone(), cache.milky_version))
     }
 }
 
@@ -494,6 +509,26 @@ fn validate_stored(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn milky_generation_changes_only_for_transport_changes_and_detects_a_b_a() {
+        let (_directory, path, _) = fixture();
+        let store = ConfigStore::open(&path).await.unwrap();
+        let (original, first) = store.milky_config_version().await.unwrap();
+        let mut config = store.effective().await.unwrap();
+        config.app.timezone = "UTC".into();
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        store.reload().await.unwrap();
+        assert_eq!(store.milky_config_version().await.unwrap().1, first);
+        config.milky.url = "http://127.0.0.1:3999".into();
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        store.reload().await.unwrap();
+        assert_eq!(store.milky_config_version().await.unwrap().1, first + 1);
+        config.milky = original;
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        store.reload().await.unwrap();
+        assert_eq!(store.milky_config_version().await.unwrap().1, first + 2);
+    }
 
     #[tokio::test]
     async fn cached_reads_do_not_reopen_files_and_explicit_reload_preserves_last_valid_state() {

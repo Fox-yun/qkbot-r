@@ -22,6 +22,7 @@ pub async fn conversation(host: &Host, msg: &Incoming) -> Result<Conversation> {
     let actor = msg.sender_id;
     let defaults = host.config.plugins.ai.defaults.clone();
     host.store.call(move|c| {
+        crate::access::require_enabled(c,&scope.key())?;
         let (mode,revision)=scope_mode(c,&scope,&defaults.mode)?;
         let owner=if scope.scene==Scene::Friend||mode=="user"{Some(actor)}else{None};
         let id=match owner {Some(user)=>format!("{}:v{revision}:user:{user}",scope.key()),None=>format!("{}:v{revision}:group",scope.key())};

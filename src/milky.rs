@@ -92,6 +92,29 @@ enum EventAction {
     Reauthenticate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilkyContact {
+    pub id: i64,
+    pub name: String,
+    pub remark: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MilkyContacts {
+    pub bot_id: i64,
+    pub groups: Vec<MilkyContact>,
+    pub friends: Vec<MilkyContact>,
+}
+
+#[derive(Debug)]
+pub struct MilkyAccountChanged;
+impl std::fmt::Display for MilkyAccountChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Milky account changed while reading contacts")
+    }
+}
+impl std::error::Error for MilkyAccountChanged {}
+
 impl Milky {
     pub fn new(config: MilkyConfig, http: reqwest::Client) -> Result<Self> {
         let mut base = reqwest::Url::parse(&config.url).context("invalid Milky URL")?;
@@ -166,15 +189,7 @@ impl Milky {
 
     pub async fn login(&self) -> Result<i64> {
         let generation = self.invalidate_account();
-        let data = self.call("get_login_info", json!({})).await?;
-        let id = data["uin"]
-            .as_i64()
-            .filter(|id| *id > 0)
-            .context("Milky login missing uin")?;
-        ensure!(
-            self.config.bot_id.is_none_or(|expected| expected == id),
-            "Milky login account differs from configured bot_id"
-        );
+        let id = self.current_account().await?;
         ensure!(
             self.verification.load(Ordering::Acquire) == generation,
             "Milky login verification expired"
@@ -200,6 +215,46 @@ impl Milky {
             "Milky login verification expired"
         );
         Ok(id)
+    }
+
+    /// Read-only identity probe: administration must not change the event
+    /// transport's account verification generation just to refresh a list.
+    pub async fn current_account(&self) -> Result<i64> {
+        let data = self.call("get_login_info", json!({})).await?;
+        let id = data["uin"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .context("Milky login missing uin")?;
+        ensure!(
+            self.config.bot_id.is_none_or(|expected| expected == id),
+            "Milky login account differs from configured bot_id"
+        );
+        Ok(id)
+    }
+
+    pub async fn verify_account(&self, expected: i64) -> Result<()> {
+        if expected <= 0 || self.current_account().await? != expected {
+            return Err(MilkyAccountChanged.into());
+        }
+        Ok(())
+    }
+
+    /// Fetch real membership, bracketed by fresh account probes. Names and
+    /// remarks are data only; malformed IDs never become an authorization key.
+    pub async fn contacts(&self, no_cache: bool) -> Result<MilkyContacts> {
+        let bot_id = self.current_account().await?;
+        let (groups, friends) = tokio::try_join!(
+            self.call("get_group_list", json!({"no_cache": no_cache})),
+            self.call("get_friend_list", json!({"no_cache": no_cache})),
+        )?;
+        let groups = parse_contacts(&groups, "groups", "group_id", "group_name")?;
+        let friends = parse_contacts(&friends, "friends", "user_id", "nickname")?;
+        self.verify_account(bot_id).await?;
+        Ok(MilkyContacts {
+            bot_id,
+            groups,
+            friends,
+        })
     }
 
     fn invalidate_account(&self) -> u64 {
@@ -474,6 +529,39 @@ pub(crate) async fn read_bounded(mut response: reqwest::Response, limit: usize) 
     Ok(bytes)
 }
 
+fn parse_contacts(
+    data: &Value,
+    field: &str,
+    id_key: &str,
+    name_key: &str,
+) -> Result<Vec<MilkyContact>> {
+    let entries = data[field]
+        .as_array()
+        .context("Milky contacts list missing")?;
+    let mut ids = std::collections::HashSet::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let id = entry[id_key]
+                .as_i64()
+                .filter(|id| *id > 0)
+                .context("Milky contact ID invalid")?;
+            ensure!(ids.insert(id), "Milky contacts contain duplicate IDs");
+            Ok(MilkyContact {
+                id,
+                name: entry[name_key]
+                    .as_str()
+                    .context("Milky contact name missing")?
+                    .to_owned(),
+                remark: entry["remark"]
+                    .as_str()
+                    .context("Milky contact remark missing")?
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn normalize_event(
     bot_id: i64,
@@ -622,6 +710,74 @@ pub(crate) mod tests {
     fn event(segments: Value) -> Value {
         json!({"self_id": 123, "event_type": "message_receive", "data": {"message_scene": "group", "peer_id": 456,
             "sender_id": 789, "message_seq": 10, "segments": segments}})
+    }
+
+    #[test]
+    fn contact_lists_use_real_milky_fields_and_preserve_large_identifiers() {
+        let groups = parse_contacts(
+            &json!({"groups":[{"group_id":9007199254740993_i64,
+            "group_name":"群名称","remark":"群备注"}]}),
+            "groups",
+            "group_id",
+            "group_name",
+        )
+        .unwrap();
+        assert_eq!(
+            groups,
+            vec![MilkyContact {
+                id: 9_007_199_254_740_993,
+                name: "群名称".into(),
+                remark: "群备注".into()
+            }]
+        );
+        let friends = parse_contacts(
+            &json!({"friends":[{"user_id":789,"nickname":"好友名称","remark":""}]}),
+            "friends",
+            "user_id",
+            "nickname",
+        )
+        .unwrap();
+        assert_eq!(friends[0].id, 789);
+        assert_eq!(friends[0].name, "好友名称");
+        assert!(friends[0].remark.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_duplicate_contact_identifiers_cannot_authorize_a_scope() {
+        for data in [
+            json!({}),
+            json!({"groups":null}),
+            json!({"groups":[{"group_id":"123","group_name":"name","remark":""}]}),
+            json!({"groups":[{"group_id":0,"group_name":"name","remark":""}]}),
+            json!({"groups":[{"group_id":123,"remark":""}]}),
+            json!({"groups":[{"group_id":123,"group_name":"name"}]}),
+            json!({"groups":[{"group_id":123,"group_name":"one","remark":""},{"group_id":123,"group_name":"two","remark":""}]}),
+        ] {
+            assert!(parse_contacts(&data, "groups", "group_id", "group_name").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn administrative_identity_probe_does_not_invalidate_event_verification() {
+        let (url, server) = server(
+            "200 OK",
+            r#"{"status":"ok","retcode":0,"data":{"uin":123}}"#,
+        )
+        .await;
+        let milky = Milky::new(
+            MilkyConfig {
+                url,
+                ..Default::default()
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        milky.logged_in.store(123, Ordering::Release);
+        milky.verification.store(7, Ordering::Release);
+        milky.verify_account(123).await.unwrap();
+        assert_eq!(milky.verification.load(Ordering::Acquire), 7);
+        assert!(milky.is_verified());
+        server.await.unwrap();
     }
 
     #[test]

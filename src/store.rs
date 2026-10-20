@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot};
 
 type Work = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -14,6 +19,7 @@ enum Job {
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Job>,
+    scope_gates: Arc<Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>>,
 }
 impl Store {
     pub async fn open(path: impl AsRef<Path>, capacity: usize) -> Result<Self> {
@@ -53,9 +59,15 @@ impl Store {
         started
             .await
             .context("database worker stopped at startup")??;
-        let store = Self { sender };
+        let store = Self {
+            sender,
+            scope_gates: Arc::new(Mutex::new(HashMap::new())),
+        };
         store.call(|c| { c.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(plugin_id TEXT NOT NULL,version INTEGER NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(plugin_id,version));")?; Ok(()) }).await?;
         store.migrate("host", 1, HOST_SCHEMA).await?;
+        store
+            .migrate("scope_access", 1, crate::access::MIGRATION)
+            .await?;
         store.call(|c| {
             c.execute("UPDATE outbox SET state='unknown',detail='process stopped after submission' WHERE state='submitted'", [])?;
             c.execute("UPDATE outbox SET state='failed',detail='process stopped before submission' WHERE state='prepared'", [])?;
@@ -76,6 +88,22 @@ impl Store {
             })))
             .map_err(|_| anyhow!("database queue is full or closed"))?;
         rx.await.context("database worker closed")?
+    }
+
+    pub(crate) fn scope_gate(&self, key: &str) -> Result<Arc<tokio::sync::RwLock<()>>> {
+        let mut gates = self
+            .scope_gates
+            .lock()
+            .map_err(|_| anyhow!("scope gate unavailable"))?;
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return Ok(gate);
+        }
+        if gates.len() > 4096 {
+            gates.retain(|_, gate| gate.strong_count() > 0);
+        }
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        gates.insert(key.to_owned(), Arc::downgrade(&gate));
+        Ok(gate)
     }
 
     pub async fn migrate(&self, plugin: &str, version: i64, sql: &str) -> Result<()> {

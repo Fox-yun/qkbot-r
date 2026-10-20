@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -109,6 +109,7 @@ test("static UI removes admin-token entry and every literal DOM ID resolves", ()
   for (const match of script.matchAll(/\$\("([^"]+)"\)/gu)) assert.ok(h.ids.has(match[1]), match[1]);
   assert.doesNotMatch(script + html, /localStorage|sessionStorage|Authorization|admin-token|access\.admins|\/bot status|\/bot plugins|\/ai(?:\s|<)/u);
   assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|setInterval/u);
+  assert.doesNotMatch(script + html, /access\.groups|access\.friends|白名单/u);
 });
 test("setup and login state use password and CSRF session; writes send no bearer", async () => {
   const h = harness();
@@ -209,4 +210,109 @@ test("true logout calls the server before removing local session", async () => {
   const h = harness(); await h.login(); h.setHandler(async () => ({ body: {} }));
   await h.ids.get("logout").emit("click"); for (let i = 0; i < 10; i++) await Promise.resolve();
   assert.ok(h.calls.some((call) => call.path === "/api/auth/logout" && call.options.method === "POST")); assert.equal(h.app.state.authenticated, false);
+});
+
+const contacts = (botId = "123", count = 1) => ({
+  bot_id: botId, fetched_at: 1800000000,
+  groups: Array.from({ length: count }, (_, index) => ({ id: String(1000 + index), name: "群 " + index, remark: index === 0 ? "<img>测试备注" : "", enabled: true })),
+  friends: [{ id: "789", name: "小明", remark: "朋友备注", enabled: true }],
+});
+async function contactPage(h, data = contacts()) {
+  await h.login(); h.app.state.view = "contacts";
+  h.setHandler(async () => ({ body: data })); await h.app.loadContacts();
+}
+
+test("contacts work while bot is stopped, paginate and search without additional polling", async () => {
+  const h = harness(); await h.login();
+  h.app.state.status = { online: false, phase: "stopped", bot_id: null, runtime_generation: 3 };
+  h.app.state.view = "contacts";
+  h.setHandler(async () => ({ body: contacts("123", 65) }));
+  const timers = h.timers.size; await h.app.loadContacts();
+  assert.equal(h.app.state.contacts.phase, "ready"); assert.equal(h.timers.size, timers);
+  assert.equal(h.ids.get("contacts-account").textContent, "QQ 123");
+  assert.equal(h.ids.get("contacts-list").children.length, 30);
+  assert.equal(h.document.querySelectorAll("[data-contact-toggle]")[0].disabled, false);
+  h.app.renderStatus(); h.app.renderStatus();
+  assert.equal(h.app.state.contacts.phase, "ready", "a stable stopped runtime must not invalidate contact controls");
+  await h.ids.get("contacts-next").emit("click"); assert.equal(h.app.state.contacts.page, 2);
+  await h.ids.get("contacts-next").emit("click"); assert.equal(h.ids.get("contacts-list").children.length, 5);
+  const requests = h.calls.length;
+  h.ids.get("contacts-search").value = "测试备注"; await h.ids.get("contacts-search").emit("input");
+  assert.equal(h.app.state.contacts.page, 1); assert.equal(h.ids.get("contacts-list").children.length, 1);
+  assert.match(h.ids.get("contacts-list").textContent, /<img>测试备注/u);
+  h.ids.get("contacts-search").value = "1064"; await h.ids.get("contacts-search").emit("input");
+  assert.match(h.ids.get("contacts-list").textContent, /1064/u);
+  h.ids.get("contacts-search").value = ""; await h.ids.get("contacts-search").emit("input");
+  await h.ids.get("contacts-friends").emit("click");
+  assert.equal(h.ids.get("contacts-list").children.length, 1); assert.match(h.ids.get("contacts-list").textContent, /朋友备注/u);
+  assert.equal(h.calls.length, requests, "search and pagination must use the loaded snapshot");
+});
+
+test("contact switch submits bound string IDs with CSRF and confirms only the matching response", async () => {
+  const h = harness(); await contactPage(h);
+  let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const changing = h.app.toggleContact("group", "1000", false); await Promise.resolve();
+  const call = h.calls.at(-1);
+  assert.equal(call.path, "/api/qq/contacts/toggle");
+  assert.deepEqual(call.body, { bot_id: "123", scene: "group", peer_id: "1000", enabled: false });
+  assert.equal(call.options.headers["X-CSRF-Token"], "csrf-test");
+  assert.equal(h.app.state.contacts.groups[0].enabled, false);
+  assert.match(h.ids.get("contacts-list").textContent, /保存中/u);
+  assert.doesNotMatch(h.ids.get("contacts-message").textContent, /即时生效/u);
+  assert.equal(h.document.querySelectorAll("[data-contact-toggle]")[0].disabled, true);
+  resolve({ body: call.body }); await changing;
+  assert.match(h.ids.get("contacts-message").textContent, /已关闭，.*即时生效/u);
+  assert.equal(h.document.querySelectorAll("[data-contact-toggle]")[0].disabled, false);
+});
+
+test("lost or mismatched toggle acknowledgement rolls back the display and requires a refresh", async () => {
+  for (const result of [{ error: new Error("lost") }, { body: { bot_id: "456", scene: "group", peer_id: "1000", enabled: false } }]) {
+    const h = harness(); await contactPage(h); h.setHandler(async () => result);
+    await h.app.toggleContact("group", "1000", false);
+    assert.equal(h.app.state.contacts.groups[0].enabled, true); assert.equal(h.app.state.contacts.phase, "uncertain");
+    assert.match(h.ids.get("contacts-message").textContent, /未确认.*刷新/u);
+    assert.doesNotMatch(h.ids.get("contacts-message").textContent, /即时生效/u);
+    assert.equal(h.document.querySelectorAll("[data-contact-toggle]")[0].disabled, true);
+    const requests = h.calls.length; await h.app.toggleContact("group", "1000", false); assert.equal(h.calls.length, requests);
+    h.setHandler(async () => ({ body: { ...contacts(), groups: [{ ...contacts().groups[0], enabled: false }] } }));
+    await h.app.loadContacts(true); assert.equal(h.calls.at(-1).path, "/api/qq/contacts?force=true");
+    assert.equal(h.app.state.contacts.phase, "ready"); assert.equal(h.app.state.contacts.groups[0].enabled, false);
+  }
+});
+
+test("contact responses from an old page, login or account cannot restore the old list", async () => {
+  for (const invalidate of [
+    (h) => h.app.showView("overview"),
+    (h) => h.app.clearSession(),
+    (h) => { h.app.state.status = { online: false, phase: "stopped", runtime_generation: 4 }; h.app.renderStatus(); },
+  ]) {
+    const h = harness(); await h.login(); h.app.state.view = "contacts";
+    h.app.state.status = { online: false, phase: "stopped", runtime_generation: 3 };
+    let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
+    const old = h.app.loadContacts(); await Promise.resolve(); invalidate(h);
+    resolve({ body: contacts() }); await old;
+    assert.equal(h.app.state.contacts.botId, ""); assert.equal(h.ids.get("contacts-list").children.length, 0);
+  }
+  const h = harness(); await contactPage(h);
+  let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const old = h.app.toggleContact("group", "1000", false); await Promise.resolve();
+  h.app.state.status = { phase: "running", online: true, bot_id: "456", runtime_generation: 2 }; h.app.renderStatus();
+  resolve({ body: { bot_id: "123", scene: "group", peer_id: "1000", enabled: false } }); await old;
+  assert.equal(h.app.state.contacts.botId, ""); assert.doesNotMatch(h.ids.get("contacts-message").textContent, /即时生效/u);
+});
+
+test("stale account conflicts disable the old list; offline, empty and invalid data are clear", async () => {
+  const h = harness(); await contactPage(h);
+  h.setHandler(async () => ({ status: 409, body: { code: "contacts_stale", error: "账号变化" } }));
+  await h.app.toggleContact("group", "1000", false);
+  assert.equal(h.app.state.contacts.botId, ""); assert.equal(h.ids.get("contacts-list").children.length, 0);
+  assert.match(h.ids.get("contacts-message").textContent, /旧列表已停用/u);
+  h.setHandler(async () => ({ status: 502, body: { code: "contacts_offline", error: "QQ 未登录" } }));
+  await h.app.loadContacts(true); assert.equal(h.app.state.contacts.phase, "offline");
+  assert.match(h.ids.get("contacts-message").textContent, /QQ 已登录.*手动刷新/u);
+  h.setHandler(async () => ({ body: { ...contacts(), groups: [], friends: [] } }));
+  await h.app.loadContacts(true); assert.match(h.ids.get("contacts-message").textContent, /暂无群聊/u);
+  h.setHandler(async () => ({ body: { ...contacts(), groups: [contacts().groups[0], contacts().groups[0]] } }));
+  await h.app.loadContacts(true); assert.equal(h.app.state.contacts.phase, "error");
+  assert.equal(h.ids.get("contacts-list").children.length, 0);
 });

@@ -1,5 +1,6 @@
 //! Embedded administration with server sessions and a shared database service.
 pub mod auth;
+pub mod contacts;
 pub mod memory;
 pub mod qq;
 pub mod qq_service;
@@ -8,6 +9,7 @@ pub mod settings;
 
 use self::{
     auth::{AuthError, AuthGrant, AuthService, TrustedSession},
+    contacts::ContactsService,
     memory::{Actor, MemoryAdmin},
     qq_service::QqService,
     runtime::Runtime,
@@ -34,6 +36,7 @@ pub struct AdminState {
     auth: Arc<AuthService>,
     requests: Arc<Semaphore>,
     qq: QqService,
+    contacts: ContactsService,
     mutations: tokio_util::task::TaskTracker,
 }
 impl AdminState {
@@ -44,6 +47,7 @@ impl AdminState {
     ) -> Arc<Self> {
         Arc::new(Self {
             qq: QqService::new(store.clone()),
+            contacts: ContactsService::new(store.clone(), runtime.clone()),
             store,
             runtime,
             auth,
@@ -75,6 +79,8 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/runtime/stop", post(stop))
         .route("/api/qq/status", get(qq_status))
         .route("/api/qq/qrcode", post(qq_qrcode))
+        .route("/api/qq/contacts", get(qq_contacts))
+        .route("/api/qq/contacts/toggle", post(toggle_contact))
         .route("/api/budget", get(budget))
         .route("/api/memory/conversations", get(conversations))
         .route("/api/memory/conversations/{id}", get(conversation))
@@ -168,7 +174,7 @@ async fn protect(
                 );
                 // Passive polling must not keep an abandoned session alive indefinitely.
                 let touch = mutation
-                    || matches!(path.as_str(), "/api/config")
+                    || matches!(path.as_str(), "/api/config" | "/api/qq/contacts")
                     || (path.starts_with("/api/memory/")
                         && !path.starts_with("/api/memory/operations/"));
                 let session = match state.auth.authenticate(request.headers(), touch).await {
@@ -309,6 +315,21 @@ async fn qq_qrcode(State(s): State<Arc<AdminState>>) -> Response {
         Err(e) => qq_error(e),
     }
 }
+async fn qq_contacts(State(s): State<Arc<AdminState>>, Query(q): Query<Force>) -> Response {
+    result(async { Ok(serde_json::to_value(s.contacts.list(q.force).await?)?) }.await)
+}
+async fn toggle_contact(
+    State(s): State<Arc<AdminState>>,
+    Json(v): Json<contacts::ToggleRequest>,
+) -> Response {
+    result(
+        s.mutations
+            .clone()
+            .spawn(async move { Ok(serde_json::to_value(s.contacts.set_enabled(v).await?)?) })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("开关操作异常，请刷新列表核对状态"))),
+    )
+}
 fn qq_error(e: qq::QqError) -> Response {
     (
         e.status(),
@@ -320,6 +341,13 @@ fn result(r: Result<Value>) -> Response {
     match r {
         Ok(v) => Json(v).into_response(),
         Err(e) => {
+            if let Some(contact_error) = e.downcast_ref::<contacts::ContactsError>() {
+                return (
+                    contact_error.status(),
+                    Json(json!({"error":contact_error.to_string(),"code":contact_error.code()})),
+                )
+                    .into_response();
+            }
             let status = match e.downcast_ref::<memory::AdminError>() {
                 Some(memory::AdminError::Conflict(_)) => StatusCode::CONFLICT,
                 Some(memory::AdminError::NotFound(_)) => StatusCode::NOT_FOUND,

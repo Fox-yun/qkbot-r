@@ -378,6 +378,7 @@ impl MemoryStore {
 }
 
 fn check_guard(db: &Connection, guard: &ContextGuard) -> Result<()> {
+    crate::access::check_conversation(db, &guard.conversation_id)?;
     let epoch: Option<i64> = db
         .query_row(
             "SELECT epoch FROM ai_conversations WHERE id=?1",
@@ -1226,7 +1227,7 @@ mod tests {
     }
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
+        db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(CURSOR_MIGRATION).unwrap();
         db.execute_batch(ADMIN_MIGRATION).unwrap();

@@ -16,7 +16,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::{
+    sync::CancellationToken,
+    task::{TaskTracker, task_tracker::TaskTrackerToken},
+};
 
 struct Job {
     key: MessageKey,
@@ -34,6 +37,30 @@ struct Session {
     cancel: Option<CancellationToken>,
     active_guard: Option<ContextGuard>,
     touched: i64,
+}
+struct BackgroundJob {
+    guard: ContextGuard,
+    cancel: CancellationToken,
+}
+
+/// Match the model's single background slot, and remove registration even when
+/// the caller drops the maintenance future. Shutdown also waits for this lease.
+struct BackgroundLease<'a> {
+    registry: &'a Mutex<Option<Arc<BackgroundJob>>>,
+    job: Arc<BackgroundJob>,
+    _tracked: TaskTrackerToken,
+}
+impl Drop for BackgroundLease<'_> {
+    fn drop(&mut self) {
+        self.job.cancel.cancel();
+        let mut registered = self.registry.lock().unwrap();
+        if registered
+            .as_ref()
+            .is_some_and(|job| Arc::ptr_eq(job, &self.job))
+        {
+            *registered = None;
+        }
+    }
 }
 impl Session {
     fn waiting(&self) -> usize {
@@ -63,6 +90,7 @@ impl Session {
 pub struct Chat {
     host: Arc<Host>,
     sessions: Mutex<HashMap<String, Session>>,
+    background: Mutex<Option<Arc<BackgroundJob>>>,
     queued: Arc<Semaphore>,
     turns: Arc<Semaphore>,
     tasks: TaskTracker,
@@ -76,6 +104,7 @@ impl Chat {
             )),
             host,
             sessions: Mutex::new(HashMap::new()),
+            background: Mutex::new(None),
             tasks: TaskTracker::new(),
         })
     }
@@ -146,6 +175,9 @@ impl Chat {
         {
             state.cancel_epoch(guard);
         }
+        self.cancel_background(|active| {
+            active.conversation_id == guard.conversation_id && active.epoch == guard.epoch
+        });
     }
     pub fn cancel_scope(&self, scope: &Scope) {
         let prefix = format!("{}:", scope.key());
@@ -157,18 +189,47 @@ impl Chat {
                 }
             }
         }
+        self.cancel_background(|guard| guard.conversation_id.starts_with(&prefix));
     }
     /// A late web receipt must never cancel work accepted under its new generation.
     pub fn cancel_before(&self, conversation_id: &str, epoch: i64) {
         if let Some(state) = self.sessions.lock().unwrap().get_mut(conversation_id) {
             state.cancel_before(epoch);
         }
+        self.cancel_background(|guard| {
+            guard.conversation_id == conversation_id && guard.epoch < epoch
+        });
+    }
+    fn cancel_background(&self, matches: impl FnOnce(&ContextGuard) -> bool) {
+        if let Some(job) = self.background.lock().unwrap().as_ref()
+            && matches(&job.guard)
+        {
+            job.cancel.cancel();
+        }
+    }
+    fn begin_background(&self, guard: &ContextGuard) -> Option<BackgroundLease<'_>> {
+        let mut registered = self.background.lock().unwrap();
+        if registered.is_some() || self.host.cancel.is_cancelled() {
+            return None;
+        }
+        let job = Arc::new(BackgroundJob {
+            guard: guard.clone(),
+            cancel: self.host.cancel.child_token(),
+        });
+        let lease = BackgroundLease {
+            registry: &self.background,
+            job: job.clone(),
+            _tracked: self.tasks.token(),
+        };
+        *registered = Some(job);
+        Some(lease)
     }
     pub fn pending(&self) -> usize {
         self.host.config.limits.queued_global - self.queued.available_permits()
     }
     pub async fn shutdown(&self) {
         self.host.cancel.cancel();
+        self.cancel_background(|_| true);
         for state in self.sessions.lock().unwrap().values_mut() {
             state.queue.clear();
             if let Some(c) = &state.cancel {
@@ -553,19 +614,25 @@ impl Chat {
                 tracing::debug!("memory prefix exceeds budget; waiting for smaller batch");
                 continue;
             };
-            let response = self
-                .host
-                .llm
-                .as_ref()
-                .unwrap()
-                .complete_background_admitted(
+            let Some(background) = self.begin_background(&guard) else {
+                return Ok(());
+            };
+            // A scope may have changed during preparation, before its cancellation
+            // could see this registration. Validate again after registering.
+            if !self.host.valid(&guard).await? || background.job.cancel.is_cancelled() {
+                continue;
+            }
+            let response = tokio::select! {
+                biased;
+                _ = background.job.cancel.cancelled() => return Ok(()),
+                response = self.host.llm.as_ref().unwrap().complete_background_admitted(
                     input.messages,
                     self.host.config.plugins.ai.memory_output_budget,
-                    &self.host.cancel,
+                    &background.job.cancel,
                     guard.clone(),
                     self.host.epochs["ai"],
-                )
-                .await?;
+                ) => response?,
+            };
             if let Some(response) = response {
                 self.host.usage("memory", &response).await?;
                 let update: BatchUpdate = serde_json::from_str(
@@ -573,7 +640,7 @@ impl Chat {
                         .as_str()
                         .context("整理结果缺少文本")?,
                 )?;
-                if self.host.valid(&guard).await? {
+                if self.host.valid(&guard).await? && !background.job.cancel.is_cancelled() {
                     let busy = self
                         .sessions
                         .lock()
@@ -607,7 +674,7 @@ fn compaction_candidates(
                 COALESCE(json_extract(settings,'$.memory_write'),?2) AS memory_on,
                 COALESCE(json_extract(settings,'$.paused'),?3) AS is_paused,
                 MAX(2,COALESCE(json_extract(settings,'$.recent_messages'),?4)) AS recent
-            FROM ai_conversations c
+            FROM ai_conversations c WHERE NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=c.scope AND a.enabled=0)
         ), eligible AS (
             SELECT *, CASE
                 WHEN summary_on AND memory_on THEN MIN(compacted_until,memory_processed_until)
@@ -745,6 +812,47 @@ mod tests {
             quote_seq: None,
             received_at: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn background_registration_is_bounded_and_generation_scoped() {
+        let host = local_host().await;
+        let chat = Chat::new(host.clone());
+        let guard = ContextGuard {
+            conversation_id: "1:group:2:v0:group".into(),
+            epoch: 2,
+        };
+        let old = ContextGuard {
+            epoch: 1,
+            ..guard.clone()
+        };
+        let other = ContextGuard {
+            conversation_id: "1:group:3:v0:group".into(),
+            epoch: 1,
+        };
+        let first = chat.begin_background(&guard).unwrap();
+        assert!(chat.begin_background(&guard).is_none());
+        assert!(chat.begin_background(&other).is_none());
+        chat.cancel(&old);
+        chat.cancel_before(&guard.conversation_id, 2);
+        chat.cancel_before(&other.conversation_id, 3);
+        assert!(!first.job.cancel.is_cancelled());
+        chat.cancel_before(&guard.conversation_id, 3);
+        assert!(first.job.cancel.is_cancelled());
+        // Cancellation alone cannot create a replacement before the old future drains.
+        assert!(chat.begin_background(&guard).is_none());
+        drop(first);
+        let second = chat.begin_background(&guard).unwrap();
+        chat.cancel_scope(&incoming(1).key.scope);
+        assert!(second.job.cancel.is_cancelled());
+        drop(second);
+        let third = chat.begin_background(&guard).unwrap();
+        chat.cancel(&guard);
+        assert!(third.job.cancel.is_cancelled());
+        drop(third);
+        chat.shutdown().await;
+        assert!(chat.begin_background(&guard).is_none());
+        host.store.stop().await.unwrap();
     }
 
     #[tokio::test]

@@ -1,8 +1,4 @@
-use crate::{
-    llm::LlmConfig,
-    milky::MilkyConfig,
-    types::{Scene, Scope},
-};
+use crate::{llm::LlmConfig, milky::MilkyConfig};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, path::Path};
@@ -13,7 +9,12 @@ pub struct Config {
     pub app: AppConfig,
     pub milky: MilkyConfig,
     pub llm: LlmConfig,
-    pub access: AccessConfig,
+    #[serde(
+        rename = "access",
+        skip_serializing,
+        deserialize_with = "ignore_legacy_access"
+    )]
+    _legacy_access: Option<()>,
     pub limits: Limits,
     pub plugins: PluginsConfig,
     pub web: WebConfig,
@@ -93,32 +94,11 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct AccessConfig {
-    pub groups: Vec<i64>,
-    pub friends: Vec<i64>,
-    #[serde(
-        rename = "admins",
-        skip_serializing,
-        deserialize_with = "ignore_legacy_admins"
-    )]
-    _legacy_admins: Vec<i64>,
-}
-impl AccessConfig {
-    pub fn allows(&self, scope: &Scope) -> bool {
-        match scope.scene {
-            Scene::Group => self.groups.contains(&scope.peer_id),
-            Scene::Friend => self.friends.contains(&scope.peer_id),
-        }
-    }
-}
-
-fn ignore_legacy_admins<'de, D: serde::Deserializer<'de>>(
+fn ignore_legacy_access<'de, D: serde::Deserializer<'de>>(
     d: D,
-) -> std::result::Result<Vec<i64>, D::Error> {
+) -> std::result::Result<Option<()>, D::Error> {
     let _ = serde::de::IgnoredAny::deserialize(d)?;
-    Ok(Vec::new())
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

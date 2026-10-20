@@ -1,4 +1,5 @@
 use crate::{
+    access::AccessStore,
     config::Config,
     llm::Llm,
     milky::{Milky, SendOutcome},
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Host {
     pub config: Arc<Config>,
     pub store: Store,
+    pub access: AccessStore,
     pub milky: Milky,
     pub llm: Option<Llm>,
     pub memory: MemoryStore,
@@ -80,6 +82,7 @@ impl Host {
         crate::plugins::reminder::recover_interrupted(&store).await?;
         let host = Arc::new(Self {
             config: Arc::new(config),
+            access: AccessStore::new(store.clone()),
             store,
             milky,
             llm,
@@ -98,7 +101,15 @@ impl Host {
     pub async fn valid(&self, guard: &ContextGuard) -> Result<bool> {
         let g = guard.clone();
         let epoch = self.epochs.get("ai").copied().unwrap_or(0);
-        self.store.call(move|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ai_conversations c,plugin_states p WHERE c.id=?1 AND c.epoch=?2 AND p.id='ai' AND p.enabled=1 AND p.epoch=?3)",params![g.conversation_id,g.epoch,epoch],|r|r.get(0))?)).await
+        self.store.call(move|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ai_conversations c,plugin_states p WHERE c.id=?1 AND c.epoch=?2 AND p.id='ai' AND p.enabled=1 AND p.epoch=?3 AND NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=c.scope AND a.enabled=0))",params![g.conversation_id,g.epoch,epoch],|r|r.get(0))?)).await
+    }
+
+    async fn accepts_message(&self, message: &crate::types::Incoming) -> Result<bool> {
+        let scope = message.key.scope.key();
+        let source = message.key.key();
+        self.store
+            .call(move |db| Ok(crate::access::message_revision(db, &scope, &source).is_ok()))
+            .await
     }
 
     /// Persist intent before submission. An ambiguous send is never retried here.
@@ -110,7 +121,27 @@ impl Host {
         inbound_position: i64,
         text: String,
     ) -> Result<SendOutcome> {
-        ensure!(self.config.access.allows(scope), "会话不在白名单中");
+        let scope_key = scope.key();
+        let access_revision = self
+            .store
+            .call(move |db| {
+                let revision = crate::access::require_enabled(db, &scope_key)?;
+                if inbound_position > 0 {
+                    use rusqlite::OptionalExtension;
+                    let original: Option<i64> = db
+                        .query_row(
+                            "SELECT access_revision FROM messages WHERE id=?1 AND scope=?2",
+                            params![inbound_position, scope_key],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if original != Some(revision) {
+                        return Err(crate::access::AccessDisabled.into());
+                    }
+                }
+                Ok(revision)
+            })
+            .await?;
         ensure!(
             !text.trim().is_empty() && text.len() <= self.config.limits.max_message_bytes,
             "发送文本为空或超出上限"
@@ -135,6 +166,7 @@ impl Host {
             let g = guard.clone();
             let delay=self.store.call(move|c| {
             let tx=c.transaction()?;
+            crate::access::check_revision(&tx,&scope_key,access_revision)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g { check_guard(&tx,g)?; }
             let count:i64=tx.query_row("SELECT COUNT(*) FROM outbox WHERE scope=?1 AND created_at>?2 AND state IN('prepared','submitted','confirmed','unknown')",params![scope_key,now()-3600],|r|r.get(0))?;
@@ -143,7 +175,7 @@ impl Host {
                 let last:Option<i64>=tx.query_row("SELECT MAX(created_at) FROM outbox WHERE scope=?1 AND origin_plugin='ai' AND state IN('prepared','submitted','confirmed','unknown')",[&scope_key],|r|r.get(0))?;
                 if let Some(last)=last {let delay=last+cooldown-now();if delay>0{return Ok(Some(delay));}}
             }
-            tx.execute("INSERT INTO outbox(id,scope,origin_plugin,plugin_epoch,conversation_id,context_epoch,body,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'prepared',?8,?8)",params![id1,scope_key,origin,plugin_epoch,g.as_ref().map(|x|&x.conversation_id),g.as_ref().map(|x|x.epoch),body,now()])?;
+            tx.execute("INSERT INTO outbox(id,scope,origin_plugin,plugin_epoch,conversation_id,context_epoch,body,state,created_at,updated_at,access_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,'prepared',?8,?8,?9)",params![id1,scope_key,origin,plugin_epoch,g.as_ref().map(|x|&x.conversation_id),g.as_ref().map(|x|x.epoch),body,now(),access_revision])?;
             tx.commit()?; Ok(None)
         }).await?;
             match delay {
@@ -156,11 +188,14 @@ impl Host {
         let id1 = id.clone();
         let origin = plugin.to_owned();
         let g = guard.clone();
+        let scope_key = scope.key();
+        let _delivery = self.access.delivery_guard(scope).await?;
         let submit=self.store.call(move|c|{
             let tx=c.transaction()?;
+            crate::access::check_revision(&tx,&scope_key,access_revision)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g {check_guard(&tx,g)?;}
-            tx.execute("UPDATE outbox SET state='submitted',updated_at=?2 WHERE id=?1 AND state='prepared'",params![id1,now()])?;
+            ensure!(tx.execute("UPDATE outbox SET state='submitted',updated_at=?2 WHERE id=?1 AND state='prepared'",params![id1,now()])?==1,"发送已取消");
             tx.commit()?;Ok(())
         }).await;
         if let Err(e) = submit {
@@ -190,11 +225,11 @@ impl Host {
             let tx=c.transaction()?;
             tx.execute("UPDATE outbox SET state=?2,message_seq=?3,detail=?4,updated_at=?5 WHERE id=?1",params![id,state,seq,detail,now()])?;
             if let Some(seq)=seq {
-                let valid=origin=="ai"&&guard.as_ref().is_some_and(|g|check_guard(&tx,g).is_ok())&&check_plugin(&tx,&origin,plugin_epoch).is_ok();
+                let valid=origin=="ai"&&guard.as_ref().is_some_and(|g|check_guard(&tx,g).is_ok())&&check_plugin(&tx,&origin,plugin_epoch).is_ok()&&crate::access::check_revision(&tx,&scope.key(),access_revision).is_ok();
                 let (conversation,epoch)=if valid {let g=guard.as_ref().unwrap();(g.conversation_id.clone(),g.epoch)}else{(String::new(),0)};
                 let role=if valid{"assistant"}else{"system"};
                 let key=format!("{}:{}",scope.key(),seq);
-                tx.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,origin_plugin,learnable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0) ON CONFLICT(key) DO UPDATE SET role=excluded.role,content=excluded.content,conversation_id=excluded.conversation_id,epoch=excluded.epoch,inbound_position=excluded.inbound_position,origin_plugin=excluded.origin_plugin",params![key,scope.key(),conversation,epoch,scope.bot_id,role,text,now(),inbound_position,origin])?;
+                tx.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,origin_plugin,learnable,access_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11) ON CONFLICT(key) DO UPDATE SET role=excluded.role,content=excluded.content,conversation_id=excluded.conversation_id,epoch=excluded.epoch,inbound_position=excluded.inbound_position,origin_plugin=excluded.origin_plugin,access_revision=excluded.access_revision",params![key,scope.key(),conversation,epoch,scope.bot_id,role,text,now(),inbound_position,origin,access_revision])?;
             }
             tx.commit()?;Ok(())
         }).await;
@@ -256,12 +291,14 @@ impl Router {
     pub async fn dispatch(&self, msg: crate::types::Incoming) -> Result<()> {
         use crate::plugins::ai;
         let host = &self.host;
-        if !host.config.access.allows(&msg.key.scope)
-            || msg.text.len() > host.config.limits.max_message_bytes
+        if msg.text.len() > host.config.limits.max_message_bytes
             || removed_management_command(&msg.text)
         {
             return Ok(());
         }
+        let Some(access_revision) = host.access.allowed_revision(&msg.key.scope).await? else {
+            return Ok(());
+        };
         let handler = msg
             .text
             .split_whitespace()
@@ -293,11 +330,12 @@ impl Router {
         let context = conv.clone();
         let pos=host.store.call(move|c|{
             let tx=c.transaction()?;
+            if crate::access::check_revision(&tx,&incoming.key.scope.key(),access_revision).is_err() { return Ok(None); }
             let (id,epoch)=context.as_ref().map(|v|(v.guard.conversation_id.clone(),v.guard.epoch)).unwrap_or((String::new(),0));
             let role=if incoming.is_self(){"self_unknown"}else if keep||learn{"user"}else{"control"};
             let text=if keep||learn{incoming.text.as_str()}else{""};
             let origin=if command.is_some(){Some("control")}else if learn&&!keep {Some("memory_only")}else{None};
-            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn])?;
+            let changed=tx.execute("INSERT OR IGNORE INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,origin_plugin,learnable,access_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![incoming.key.key(),incoming.key.scope.key(),id,epoch,incoming.sender_id,role,text,incoming.received_at,origin,learn,access_revision])?;
             if changed==0{return Ok(None);}
             let id=tx.last_insert_rowid();tx.execute("UPDATE messages SET inbound_position=id WHERE id=?1",[id])?;
             tx.commit()?;Ok(Some(id))
@@ -339,6 +377,9 @@ impl Router {
             };
             self.tasks.spawn(async move {
                 let _permit = permit;
+                if !host.accepts_message(&msg).await.unwrap_or(false) {
+                    return;
+                }
                 let origin = handler.spec().id;
                 let result = if handler.accepts(&msg) {
                     match tokio::time::timeout(
@@ -377,6 +418,9 @@ impl Router {
             let message = msg.clone();
             self.tasks.spawn(async move {
                 let _permit = permit;
+                if !host.accepts_message(&message).await.unwrap_or(false) {
+                    return;
+                }
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     observer.on_message(&host, &message),
@@ -476,7 +520,12 @@ impl Router {
             }
             let text = format!("提醒 用户 {}：{}\nID：{}", due.actor_id, due.text, due.id);
             let result = self.host.send(&due.scope, "reminder", None, 0, text).await;
-            if result.is_err() && self.host.cancel.is_cancelled() {
+            if result.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<crate::access::AccessDisabled>()
+                    .is_some()
+            }) || (result.is_err() && self.host.cancel.is_cancelled())
+            {
                 reminder::release_claim(&self.host.store, &due.id).await?;
                 continue;
             }
@@ -536,6 +585,7 @@ fn removed_management_command(text: &str) -> bool {
 }
 
 async fn route_command(host: &Host, msg: &crate::types::Incoming, command: &str) -> Result<String> {
+    ensure!(host.accepts_message(msg).await?, "此指令已失效");
     use crate::tools::ToolOutcome;
     let parts: Vec<_> = msg.text.split_whitespace().collect();
     if command == "/bot" {
@@ -571,7 +621,7 @@ fn command_root(text: &str) -> Option<&'static str> {
 }
 pub fn check_guard(c: &rusqlite::Connection, g: &ContextGuard) -> Result<()> {
     let valid: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1 AND epoch=?2)",
+        "SELECT EXISTS(SELECT 1 FROM ai_conversations c WHERE id=?1 AND epoch=?2 AND NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=c.scope AND a.enabled=0))",
         params![g.conversation_id, g.epoch],
         |r| r.get(0),
     )?;
@@ -596,5 +646,68 @@ mod routing_tests {
         assert_eq!(command_root("/clock now"), Some("/clock"));
         assert_eq!(command_root("他说 /bot confirm TOKEN"), None);
         assert_eq!(command_root("/aifoo"), None);
+    }
+    #[tokio::test]
+    async fn disabled_group_ingress_is_silent_and_never_persists_or_executes() {
+        let mut config = Config::from_toml(include_str!("../config.example.toml")).unwrap();
+        config.app.database = ":memory:".into();
+        config.plugins.ai.enabled = false;
+        let host = Host::create(config).await.unwrap();
+        let router = Router::new(host.clone());
+        let scope = Scope {
+            bot_id: 1,
+            scene: crate::types::Scene::Group,
+            peer_id: 20,
+        };
+        host.access.set_enabled(scope.clone(), false).await.unwrap();
+        for (index, text) in [
+            "小鱼记住我喜欢绿茶",
+            "/clock",
+            "/remind add 60 不应创建",
+            "/bot confirm anything",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            router
+                .dispatch(crate::types::Incoming {
+                    key: crate::types::MessageKey {
+                        scope: scope.clone(),
+                        message_seq: index as i64 + 1,
+                    },
+                    sender_id: 7,
+                    text: text.into(),
+                    mentions: vec![1],
+                    quote_seq: None,
+                    received_at: now(),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            host.send(&scope, "host", None, 0, "不应发送".into())
+                .await
+                .is_err()
+        );
+        host.store
+            .call(|db| {
+                for table in [
+                    "messages",
+                    "outbox",
+                    "ai_memories",
+                    "tool_runs",
+                    "reminder_jobs",
+                ] {
+                    assert_eq!(
+                        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        router.shutdown().await.unwrap();
     }
 }

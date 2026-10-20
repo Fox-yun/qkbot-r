@@ -30,13 +30,7 @@ impl Plugin for ClockPlugin {
         }
         match host
             .gateway
-            .direct(
-                message.key.scope.clone(),
-                message.sender_id,
-                "clock_now",
-                json!({}),
-                message.received_at,
-            )
+            .direct_message(message, "clock_now", json!({}))
             .await?
         {
             crate::tools::ToolOutcome::Completed { receipt, .. } => Ok(receipt),

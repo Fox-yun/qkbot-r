@@ -10,8 +10,20 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
         .unwrap();
     Milky::new(config.milky, http.clone()).unwrap();
     Llm::new(config.llm, http).unwrap();
-    assert!(config.access.groups.is_empty());
     assert_eq!(config.plugins.ai.defaults.mode, "group");
+}
+
+#[test]
+fn legacy_access_is_readable_but_absent_from_saved_configuration() {
+    let config: Config =
+        toml::from_str("[access]\ngroups = [123]\nfriends = []\nadmins = [456]").unwrap();
+    assert!(
+        serde_json::to_value(&config)
+            .unwrap()
+            .get("access")
+            .is_none()
+    );
+    assert!(!toml::to_string(&config).unwrap().contains("[access]"));
 }
 
 #[test]

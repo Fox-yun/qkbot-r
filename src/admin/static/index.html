@@ -35,6 +35,7 @@
       <nav class="navigation" aria-label="主要导航">
         <button class="nav-item active" type="button" data-view="overview" aria-current="page"><span aria-hidden="true">◫</span>运行概览</button>
         <button class="nav-item" type="button" data-view="qq"><span aria-hidden="true">◎</span>QQ 登录</button>
+        <button class="nav-item" type="button" data-view="contacts"><span aria-hidden="true">◉</span>群与好友</button>
         <button class="nav-item" type="button" data-view="memory"><span aria-hidden="true">▤</span>记忆与上下文</button>
         <button class="nav-item" type="button" data-view="config"><span aria-hidden="true">≡</span>配置管理</button>
       </nav>
@@ -53,12 +54,24 @@
         </div>
         <div class="metrics-grid"><article class="card metric"><span class="section-label">当前机器人</span><strong id="bot-id">—</strong><span class="hint">Milky 已确认的 QQ 号</span></article><article class="card metric"><span class="section-label">本次启动</span><strong id="started-at">—</strong><span class="hint">运行时启动时间</span></article><article class="card metric"><span class="section-label">配置状态</span><strong id="revision-state">—</strong><span id="revision-detail" class="hint">保存后需应用才能生效</span></article></div>
         <article class="card budget-card"><div class="card-top"><div><span class="section-label">模型用量与预算</span><h2>请求预算与使用情况</h2></div><button id="refresh-budget" class="text-button accent" type="button" data-action>刷新用量</button></div><div id="budget-usage" class="budget-grid"><p class="muted">正在读取用量。</p></div><p class="hint">预算控制会影响后续模型请求。上下文的保守估算与服务商实际 token 用量分别显示。</p></article>
-        <article class="card setup-card"><div><span class="section-label">首次使用</span><h2>三步开始聊天</h2></div><ol class="steps"><li><span>01</span><div><strong>配置连接</strong><p>填写模型接口、Milky 地址与会话白名单。</p></div></li><li><span>02</span><div><strong>登录 QQ</strong><p>通过 LLBot 管理端获取二维码并扫码。</p></div></li><li><span>03</span><div><strong>连接机器人</strong><p>保存并应用后，在白名单会话中 @小鱼或使用触发词。</p></div></li></ol></article>
+        <article class="card setup-card"><div><span class="section-label">首次使用</span><h2>三步开始聊天</h2></div><ol class="steps"><li><span>01</span><div><strong>配置连接</strong><p>填写模型接口与 Milky 地址。</p></div></li><li><span>02</span><div><strong>登录 QQ</strong><p>通过 LLBot 管理端获取二维码并扫码。</p></div></li><li><span>03</span><div><strong>连接机器人</strong><p>保存并应用后，在群聊中 @小鱼或使用触发词；会话开关在「群与好友」中管理。</p></div></li></ol></article>
       </section>
 
       <section id="view-qq" class="view" aria-labelledby="qq-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">ACCOUNT</p><h1 id="qq-title">QQ 登录</h1><p class="muted">扫码操作由本机 LLBot 管理端提供。</p></div><div class="button-row"><span id="qq-badge" class="badge neutral">待同步</span><button id="refresh-qq" class="button secondary" type="button" data-action>刷新状态</button></div></div>
         <div class="qq-layout"><article class="card qr-card"><div id="qr-placeholder" class="qr-placeholder"><span aria-hidden="true">▦</span><strong>等待获取二维码</strong><p>点击下方按钮，用手机 QQ 扫码登录。</p></div><img id="qr-image" class="qr-image" alt="使用手机 QQ 扫描此登录二维码" hidden><p id="qr-expiry" class="hint">二维码不会自动刷新，避免正在扫描时失效。</p><button id="get-qr" class="button primary" type="button" data-action>获取登录二维码</button><p id="qq-detail" class="muted">登录状态按服务端建议间隔同步；页面隐藏时暂停。</p></article><div class="stack"><article class="card"><span class="section-label">连接说明</span><h2>两个地址，各司其职</h2><p class="muted">先按官方文档安装并运行 LLBot，完成运行模式与签名授权配置，再在这里填写 WebUI 密码。小鱼 Rust 程序需要配合已运行的 LLBot 使用。</p><dl class="help-list"><div><dt>QQ 管理端 · 通常 3080</dt><dd>获取二维码和检查账号登录状态，填写在「QQ 登录管理」配置中。这里只使用 LLBot WebUI 密码，不收集 QQ 密码或签名 auth_token。</dd></div><div><dt>Milky 接口 · 通常 3010</dt><dd>收发 QQ 消息，需在 LLBot 中启用 Milky 并填写正确的访问令牌。</dd></div></dl><p class="hint">浏览器只访问小鱼管理台；小鱼在服务端连接 LLBot。远程部署时地址以小鱼所在机器为准。</p><a class="text-link" href="https://luckylillia.com/guide/config" target="_blank" rel="noopener noreferrer">LLBot 官方配置文档 ↗</a></article><article class="card soft-card"><h3>扫码之后</h3><p class="muted">已点击连接的机器人会等待登录完成，然后自动接入 Milky，无需反复重启。若账号已登录，可直接返回运行概览连接。</p><button class="text-button accent" type="button" data-view="config">检查连接配置 →</button></article></div></div>
+      </section>
+
+      <section id="view-contacts" class="view" aria-labelledby="contacts-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">GROUPS & FRIENDS</p><h1 id="contacts-title">群与好友</h1><p class="muted">为每个群和好友单独控制 Bot，修改自动保存并即时生效。</p></div><button id="refresh-contacts" class="button secondary" type="button">刷新列表</button></div>
+        <article class="card contacts-card">
+          <div class="card-top"><div><span class="section-label">当前 QQ 账号</span><h2 id="contacts-account">尚未读取</h2></div><span id="contacts-updated" class="hint">进入此页后加载</span></div>
+          <p class="hint contacts-help">黑名单机制：所有群和好友默认开启，包括新加入的群和新好友；仅关闭的对象会被拦截。群聊仍由 @ 或关键词触发；关闭后保留既有记忆。QQ 已登录即可管理开关。</p>
+          <div class="contacts-toolbar"><div class="contact-tabs" role="group" aria-label="联系人类型"><button id="contacts-groups" class="contact-tab active" type="button" aria-pressed="true">群聊</button><button id="contacts-friends" class="contact-tab" type="button" aria-pressed="false">好友</button></div><input id="contacts-search" type="search" aria-label="搜索群或好友" placeholder="搜索名称、备注或 ID" autocomplete="off"></div>
+          <p id="contacts-message" class="contacts-message muted" role="status" aria-live="polite">正在准备联系人列表。</p>
+          <div id="contacts-list" class="contacts-list" aria-label="群与好友开关"></div>
+          <div class="pagination"><button id="contacts-prev" class="text-button" type="button">← 上一页</button><span id="contacts-page" class="hint">第 1 页</span><button id="contacts-next" class="text-button" type="button">下一页 →</button></div>
+        </article>
       </section>
 
       <section id="view-memory" class="view" aria-labelledby="memory-title" hidden>

@@ -10,6 +10,7 @@
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
     pendingOperation: null,
+    contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
   const inputs = new Map();
   const secretInputs = new Map();
@@ -56,9 +57,7 @@
       field("qq_login.url", "LLBot WebUI 地址", "text", "通常为 http://127.0.0.1:3080。", { placeholder: "http://127.0.0.1:3080" }),
       { secret: "llbot_token", label: "LLBot WebUI 密码 / 令牌" },
     ] },
-    { title: "会话与触发", description: "仅处理白名单中的会话。真实 @机器人、私聊或关键词可触发聊天。", fields: [
-      field("access.groups", "允许的群号", "ids", "每行一个，也可使用逗号或空格分隔。空列表不允许群聊。"),
-      field("access.friends", "允许的私聊 QQ 号", "ids", "每行一个。空列表不允许私聊。"),
+    { title: "会话与触发", description: "真实 @机器人、私聊或关键词可触发聊天。每个会话的 Bot 开关在「群与好友」中管理。", fields: [
       field("plugins.ai.keywords", "关键词触发", "lines", "每行一个；子串匹配。清空后仍可通过真实 @或私聊触发。"),
       field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有会话在「记忆与上下文」中单独管理。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
       field("plugins.ai.defaults.persona", "默认人设名称", "text", "必须与下方人设表中的名称对应。"),
@@ -406,6 +405,7 @@
     document.querySelectorAll("#memory-editor-form input,#memory-editor-form select,#memory-editor-form textarea").forEach((node) => { node.disabled = state.busy || pending; });
     $("edit-memory-subject").disabled ||= Boolean(state.memory.editing?.id);
     $("edit-memory-locked").disabled ||= !state.memory.editing?.id;
+    updateContactControls();
   }
 
   async function loadConfig() {
@@ -434,6 +434,10 @@
   function renderStatus() {
     if (!state.status) { updateControls(); return; }
     const status = state.status;
+    const contacts = state.contacts;
+    if ((contacts.botId || contacts.loading) && ((contacts.generation != null && status.runtime_generation != null && contacts.generation !== status.runtime_generation) || (contacts.botId && status.online && status.bot_id != null && String(status.bot_id) !== contacts.botId))) {
+      invalidateContacts("机器人连接或账号已变化，请刷新联系人列表。");
+    }
     const [label, title, kind] = phases[status.phase] || ["未知状态", "等待状态更新", "neutral"];
     badge("runtime-badge", label, kind); badge("header-status", label, kind);
     $("runtime-title").textContent = title;
@@ -510,6 +514,8 @@
     try {
       const result = await api("/api/qq/status" + (manual ? "?force=true" : ""));
       if (version !== state.qqQueryVersion) return;
+      const previous = state.qq;
+      if (state.contacts.botId && previous?.online && String(previous.uin) === state.contacts.botId && (!result.online || String(result.uin) !== state.contacts.botId)) invalidateContacts("QQ 登录状态或账号已变化，请登录后刷新联系人列表。", "offline");
       state.qq = result; state.qqError = ""; state.qqFailures = 0;
       state.qqInterval = Math.max(result.online ? 30000 : 1000, Math.min(60000, Number(result.poll_interval_ms) || 5000));
       renderQq();
@@ -527,6 +533,108 @@
       state.qrExpires = Number(result.expires_at) || null; state.qqInterval = Math.max(1000, Math.min(60000, Number(result.poll_interval_ms) || 5000));
       renderQq(); scheduleQq();
     } catch (error) { if (version === state.qqQueryVersion && error.status !== -1) { qqFailure(error); renderQq(); scheduleQq(); } throw error; }
+  }
+  const CONTACT_PAGE_SIZE = 30;
+  const contactId = (value) => typeof value === "string" && /^[1-9]\d{0,19}$/u.test(value);
+  const contactsCurrent = (version, session) => state.authenticated && state.session === session && state.contacts.version === version && state.view === "contacts";
+  function invalidateContacts(message = "进入此页后加载联系人列表。", phase = "idle") {
+    const c = state.contacts;
+    c.version++; c.loading = false; c.saving = null; c.phase = phase; c.message = message;
+    c.botId = ""; c.generation = null; c.groups = []; c.friends = []; c.fetchedAt = null; c.page = 1;
+    renderContacts();
+  }
+  function updateContactControls() {
+    const c = state.contacts, blocked = !state.authenticated || state.busy;
+    $("refresh-contacts").disabled = blocked || c.loading || Boolean(c.saving);
+    $("contacts-search").disabled = !state.authenticated || c.loading;
+    $("contacts-prev").disabled = blocked || c.loading || c.page <= 1;
+    $("contacts-next").disabled = blocked || c.loading || c.page >= c.totalPages;
+    document.querySelectorAll("[data-contact-toggle]").forEach((input) => { input.disabled = blocked || c.phase !== "ready" || c.loading || Boolean(c.saving); });
+  }
+  function renderContacts() {
+    const c = state.contacts, name = c.scene === "group" ? "群聊" : "好友";
+    $("contacts-account").textContent = c.botId ? "QQ " + c.botId : "尚未读取";
+    $("contacts-updated").textContent = c.fetchedAt == null ? "按需读取 · 手动刷新" : "更新于 " + dateText(c.fetchedAt);
+    for (const [id, scene, rows, title] of [["contacts-groups", "group", c.groups, "群聊"], ["contacts-friends", "friend", c.friends, "好友"]]) {
+      const active = scene === c.scene;
+      $(id).textContent = title + (c.botId ? " · " + rows.length : "");
+      $(id).classList.toggle("active", active); $(id).setAttribute("aria-pressed", String(active));
+    }
+    const query = c.query.trim().toLocaleLowerCase();
+    const rows = (c.scene === "group" ? c.groups : c.friends).filter((row) => !query || [row.name, row.remark, row.id].some((text) => text.toLocaleLowerCase().includes(query)));
+    c.totalPages = Math.max(1, Math.ceil(rows.length / CONTACT_PAGE_SIZE)); c.page = Math.min(Math.max(c.page, 1), c.totalPages);
+    const message = $("contacts-message");
+    message.className = "contacts-message " + (["error", "uncertain"].includes(c.phase) ? "inline-error" : "muted");
+    message.textContent = c.loading ? "正在读取当前账号的群与好友……" : c.message || (c.phase === "ready" ? rows.length ? `${name} ${rows.length} 个 · 修改后自动保存` : query ? "没有匹配的名称、备注或 ID。" : `当前账号暂无${name}。` : "请刷新列表，读取已登录 QQ 的群与好友。");
+    const list = $("contacts-list"); list.replaceChildren(); list.setAttribute("aria-busy", String(c.loading));
+    for (const row of rows.slice((c.page - 1) * CONTACT_PAGE_SIZE, c.page * CONTACT_PAGE_SIZE)) {
+      const item = element("div", "contact-row"), identity = element("div", "contact-identity");
+      const title = row.remark || row.name || (c.scene === "group" ? "群聊" : "好友");
+      identity.append(element("strong", "contact-name", title));
+      if (row.remark && row.name && row.remark !== row.name) identity.append(element("span", "hint contact-original", row.name));
+      identity.append(element("span", "hint contact-id", (c.scene === "group" ? "群号 " : "QQ ") + row.id));
+      const label = element("label", "contact-switch"), input = document.createElement("input");
+      input.type = "checkbox"; input.checked = row.enabled; input.setAttribute("role", "switch"); input.dataset.contactToggle = row.id;
+      input.setAttribute("aria-label", title + "（" + row.id + "）Bot 开关");
+      const scene = c.scene, version = c.version;
+      input.addEventListener("change", () => { if (version === state.contacts.version) void toggleContact(scene, row.id, input.checked); });
+      label.append(input, element("span", "contact-switch-track"), element("span", "contact-switch-label", c.saving === scene + ":" + row.id ? "保存中…" : row.enabled ? "已开启" : "已关闭"));
+      item.append(identity, label); list.append(item);
+    }
+    $("contacts-page").textContent = `第 ${c.page} / ${c.totalPages} 页 · 共 ${rows.length} 个`;
+    updateContactControls();
+  }
+  function validateContacts(result) {
+    if (!contactId(result.bot_id) || !Number.isFinite(result.fetched_at)) throw new Error("联系人响应缺少有效的账号或更新时间。");
+    for (const key of ["groups", "friends"]) {
+      if (!Array.isArray(result[key])) throw new Error("联系人列表格式不正确。");
+      const seen = new Set();
+      for (const row of result[key]) {
+        if (!row || !contactId(row.id) || typeof row.name !== "string" || typeof row.remark !== "string" || typeof row.enabled !== "boolean" || seen.has(row.id)) throw new Error("联系人数据不完整或存在重复 ID，请刷新重试。");
+        seen.add(row.id);
+      }
+    }
+  }
+  async function loadContacts(force = false) {
+    const c = state.contacts;
+    if (!state.authenticated || state.view !== "contacts" || c.loading || c.saving) return;
+    const session = state.session, version = ++c.version;
+    c.loading = true; c.phase = "loading"; c.message = ""; c.generation = state.status?.runtime_generation ?? null;
+    c.groups = []; c.friends = []; c.botId = ""; c.fetchedAt = null; renderContacts();
+    try {
+      const result = await api("/api/qq/contacts" + (force ? "?force=true" : ""));
+      if (!contactsCurrent(version, session)) return;
+      validateContacts(result);
+      c.botId = result.bot_id; c.groups = result.groups; c.friends = result.friends; c.fetchedAt = result.fetched_at; c.phase = "ready";
+    } catch (error) {
+      if (!contactsCurrent(version, session)) return;
+      c.phase = [502, 503].includes(error.status) ? "offline" : "error";
+      c.message = (c.phase === "offline" ? "暂时无法读取 QQ 联系人。请确认 QQ 已登录且 Milky 可连接，再手动刷新。 " : "联系人列表未能加载。 ") + error.message;
+    } finally {
+      if (contactsCurrent(version, session)) { c.loading = false; renderContacts(); }
+    }
+  }
+  async function toggleContact(scene, peerId, enabled) {
+    const c = state.contacts;
+    if (state.view !== "contacts" || !state.authenticated || state.busy || c.phase !== "ready" || c.loading || c.saving || typeof enabled !== "boolean") { renderContacts(); return; }
+    const row = (scene === "group" ? c.groups : scene === "friend" ? c.friends : []).find((item) => item.id === peerId);
+    if (!row || row.enabled === enabled) return;
+    const version = c.version, session = state.session, botId = c.botId, previous = row.enabled;
+    c.saving = scene + ":" + peerId; c.message = ""; row.enabled = enabled; renderContacts();
+    try {
+      const result = await api("/api/qq/contacts/toggle", "POST", { bot_id: botId, scene, peer_id: peerId, enabled });
+      if (!contactsCurrent(version, session)) return;
+      if (result.bot_id !== botId || result.scene !== scene || result.peer_id !== peerId || result.enabled !== enabled) throw new Error("开关响应与当前账号或会话不一致。");
+      c.message = `${row.remark || row.name || row.id} 的 Bot 已${enabled ? "开启" : "关闭"}，即时生效。`;
+    } catch (error) {
+      if (!contactsCurrent(version, session)) return;
+      row.enabled = previous;
+      if (error.status === 409) { invalidateContacts("QQ 账号或联系人已变化，旧列表已停用，请刷新后再操作。", "error"); return; }
+      c.phase = "uncertain"; c.message = "开关未确认，已还原页面显示。请刷新列表核对实际状态。 " + error.message;
+      if (error.code === "csrf_invalid") report(error);
+    } finally {
+      if (contactsCurrent(version, session)) { c.saving = null; renderContacts(); }
+    }
   }
   async function runAction(action) {
     if (state.busy) return;
@@ -585,13 +693,15 @@
     }
   }
   function showView(view) {
-    if (!["overview", "qq", "config", "memory"].includes(view)) return;
+    if (!["overview", "qq", "contacts", "config", "memory"].includes(view)) return;
+    if (state.view === "contacts" && view !== "contacts") invalidateContacts();
     state.view = view;
     document.querySelectorAll(".view").forEach((node) => { node.hidden = node.id !== "view-" + view; });
     document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
-    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", config: "配置管理", memory: "记忆与上下文" }[view];
+    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "配置管理", memory: "记忆与上下文" }[view];
     if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
     if (view === "qq") scheduleQq(0);
+    if (view === "contacts" && state.contacts.phase !== "ready") void loadContacts();
   }
   const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty;
   function authView(result) {
@@ -608,6 +718,7 @@
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
     state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false;
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
+    invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
     clearMemorySelection(); state.memory.list = []; $("conversation-list").replaceChildren(); $("budget-usage").replaceChildren();
     document.querySelectorAll("dialog").forEach((dialog) => { if (dialog.open) dialog.close(); });
@@ -682,7 +793,7 @@
   }
   function renderConversationList() {
     const box = $("conversation-list"); box.replaceChildren();
-    if (!state.memory.list.length) box.append(element("p", "empty-state", "没有符合条件的会话。先在白名单会话中与机器人聊天，随后在这里刷新。"));
+    if (!state.memory.list.length) box.append(element("p", "empty-state", "没有符合条件的会话。先在已开启 Bot 的会话中与机器人聊天，随后在这里刷新。"));
     for (const conversation of state.memory.list) {
       const button = element("button", "conversation-item" + (state.memory.selected?.id === conversation.id ? " selected" : ""));
       button.type = "button"; button.dataset.action = "";
@@ -952,6 +1063,10 @@
   $("config-form").addEventListener("submit", (event) => event.preventDefault());
   $("refresh-status").addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
   $("refresh-qq").addEventListener("click", () => { void runAction(() => refreshQq(true)); });
+  $("refresh-contacts").addEventListener("click", () => { void loadContacts(true); });
+  for (const [id, scene] of [["contacts-groups", "group"], ["contacts-friends", "friend"]]) $(id).addEventListener("click", () => { state.contacts.scene = scene; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
+  $("contacts-search").addEventListener("input", () => { state.contacts.query = $("contacts-search").value; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
+  for (const [id, direction] of [["contacts-prev", -1], ["contacts-next", 1]]) $(id).addEventListener("click", () => { state.contacts.page += direction; renderContacts(); });
   $("refresh-budget").addEventListener("click", () => { void runAction(loadBudget); });
   for (const id of ["connect-runtime", "apply-runtime"]) $(id).addEventListener("click", () => {
     if ((state.dirty || state.jsonDirty) && !window.confirm("本页有未保存配置。继续使用服务器已保存的配置连接？")) return;

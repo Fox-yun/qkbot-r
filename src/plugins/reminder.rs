@@ -41,17 +41,7 @@ impl Plugin for ReminderPlugin {
                     .into(),
             ),
         };
-        match host
-            .gateway
-            .direct(
-                message.key.scope.clone(),
-                message.sender_id,
-                name,
-                args,
-                message.received_at,
-            )
-            .await?
-        {
+        match host.gateway.direct_message(message, name, args).await? {
             crate::tools::ToolOutcome::Completed { receipt, .. } => Ok(receipt),
             crate::tools::ToolOutcome::Pending { preview, .. } => Ok(preview),
         }
@@ -319,7 +309,7 @@ pub async fn claim_due(store: &Store, limit: usize) -> Result<Vec<ReminderDue>> 
         let tx=conn.transaction()?;
         let epoch=tx.query_row("SELECT epoch FROM plugin_states WHERE id='reminder' AND enabled=1",[],|r|r.get::<_,i64>(0)).optional()?;
         let Some(epoch)=epoch else{return Ok(vec![])};
-        let mut stmt=tx.prepare("SELECT id,scope_json,actor_id,text,due_at FROM reminder_jobs WHERE status='pending' AND due_at<=?1 ORDER BY due_at LIMIT ?2")?;
+        let mut stmt=tx.prepare("SELECT id,scope_json,actor_id,text,due_at FROM reminder_jobs j WHERE status='pending' AND due_at<=?1 AND NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=j.scope_key AND a.enabled=0) ORDER BY due_at LIMIT ?2")?;
         let rows=stmt.query_map(params![now(),limit as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
         drop(stmt);
         let mut jobs=Vec::new();
@@ -402,6 +392,41 @@ mod tests {
             .unwrap();
         assert!(!release_claim(&store, &id).await.unwrap());
         assert!(claim_due(&store, 1).await.unwrap().is_empty());
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_chats_pause_reminders_without_starving_enabled_chats() {
+        let store = Store::open(":memory:", 16).await.unwrap();
+        store
+            .activate_plugins(vec!["reminder".into()])
+            .await
+            .unwrap();
+        migrate(&store).await.unwrap();
+        let disabled = Scope {
+            bot_id: 1,
+            scene: Scene::Group,
+            peer_id: 2,
+        };
+        let enabled = Scope {
+            bot_id: 2,
+            ..disabled.clone()
+        };
+        let a = disabled.clone();
+        let b = enabled.clone();
+        store.call(move|db|{
+            for (id,scope) in [("disabled",a),("enabled",b)] { db.execute("INSERT INTO reminder_jobs(id,operation_id,scope_key,scope_json,actor_id,text,due_at,status,created_at) VALUES(?1,?1,?2,?3,7,'reminder',0,'pending',0)",params![id,scope.key(),serde_json::to_string(&scope)?])?; }Ok(())
+        }).await.unwrap();
+        let access = crate::access::AccessStore::new(store.clone());
+        access.set_enabled(disabled.clone(), false).await.unwrap();
+        let due = claim_due(&store, 1).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].scope, enabled);
+        assert!(claim_due(&store, 1).await.unwrap().is_empty());
+        access.set_enabled(disabled.clone(), true).await.unwrap();
+        let due = claim_due(&store, 1).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].scope, disabled);
         store.stop().await.unwrap();
     }
 
