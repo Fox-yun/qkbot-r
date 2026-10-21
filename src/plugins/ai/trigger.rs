@@ -245,7 +245,9 @@ impl Ingress {
             self.feedback(&chat.host, &message, position);
             return Ok(());
         };
-        message.raw_message = serde_json::Value::Null;
+        // Keep only bounded image resource identifiers while waiting. Raw
+        // previews, forwarded nodes and temporary URLs never enter the AI queue.
+        message.raw_message = super::vision::Images::from_message(&message).raw_snapshot();
         let job = Pending {
             generation: chat.host.milky.scope_generation(&message.key.scope).ok(),
             message,

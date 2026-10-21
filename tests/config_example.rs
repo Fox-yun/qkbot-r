@@ -17,6 +17,7 @@ fn external_presets_are_valid_disabled_and_explicit_lists_take_precedence() {
 fn shipped_example_parses_and_constructs_clients_without_network() {
     let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
     config.validate().unwrap();
+    assert!(config.llm.vision);
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -29,6 +30,17 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
         config.plugins.ai.defaults.allowed_tools,
         ["clock_now", "reply_message"]
     );
+}
+
+#[test]
+fn vision_defaults_on_for_legacy_configs_and_explicit_off_roundtrips() {
+    let legacy: Config = toml::from_str("[llm]\nmodel = 'legacy-model'").unwrap();
+    assert!(legacy.llm.vision);
+    let disabled: Config = toml::from_str("[llm]\nvision = false").unwrap();
+    assert!(!disabled.llm.vision);
+    let roundtrip: Config = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
+    assert!(!roundtrip.llm.vision);
+    assert!(format!("{:?}", disabled.llm).contains("vision: false"));
 }
 
 #[test]

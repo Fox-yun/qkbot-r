@@ -740,6 +740,24 @@ const globalTools = (h) => h.app.inputs.get("plugins.ai.defaults.allowed_tools")
 const conversationTools = (h) => h.app.settingInputs.get("allowed_tools").input;
 const toolCheckbox = (control, name) => control.toolPicker.rows.get(name).checkbox;
 
+test("vision switch roundtrips independently of native tools and model selection", async () => {
+  const h = harness(); await h.login();
+  const vision = h.app.inputs.get("llm.vision").control;
+  assert.equal(vision.type, "checkbox"); assert.equal(vision.checked, true);
+  const initial = h.app.readForm().llm;
+  vision.checked = false; await vision.emit("input");
+  assert.equal(h.app.readForm().llm.vision, false); assert.equal(h.app.state.dirty, true);
+  assert.equal(h.app.readForm().llm.tool_calling, initial.tool_calling);
+  assert.equal(h.app.readForm().llm.model, initial.model);
+  h.app.syncJson(); h.app.adoptJson();
+  assert.equal(h.app.inputs.get("llm.vision").control.checked, false);
+  const saved = h.snapshot(); saved.config.llm.vision = false;
+  h.setHandler(async () => ({ body: saved })); await h.app.loadConfig();
+  assert.equal(h.app.inputs.get("llm.vision").control.checked, false);
+  const restored = h.app.inputs.get("llm.vision").control; restored.checked = true; await restored.emit("input");
+  assert.equal(h.app.readForm().llm.vision, true);
+});
+
 test("global tools are checkboxes from the server catalog, with explicit empty selection and dynamic new tools", async () => {
   const h = harness(); await h.login(); const updated = h.snapshot();
   updated.tool_catalog.push({ name: "brand_new_tool", description: "来自新增插件注册项", plugin_id: "clock", effect: "local_write" });

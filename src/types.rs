@@ -53,7 +53,7 @@ pub struct Incoming {
     pub mentions: Vec<i64>,
     pub quote_seq: Option<i64>,
     pub received_at: i64,
-    /// Complete Milky IncomingMessage; AI continues to use only normalized text.
+    /// Complete Milky IncomingMessage; AI retains only bounded current-image IDs.
     #[serde(default)]
     pub raw_message: Value,
     /// Notifications use a negative internal deduplication key, never a QQ sequence.

@@ -2,6 +2,7 @@ pub mod chat;
 pub mod memory;
 pub(crate) mod reply;
 pub(crate) mod trigger;
+pub(crate) mod vision;
 
 use crate::{
     config::AiSettings,

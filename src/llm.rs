@@ -2,12 +2,16 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::milky::read_bounded;
+
+pub(crate) const MAX_INPUT_IMAGES: usize = 4;
+pub(crate) const MAX_IMAGE_URL_BYTES: usize = 1_400_000;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -16,6 +20,7 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub tool_calling: bool,
+    pub vision: bool,
     pub max_concurrent_requests: usize,
     pub request_timeout_secs: u64,
     pub max_response_bytes: usize,
@@ -29,6 +34,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("api_key", &"[redacted]")
             .field("model", &self.model)
             .field("tool_calling", &self.tool_calling)
+            .field("vision", &self.vision)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("max_response_bytes", &self.max_response_bytes)
@@ -43,6 +49,7 @@ impl Default for LlmConfig {
             api_key: String::new(),
             model: String::new(),
             tool_calling: true,
+            vision: true,
             max_concurrent_requests: 2,
             request_timeout_secs: 60,
             max_response_bytes: 256 * 1024,
@@ -143,6 +150,35 @@ impl Llm {
             cancel,
             permit,
             Some(crate::budget::RequestAdmission::Chat(admission)),
+            None,
+        )
+        .await
+    }
+
+    /// Visual inputs are tied to the QQ login that supplied their pixels,
+    /// including while waiting for an available model request slot.
+    pub(crate) async fn complete_visual_admitted(
+        &self,
+        messages: Vec<Value>,
+        tools: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        admission: crate::budget::Admission,
+        account: (&crate::milky::Milky, u64),
+    ) -> Result<LlmResponse> {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
+            p = self.requests.clone().acquire_owned() => p.context("model request scheduler closed")?,
+        };
+        self.request(
+            messages,
+            tools,
+            max_output,
+            cancel,
+            permit,
+            Some(crate::budget::RequestAdmission::Chat(admission)),
+            Some(account),
         )
         .await
     }
@@ -159,7 +195,7 @@ impl Llm {
             _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
             permit = self.requests.clone().acquire_owned() => permit.context("model request scheduler closed")?,
         };
-        self.request(messages, tools, max_output, cancel, permit, None)
+        self.request(messages, tools, max_output, cancel, permit, None, None)
             .await
     }
 
@@ -207,11 +243,20 @@ impl Llm {
         let Ok(permit) = self.requests.clone().try_acquire_owned() else {
             return Ok(None);
         };
-        self.request(messages, Vec::new(), max_output, cancel, permit, admission)
-            .await
-            .map(Some)
+        self.request(
+            messages,
+            Vec::new(),
+            max_output,
+            cancel,
+            permit,
+            admission,
+            None,
+        )
+        .await
+        .map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
         messages: Vec<Value>,
@@ -220,12 +265,17 @@ impl Llm {
         cancel: &CancellationToken,
         _permit: OwnedSemaphorePermit,
         admission: Option<crate::budget::RequestAdmission>,
+        account: Option<(&crate::milky::Milky, u64)>,
     ) -> Result<LlmResponse> {
         ensure!(
             (1..=32768).contains(&max_output),
             "output token budget must be 1..32768"
         );
-        validate_messages(&messages)?;
+        let image_count = validate_messages(&messages)?;
+        ensure!(
+            self.config.vision || image_count == 0,
+            "vision input disabled for this model"
+        );
         ensure!(tools.len() <= 16, "too many tool definitions");
         ensure!(
             self.config.tool_calling || tools.is_empty(),
@@ -257,6 +307,9 @@ impl Llm {
             body["parallel_tool_calls"] = json!(false);
         }
         let operation = async {
+            if let Some((milky, generation)) = account {
+                milky.check_generation(generation)?;
+            }
             if let Some(budget) = &self.budget {
                 ensure!(
                     admission.is_some(),
@@ -265,6 +318,9 @@ impl Llm {
                 budget.reserve_request(admission).await?;
             }
             ensure!(!cancel.is_cancelled(), "model request cancelled");
+            if let Some((milky, generation)) = account {
+                milky.check_generation(generation)?;
+            }
             let mut request = self
                 .http
                 .post(self.endpoint.clone())
@@ -272,6 +328,9 @@ impl Llm {
                 .json(&body);
             if !self.config.api_key.is_empty() {
                 request = request.bearer_auth(&self.config.api_key);
+            }
+            if let Some((milky, generation)) = account {
+                milky.check_generation(generation)?;
             }
             let response = request
                 .send()
@@ -283,6 +342,9 @@ impl Llm {
                 response.status().as_u16()
             );
             let bytes = read_bounded(response, self.config.max_response_bytes).await?;
+            if let Some((milky, generation)) = account {
+                milky.check_generation(generation)?;
+            }
             let value: Value =
                 serde_json::from_slice(&bytes).context("model response is not valid JSON")?;
             parse_response(value, &allowed_tools)
@@ -341,13 +403,74 @@ fn tool_calls(message: &Value) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn validate_messages(messages: &[Value]) -> Result<()> {
+/// Only host-normalized JPEG data is accepted. The transport never asks the
+/// model provider to fetch a remote URL or interpret another media format.
+fn validate_user_parts(parts: &[Value]) -> Result<usize> {
+    ensure!(!parts.is_empty(), "user content parts must not be empty");
+    let mut images = 0;
+    for part in parts {
+        let part = part
+            .as_object()
+            .context("user content part must be an object")?;
+        ensure!(
+            part.len() == 2,
+            "user content part has missing or unknown fields"
+        );
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => ensure!(
+                part.get("text").is_some_and(Value::is_string),
+                "text content part must contain a string"
+            ),
+            Some("image_url") => {
+                images += 1;
+                ensure!(
+                    images <= MAX_INPUT_IMAGES,
+                    "too many input images in one message"
+                );
+                let image = part
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .context("image_url content part must contain an object")?;
+                ensure!(
+                    image.len() == 2 && image.get("detail").and_then(Value::as_str) == Some("auto"),
+                    "image_url must contain only url and detail=auto"
+                );
+                let url = image
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .context("image_url url must be a string")?;
+                ensure!(
+                    url.len() <= MAX_IMAGE_URL_BYTES,
+                    "image data URL exceeds limit"
+                );
+                let encoded = url
+                    .strip_prefix("data:image/jpeg;base64,")
+                    .context("image URL must be inline JPEG base64 data")?;
+                ensure!(!encoded.is_empty(), "image base64 data must not be empty");
+                let bytes = STANDARD
+                    .decode(encoded)
+                    .context("image base64 data is invalid")?;
+                ensure!(
+                    bytes.len() >= 5
+                        && bytes.starts_with(&[0xff, 0xd8, 0xff])
+                        && bytes.ends_with(&[0xff, 0xd9]),
+                    "image data is not a complete JPEG"
+                );
+            }
+            _ => anyhow::bail!("unsupported user content part type"),
+        }
+    }
+    Ok(images)
+}
+
+fn validate_messages(messages: &[Value]) -> Result<usize> {
     ensure!(
         !messages.is_empty() && messages.len() <= 8192,
         "model messages must contain 1..8192 entries"
     );
     let mut pending = HashSet::new();
     let mut used_ids = HashSet::new();
+    let mut images = 0;
     for message in messages {
         let role = message["role"].as_str().context("message missing role")?;
         if role == "tool" {
@@ -369,10 +492,21 @@ fn validate_messages(messages: &[Value]) -> Result<()> {
             matches!(role, "system" | "user" | "assistant"),
             "unsupported model message role"
         );
-        ensure!(
-            message["content"].is_string() || (role == "assistant" && message["content"].is_null()),
-            "message content must be text"
-        );
+        if role == "user"
+            && let Some(parts) = message["content"].as_array()
+        {
+            images += validate_user_parts(parts)?;
+            ensure!(
+                images <= MAX_INPUT_IMAGES,
+                "too many input images in one request"
+            );
+        } else {
+            ensure!(
+                message["content"].is_string()
+                    || (role == "assistant" && message["content"].is_null()),
+                "message content must be text"
+            );
+        }
         if role == "assistant" {
             for (id, _) in tool_calls(message)? {
                 ensure!(
@@ -389,7 +523,7 @@ fn validate_messages(messages: &[Value]) -> Result<()> {
         }
     }
     ensure!(pending.is_empty(), "missing tool result");
-    Ok(())
+    Ok(images)
 }
 
 fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmResponse> {
@@ -465,6 +599,252 @@ mod tests {
             api_key: "llm-only".into(),
             ..Default::default()
         }
+    }
+
+    fn image_part() -> Value {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        json!({"type":"image_url","image_url":{
+            "url":format!("data:image/jpeg;base64,{}",STANDARD.encode(jpeg.into_inner())),
+            "detail":"auto"
+        }})
+    }
+
+    #[test]
+    fn mixed_user_input_accepts_inline_jpeg_without_changing_tool_protocol() {
+        let messages = vec![
+            json!({"role":"system","content":"Describe the image"}),
+            json!({"role":"user","content":[{"type":"text","text":"first"},image_part(),{"type":"text","text":"second"},image_part()]}),
+            json!({"role":"assistant","content":null,"tool_calls":[call("one")]}),
+            json!({"role":"tool","tool_call_id":"one","content":"time result"}),
+            json!({"role":"assistant","content":"answer"}),
+        ];
+        assert_eq!(validate_messages(&messages).unwrap(), 2);
+        assert_eq!(
+            validate_messages(&[
+                json!({"role":"user","content":[{"type":"text","text":"text only"}]})
+            ])
+            .unwrap(),
+            0
+        );
+        assert!(
+            validate_messages(&[
+                messages[2].clone(),
+                messages[1].clone(),
+                messages[3].clone()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn input_images_are_bounded_per_message_and_request() {
+        let four = vec![image_part(); MAX_INPUT_IMAGES];
+        assert_eq!(
+            validate_messages(&[json!({"role":"user","content":four})]).unwrap(),
+            MAX_INPUT_IMAGES
+        );
+        let five = vec![image_part(); MAX_INPUT_IMAGES + 1];
+        assert!(validate_messages(&[json!({"role":"user","content":five})]).is_err());
+        let two = vec![image_part(); 2];
+        let first = json!({"role":"user","content":two});
+        let mut messages = vec![first.clone(), first];
+        assert_eq!(validate_messages(&messages).unwrap(), MAX_INPUT_IMAGES);
+        messages.push(json!({"role":"user","content":[image_part()]}));
+        assert!(validate_messages(&messages).is_err());
+        let mut oversized = image_part();
+        oversized["image_url"]["url"] = json!("x".repeat(MAX_IMAGE_URL_BYTES + 1));
+        assert!(
+            validate_messages(&[json!({"role":"user","content":[oversized]})])
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds limit")
+        );
+    }
+
+    #[test]
+    fn image_input_rejects_external_urls_invalid_data_and_non_user_roles() {
+        let mut invalid_parts = vec![
+            Value::Null,
+            json!("plain part"),
+            json!({"type":"text"}),
+            json!({"type":"text","text":17}),
+            json!({"type":"text","text":"hello","extra":true}),
+            json!({"type":"audio","audio":"data"}),
+            json!({"type":"image_url","image_url":"not an object"}),
+            json!({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"}}),
+        ];
+        for url in [
+            "https://example.invalid/image.jpg",
+            "http://127.0.0.1/image.jpg",
+            "file:///tmp/image.jpg",
+            "data:image/png;base64,iVBORw==",
+            "data:image/jpeg;base64,",
+            "data:image/jpeg;base64,not base64!",
+            "data:image/jpeg;base64,/9j/==",
+            "data:image/jpeg;base64,/9j/\n",
+            "data:image/jpeg;base64,/9j/",
+            "data:image/jpeg;base64,aGVsbG8=",
+        ] {
+            let mut part = image_part();
+            part["image_url"]["url"] = json!(url);
+            invalid_parts.push(part);
+        }
+        for detail in [json!("high"), json!("low"), Value::Null, json!(false)] {
+            let mut part = image_part();
+            part["image_url"]["detail"] = detail;
+            invalid_parts.push(part);
+        }
+        let mut extra = image_part();
+        extra["image_url"]["headers"] = json!({"Authorization":"fake"});
+        invalid_parts.push(extra);
+        let mut extra = image_part();
+        extra["extra"] = json!(true);
+        invalid_parts.push(extra);
+        for part in invalid_parts {
+            assert!(validate_messages(&[json!({"role":"user","content":[part]})]).is_err());
+        }
+        for content in [json!([]), Value::Null, json!({"text":"hello"}), json!(42)] {
+            assert!(validate_messages(&[json!({"role":"user","content":content})]).is_err());
+        }
+        for role in ["system", "assistant"] {
+            for parts in [
+                json!([image_part()]),
+                json!([{"type":"text","text":"hello"}]),
+            ] {
+                assert!(validate_messages(&[json!({"role":role,"content":parts})]).is_err());
+            }
+        }
+        let call = json!({"role":"assistant","content":null,"tool_calls":[call("one")]});
+        assert!(
+            validate_messages(&[
+                call,
+                json!({"role":"tool","tool_call_id":"one","content":[image_part()]})
+            ])
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_vision_rejects_images_before_transport() {
+        let mut cfg = config("http://127.0.0.1:1".into());
+        cfg.vision = false;
+        let client = Llm::new(cfg, reqwest::Client::new()).unwrap();
+        let error = client
+            .complete(
+                vec![json!({"role":"user","content":[image_part()]})],
+                vec![],
+                128,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "vision input disabled for this model");
+        assert_eq!(client.requests.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_vision_preserves_text_and_native_tools() {
+        let body = response(json!({"role":"assistant","content":null,"tool_calls":[call("one")]}))
+            .to_string();
+        let (url, server) = server("200 OK", &body).await;
+        let mut cfg = config(url);
+        cfg.vision = false;
+        let client = Llm::new(cfg, reqwest::Client::new()).unwrap();
+        let result = client.complete(
+            vec![json!({"role":"user","content":[{"type":"text","text":"what time?"}]})],
+            vec![json!({"type":"function","function":{"name":"clock_now","parameters":{"type":"object"}}})],
+            128, &CancellationToken::new(),
+        ).await.unwrap();
+        assert_eq!(
+            result.message["tool_calls"][0]["function"]["name"],
+            "clock_now"
+        );
+        let request = server.await.unwrap();
+        assert!(request.contains("what time?"));
+        assert!(request.contains("\"parallel_tool_calls\":false"));
+        assert!(!request.contains("image_url"));
+    }
+
+    #[tokio::test]
+    async fn visual_request_waiting_for_a_permit_rejects_reverified_account_before_http() {
+        use crate::{
+            milky::{Milky, MilkyConfig},
+            types::{ContextGuard, Scene, Scope},
+        };
+        let login_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let login_url = format!("http://{}", login_listener.local_addr().unwrap());
+        let login_server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/get_login_info",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"status":"ok","retcode":0,"data":{"uin":123}}))
+                }),
+            );
+            axum::serve(login_listener, app).await.unwrap();
+        });
+        let milky = Milky::new(
+            MilkyConfig {
+                url: login_url,
+                ..Default::default()
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(milky.login().await.unwrap(), 123);
+        let scope = Scope {
+            bot_id: 123,
+            scene: Scene::Group,
+            peer_id: 456,
+        };
+        let generation = milky.scope_generation(&scope).unwrap();
+        let model_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = config(format!("http://{}", model_listener.local_addr().unwrap()));
+        cfg.max_concurrent_requests = 1;
+        cfg.request_timeout_secs = 1;
+        let client = Llm::new(cfg, reqwest::Client::new()).unwrap();
+        let held = client.requests.clone().acquire_owned().await.unwrap();
+        let cancel = CancellationToken::new();
+        let request = client.complete_visual_admitted(
+            vec![json!({"role":"user","content":[{"type":"text","text":"describe"},image_part()]})],
+            vec![],
+            128,
+            &cancel,
+            crate::budget::Admission {
+                scope: scope.clone(),
+                actor: 789,
+                guard: ContextGuard {
+                    conversation_id: "visual-test".into(),
+                    epoch: 1,
+                },
+                plugin_epoch: 1,
+            },
+            (&milky, generation),
+        );
+        tokio::pin!(request);
+        // Poll the request into the semaphore queue before replacing the login.
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request bypassed held permit: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert_eq!(milky.login().await.unwrap(), 123);
+        assert_ne!(milky.scope_generation(&scope).unwrap(), generation);
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut request)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("account verification expired"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), model_listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(client.requests.available_permits(), 1);
+        login_server.abort();
     }
 
     #[test]

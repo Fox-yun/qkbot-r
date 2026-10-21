@@ -29,6 +29,7 @@ struct MockServer {
     sends: mpsc::Receiver<Value>,
     quotes: mpsc::Receiver<Value>,
     quote_requests: mpsc::Receiver<ModelRequest>,
+    resources: mpsc::Receiver<ModelRequest>,
     control_quotes: Arc<AtomicBool>,
     drop_send_ack: Arc<AtomicBool>,
     login_id: Arc<AtomicI64>,
@@ -50,6 +51,7 @@ impl MockServer {
         let (send_tx, sends) = mpsc::channel(32);
         let (quote_tx, quotes) = mpsc::channel(32);
         let (quote_request_tx, quote_requests) = mpsc::channel(32);
+        let (resource_tx, resources) = mpsc::channel(32);
         let control_quotes = Arc::new(AtomicBool::new(false));
         let controlled = control_quotes.clone();
         let drop_send_ack = Arc::new(AtomicBool::new(false));
@@ -73,6 +75,7 @@ impl MockServer {
                 let send_tx = send_tx.clone();
                 let quote_tx = quote_tx.clone();
                 let quote_request_tx = quote_request_tx.clone();
+                let resource_tx = resource_tx.clone();
                 let controlled = controlled.clone();
                 let lose_ack = lose_ack.clone();
                 let sequence = sequence.clone();
@@ -116,6 +119,11 @@ impl MockServer {
                                 }}})
                                 }
                             }
+                            "/api/get_resource_temp_url" => {
+                                let (reply, receive) = oneshot::channel();
+                                if resource_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
+                                let Ok(response) = receive.await else { return; }; response
+                            }
                             "/v1/chat/completions" => {
                                 let (reply, receive) = oneshot::channel();
                                 if model_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
@@ -141,6 +149,7 @@ impl MockServer {
             sends,
             quotes,
             quote_requests,
+            resources,
             control_quotes,
             drop_send_ack,
             login_id,
@@ -2419,6 +2428,196 @@ async fn reply_tool_revocation_after_outbox_preparation_blocks_the_final_http_su
     assert!(detail.starts_with("not submitted:"), "{detail}");
     assert_eq!((assistants, revoked), (0, 1));
     within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+fn image_message(seq: i64, text: &str) -> Incoming {
+    let mut incoming = message(seq, text);
+    incoming.raw_message = json!({"segments":[{
+        "type":"image","data":{
+            "resource_id":"pic-one",
+            "temp_url":"http://127.0.0.1:9/untrusted-event-preview.png"
+        }
+    }]});
+    incoming
+}
+
+#[tokio::test]
+async fn vision_untriggered_group_image_never_requests_a_message_resource_or_model() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.vision = true;
+    })
+    .await;
+    let mut incoming = image_message(1, "群里的普通图片");
+    incoming.mentions.clear();
+    router.dispatch(incoming).await.unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_image_in_a_native_plugin_command_does_not_start_ai_or_resource_reads() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.vision = true;
+    })
+    .await;
+    router.dispatch(image_message(1, "/clock")).await.unwrap();
+    let clock = mock.sent().await;
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&clock)
+            .unwrap()
+            .offset()
+            .local_minus_utc(),
+        8 * 3600
+    );
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_unsafe_verified_resource_url_degrades_to_text_without_storing_image_data() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.vision = true;
+    })
+    .await;
+    router
+        .dispatch(image_message(5, "请描述这张图片"))
+        .await
+        .unwrap();
+    let lookup = within(mock.quote_requests.recv()).await.unwrap();
+    assert_eq!(
+        lookup.body,
+        json!({
+            "message_scene":"group","peer_id":456,"message_seq":5
+        })
+    );
+    assert_eq!(within(mock.quotes.recv()).await.unwrap(), lookup.body);
+    // Resource lookup cannot precede verification that this exact message in
+    // the current physical chat contains the incoming image resource ID.
+    assert!(mock.resources.try_recv().is_err());
+    let mut verified = quoted(&lookup.body, 789, "请描述这张图片");
+    verified["data"]["message"]["segments"] = json!([
+        {"type":"text","data":{"text":"请描述这张图片"}},
+        {"type":"image","data":{"resource_id":"pic-one"}}
+    ]);
+    lookup.reply.send(verified).unwrap();
+    let resource = within(mock.resources.recv()).await.unwrap();
+    assert_eq!(resource.body, json!({"resource_id":"pic-one"}));
+    resource
+        .reply
+        .send(json!({"status":"ok","retcode":0,"data":{
+            "url":"https://127.0.0.1/private-image.png"
+        }}))
+        .unwrap();
+    let request = mock.model().await;
+    let current = request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .expect("an unreadable image must leave a normal text model request");
+    assert!(current.contains("请描述这张图片"));
+    assert!(current.contains("图片") && current.contains("未能读取"));
+    let payload = request.body.to_string();
+    assert!(!payload.contains("pic-one"));
+    assert!(!payload.contains("private-image.png"));
+    assert!(!payload.contains("untrusted-event-preview.png"));
+    assert!(!payload.contains("data:image"));
+    request
+        .reply
+        .send(answer("图片暂时无法读取，可以继续文字对话"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "图片暂时无法读取，可以继续文字对话");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    let contents: Vec<String> = host
+        .store
+        .call(|db| {
+            let mut statement = db.prepare("SELECT content FROM messages")?;
+            Ok(statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    for content in contents {
+        assert!(!content.contains("pic-one"));
+        assert!(!content.contains("private-image.png"));
+        assert!(!content.contains("untrusted-event-preview.png"));
+        assert!(!content.contains("data:image"));
+    }
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_disabled_skips_image_lookups_and_keeps_normal_text_chat_available() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.vision = false;
+    })
+    .await;
+    router.dispatch(image_message(1, "查看图片")).await.unwrap();
+    let request = mock.model().await;
+    let current = request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(current.contains("识图已关闭"));
+    assert!(!current.contains("untrusted-event-preview.png"));
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    request.reply.send(answer("当前只处理文字")).unwrap();
+    assert_eq!(mock.sent().await, "当前只处理文字");
+    wait_for_outbox(&host, "confirmed", 1).await;
+
+    router
+        .dispatch(message(2, "继续普通文字聊天"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    assert_eq!(current["text"], "继续普通文字聊天");
+    request.reply.send(answer("文字聊天正常")).unwrap();
+    assert_eq!(mock.sent().await, "文字聊天正常");
+    wait_for_outbox(&host, "confirmed", 2).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
     assert!(mock.models.try_recv().is_err());
     assert!(mock.sends.try_recv().is_err());
     drop(host);
