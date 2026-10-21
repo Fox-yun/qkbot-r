@@ -1869,6 +1869,66 @@ async fn sticker_search_shows_thumbnail_then_sends_one_selected_image_with_reply
 }
 
 #[tokio::test]
+async fn truncated_sticker_tool_response_never_searches_sends_an_image_or_retries() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.plugins.ai.defaults = qkbot::config::AiSettings::default();
+        enable_sticker_search(config, &mock.url);
+    })
+    .await;
+    let incoming = message(1, "发一个庆祝表情");
+    seed_sticker(&host, &incoming).await;
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    assert_eq!(request.body["max_tokens"], 800);
+    assert!(
+        request.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "search_stickers")
+    );
+    let mut response = model_tool_response(vec![model_tool_call(
+        "cut-off-search",
+        "search_stickers",
+        json!({"query":"庆祝"}),
+    )]);
+    response["choices"][0]["finish_reason"] = json!("length");
+    response["choices"][0]["message"]["content"] = json!("private unfinished model output");
+    response["usage"] = json!({"prompt_tokens":100,"completion_tokens":800,"total_tokens":900,
+        "completion_tokens_details":{"reasoning_tokens":780}});
+    request.reply.send(response).unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    let segments = sent["message"].as_array().unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0]["type"], "text");
+    let diagnostic = segments[0]["data"]["text"].as_str().unwrap();
+    assert!(diagnostic.contains("模型输出达到长度上限"));
+    assert!(diagnostic.contains("本次调用未执行"));
+    assert!(!diagnostic.contains("private"));
+    wait_for_outbox(&host, "confirmed", 1).await;
+    host.store.call(|db| {
+        let saved: (String,String,String,bool) = db.query_row(
+            "SELECT role,origin_plugin,conversation_id,learnable FROM messages WHERE key='123:group:456:100000'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        )?;
+        assert_eq!(saved, ("system".into(), "host".into(), String::new(), false));
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM messages WHERE role='assistant'", [], |r| r.get::<_,i64>(0))?, 0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM ai_sticker_admissions", [], |r| r.get::<_,i64>(0))?, 0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM tool_runs", [], |r| r.get::<_,i64>(0))?, 0);
+        Ok(())
+    }).await.unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.embeddings.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
 async fn sticker_search_in_empty_group_never_borrows_another_groups_image() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_reply_with(&mock, |config| {
@@ -1882,21 +1942,44 @@ async fn sticker_search_in_empty_group_never_borrows_another_groups_image() {
     router.dispatch(incoming).await.unwrap();
     let request = mock.model().await;
     let current = current_message_payload(&request.body);
-    request.reply.send(model_tool_response(vec![model_tool_call(
-        "find-empty-group", "search_stickers", json!({"query":"开心"}),
-    )])).unwrap();
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "find-empty-group",
+            "search_stickers",
+            json!({"query":"开心"}),
+        )]))
+        .unwrap();
     let followup = mock.model().await;
     let messages = followup.body["messages"].as_array().unwrap();
-    let result = messages.iter().find(|message| message["tool_call_id"] == "find-empty-group").unwrap();
+    let result = messages
+        .iter()
+        .find(|message| message["tool_call_id"] == "find-empty-group")
+        .unwrap();
     let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
     assert!(result["candidates"].as_array().unwrap().is_empty());
-    assert!(messages.iter().filter_map(|message| message["content"].as_array()).flatten().all(|part| part["type"] != "image_url"));
-    assert!(mock.embeddings.try_recv().is_err(), "an empty group requires no vector request");
+    assert!(
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .all(|part| part["type"] != "image_url")
+    );
+    assert!(
+        mock.embeddings.try_recv().is_err(),
+        "an empty group requires no vector request"
+    );
     followup.reply.send(model_tool_response(vec![model_tool_call(
         "explain-empty", "reply_message", json!({"text":"本群还没有可用表情，可引用图片发送 /save 入库。","reply_to":current["message_ref"]}),
     )])).unwrap();
     let sent = within(mock.sends.recv()).await.unwrap();
-    assert!(sent["message"].as_array().unwrap().iter().all(|segment| segment["type"] != "image"));
+    assert!(
+        sent["message"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|segment| segment["type"] != "image")
+    );
     wait_for_outbox(&host, "confirmed", 1).await;
     within(router.shutdown()).await.unwrap();
     assert!(mock.sends.try_recv().is_err());

@@ -97,7 +97,12 @@ impl Authorization {
         if let Some((id, revision, hash)) = &self.sticker
             && super::stickers::check_candidate(db, scope, *id, *revision, hash).is_err()
         {
-            tracing::info!(stage = "sticker_submission", status = "text_fallback", reason = "candidate_or_cooldown_changed", "sticker became unavailable before send");
+            tracing::info!(
+                stage = "sticker_submission",
+                status = "text_fallback",
+                reason = "candidate_or_cooldown_changed",
+                "sticker became unavailable before send"
+            );
             self.sticker = None;
             message
                 .segments

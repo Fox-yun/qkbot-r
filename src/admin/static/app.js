@@ -88,7 +88,7 @@
     ] },
     { title: "上下文与记忆", description: "摘要、长期记忆读取和写入分别控制；输入预算采用保守字节估算。", fields: [
       field("plugins.ai.defaults.input_budget", "输入预算（估算）", "number", "", { min: 1024, max: 262144 }),
-      field("plugins.ai.defaults.output_budget", "回复 token 上限", "number", "同时受模型及消息长度限制。", { min: 64, max: 32768 }),
+      field("plugins.ai.defaults.output_budget", "回复 token 上限", "number", "模型可能将思考与工具参数一并计入；额度过低会截断工具调用。回复仍受消息长度限制。", { min: 64, max: 32768 }),
       field("plugins.ai.defaults.recent_messages", "最近历史消息数", "number", "设为 0 时不载入最近原文。", { min: 0, max: 4096 }),
       field("plugins.ai.defaults.allowed_tools", "允许模型使用的工具", "tools", "自动读取已注册工具，保存并应用后生效。不勾选即禁用全部工具；关闭插件会保留已有选择。", { full: true }),
       field("plugins.ai.defaults.summary", "生成并使用历史摘要", "check", "关闭后不生成或注入摘要，按历史条数读取原文。"),
@@ -1510,7 +1510,7 @@
   const settingDefinitions = [
     field("persona", "会话人设", "persona", "选择已保存的自定义人设或内置模板，不受配置页未保存草稿影响。"),
     field("input_budget", "输入预算（保守估算）", "number", "", { min: 1024, max: 262144 }),
-    field("output_budget", "输出 token 上限", "number", "", { min: 64, max: 32768 }),
+    field("output_budget", "输出 token 上限", "number", "模型可能将思考与工具参数一并计入；额度过低会截断工具调用。", { min: 64, max: 32768 }),
     field("recent_messages", "最近历史条数", "number", "", { min: 0, max: 4096 }),
     field("allowed_tools", "允许的工具", "tools", "只可勾选全局允许且所属插件已启用的工具。不勾选即禁用全部工具；修改全局工具或插件后，请先保存并应用，再配置会话。"),
     field("summary", "生成并使用摘要", "check", "关闭后不生成或注入摘要；保留原文按历史条数读取。"),

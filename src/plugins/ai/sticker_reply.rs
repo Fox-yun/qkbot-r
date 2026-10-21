@@ -127,11 +127,21 @@ impl StickerTurn {
             return Ok(None);
         };
         let Ok(image) = host.stickers.read(host, scope, &candidate).await else {
-            tracing::warn!(stage = "sticker_prepare", status = "text_fallback", reason = "candidate_unavailable", "selected sticker could not be read");
+            tracing::warn!(
+                stage = "sticker_prepare",
+                status = "text_fallback",
+                reason = "candidate_unavailable",
+                "selected sticker could not be read"
+            );
             return Ok(None);
         };
         let Ok(uri) = host.media.bytes(host, image.bytes, &image.mime).await else {
-            tracing::warn!(stage = "sticker_prepare", status = "text_fallback", reason = "media_unavailable", "selected sticker could not be published locally");
+            tracing::warn!(
+                stage = "sticker_prepare",
+                status = "text_fallback",
+                reason = "media_unavailable",
+                "selected sticker could not be published locally"
+            );
             return Ok(None);
         };
         Ok(Some((candidate, uri)))

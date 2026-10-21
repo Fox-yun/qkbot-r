@@ -756,7 +756,12 @@ impl Chat {
                     .context("模型没有返回文本")?
                     .to_owned();
                 if stickers_enabled {
-                    tracing::info!(stage = "sticker_reply", status = "text_only", searched = sticker_searched, "model completed without selecting a sticker");
+                    tracing::info!(
+                        stage = "sticker_reply",
+                        status = "text_only",
+                        searched = sticker_searched,
+                        "model completed without selecting a sticker"
+                    );
                 }
                 return Ok(Reply::text("ai", text));
             };
@@ -823,11 +828,20 @@ impl Chat {
                         .await;
                     let candidates = match searched {
                         Ok(candidates) => {
-                            tracing::info!(stage = "sticker_search", status = "completed", candidate_count = candidates.len(), "scoped sticker search completed");
+                            tracing::info!(
+                                stage = "sticker_search",
+                                status = "completed",
+                                candidate_count = candidates.len(),
+                                "scoped sticker search completed"
+                            );
                             candidates
                         }
                         Err(error) => {
-                            tracing::warn!(stage = "sticker_search", status = "failed", "scoped sticker search unavailable");
+                            tracing::warn!(
+                                stage = "sticker_search",
+                                status = "failed",
+                                "scoped sticker search unavailable"
+                            );
                             return Err(error);
                         }
                     };

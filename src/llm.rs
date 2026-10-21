@@ -87,6 +87,43 @@ impl std::fmt::Display for ProviderBlocked {
 
 impl std::error::Error for ProviderBlocked {}
 
+#[derive(Debug)]
+pub(crate) struct TruncatedToolResponse;
+
+impl std::fmt::Display for TruncatedToolResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("模型输出达到长度上限，工具调用未完整生成，本次调用未执行。")
+    }
+}
+
+impl std::error::Error for TruncatedToolResponse {}
+
+// Read only integer counters. No provider text, tool names or arguments are
+// retained here, including when those fields are malformed or adversarial.
+#[derive(Debug, PartialEq, Eq)]
+struct TruncationMetadata {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    tool_call_count: usize,
+}
+
+impl TruncationMetadata {
+    fn from_response(value: &Value) -> Self {
+        Self {
+            prompt_tokens: value["usage"]["prompt_tokens"].as_u64(),
+            completion_tokens: value["usage"]["completion_tokens"].as_u64(),
+            total_tokens: value["usage"]["total_tokens"].as_u64(),
+            reasoning_tokens: value["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64(),
+            tool_call_count: value["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .map_or(0, Vec::len),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Llm {
     config: LlmConfig,
@@ -376,7 +413,24 @@ impl Llm {
             }
             let value: Value =
                 serde_json::from_slice(&bytes).context("model response is not valid JSON")?;
-            parse_response(value, &allowed_tools)
+            let metadata = TruncationMetadata::from_response(&value);
+            let result = parse_response(value, &allowed_tools);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<TruncatedToolResponse>())
+            {
+                tracing::warn!(
+                    max_output,
+                    finish_reason = "length",
+                    prompt_tokens = metadata.prompt_tokens,
+                    completion_tokens = metadata.completion_tokens,
+                    total_tokens = metadata.total_tokens,
+                    reasoning_tokens = metadata.reasoning_tokens,
+                    tool_call_count = metadata.tool_call_count,
+                    "model tool response reached output limit"
+                );
+            }
+            result
         };
         tokio::select! {
             biased;
@@ -657,6 +711,16 @@ fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmRe
         message.get("function_call").is_none_or(Value::is_null),
         "legacy function_call is not supported"
     );
+    // Even apparently complete JSON cannot authorize an operation when the
+    // provider says generation stopped at its output limit. Classify this before
+    // parsing arguments so a cut-off JSON string receives the same safe error.
+    if choices[0]["finish_reason"] == "length"
+        && message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        return Err(TruncatedToolResponse.into());
+    }
     let calls = tool_calls(message)?;
     for (_, name) in &calls {
         ensure!(
@@ -670,10 +734,6 @@ fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmRe
                 .as_str()
                 .is_some_and(|text| !text.trim().is_empty()),
         "model response contains neither text nor a tool call"
-    );
-    ensure!(
-        calls.is_empty() || choices[0]["finish_reason"] != "length",
-        "model tool call was truncated"
     );
     // Keep only native protocol fields; unknown provider metadata cannot become instructions.
     let mut normalized = json!({"role":"assistant", "content":message["content"]});
@@ -1156,6 +1216,83 @@ mod tests {
         assert!(parse_response(response(message.clone()), &allowed).is_ok());
         message["tool_calls"][0]["function"]["arguments"] = json!("{bad}");
         assert!(parse_response(response(message), &allowed).is_err());
+    }
+
+    #[test]
+    fn truncated_tool_response_rejects_complete_and_partial_arguments() {
+        let allowed = HashSet::from(["search_stickers".to_owned()]);
+        let message = json!({"role":"assistant","content":"private provider content",
+        "tool_calls":[{"id":"find","type":"function","function":{
+            "name":"search_stickers","arguments":"{\"query\":\"合成庆祝\"}"
+        }}]});
+        for finish_reason in ["stop", "tool_calls"] {
+            let mut complete = response(message.clone());
+            complete["choices"][0]["finish_reason"] = json!(finish_reason);
+            assert_eq!(parse_response(complete, &allowed).unwrap().message, message);
+        }
+        for arguments in [r#"{"query":"合成庆祝"}"#, r#"{"query":"private unfinished"#] {
+            let mut truncated = response(message.clone());
+            truncated["choices"][0]["finish_reason"] = json!("length");
+            truncated["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                json!(arguments);
+            let error = parse_response(truncated, &allowed).unwrap_err();
+            assert!(error.is::<TruncatedToolResponse>());
+            assert_eq!(
+                error.to_string(),
+                "模型输出达到长度上限，工具调用未完整生成，本次调用未执行。"
+            );
+            assert!(!format!("{error:#}").contains("private"));
+        }
+    }
+
+    #[test]
+    fn truncated_tool_response_does_not_override_provider_blocking_or_plain_text() {
+        let mut blocked = response(json!({"role":"assistant","content":null,
+            "refusal":"private provider refusal", "tool_calls":[call("one")]}));
+        blocked["choices"][0]["finish_reason"] = json!("length");
+        assert!(
+            parse_response(blocked, &HashSet::new())
+                .unwrap_err()
+                .is::<ProviderBlocked>()
+        );
+        let mut text = response(json!({"role":"assistant","content":"ordinary partial text"}));
+        text["choices"][0]["finish_reason"] = json!("length");
+        assert_eq!(
+            parse_response(text, &HashSet::new()).unwrap().message["content"],
+            "ordinary partial text"
+        );
+    }
+
+    #[test]
+    fn truncation_metadata_retains_only_unsigned_integer_counters() {
+        let mut value = response(json!({"role":"assistant","content":"private text",
+            "tool_calls":[{"function":{"name":"private-name","arguments":"private-args"}}]}));
+        value["usage"] = json!({"prompt_tokens":123,"completion_tokens":800,"total_tokens":923,
+            "completion_tokens_details":{"reasoning_tokens":768}});
+        assert_eq!(
+            TruncationMetadata::from_response(&value),
+            TruncationMetadata {
+                prompt_tokens: Some(123),
+                completion_tokens: Some(800),
+                total_tokens: Some(923),
+                reasoning_tokens: Some(768),
+                tool_call_count: 1,
+            }
+        );
+        value["usage"] = json!({"prompt_tokens":-1,"completion_tokens":"private-counter",
+            "total_tokens":1.5,"completion_tokens_details":{"reasoning_tokens":{"secret":"private"}}});
+        let metadata = TruncationMetadata::from_response(&value);
+        assert_eq!(
+            metadata,
+            TruncationMetadata {
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                reasoning_tokens: None,
+                tool_call_count: 1,
+            }
+        );
+        assert!(!format!("{metadata:?}").contains("private"));
     }
 
     #[test]
