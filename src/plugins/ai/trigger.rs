@@ -1,7 +1,7 @@
 //! Resolve quote-only triggers before deciding how to retain the current message.
 //! Ingress has already persisted a content-free deduplication row. Slow lookups
 //! run outside dispatch; later messages in the same conversation stay ordered.
-use super::{Conversation, chat::Chat};
+use super::{Conversation, chat::Chat, vision::Images};
 use crate::{
     config::Limits,
     host::Host,
@@ -57,23 +57,33 @@ pub(super) struct Quote {
     pub key: MessageKey,
     pub(super) sender: Option<i64>,
     content: String,
+    // None means a local text snapshot; Some(empty) means remote metadata was
+    // checked and contains no top-level images. Signed URLs are never retained.
+    images: Option<Images>,
 }
 impl Quote {
     pub(super) fn from_message(message: &Incoming) -> Self {
-        Self::message(
+        let mut quote = Self::message(
             message.key.clone(),
             message.sender_id,
             message.sender_nickname.as_deref(),
             message.sender_card.as_deref(),
             &message.text,
             None,
-        )
+        );
+        quote.images = Some(Images::from_message(message));
+        quote
+    }
+
+    pub(super) fn images(&self) -> Option<&Images> {
+        self.images.as_ref()
     }
     fn unavailable(key: MessageKey) -> Self {
         Self {
             key,
             sender: None,
             content: "[引用不可用]".into(),
+            images: None,
         }
     }
 
@@ -82,6 +92,7 @@ impl Quote {
             key,
             sender: None,
             content: "[引用已遗忘]".into(),
+            images: None,
         }
     }
 
@@ -101,7 +112,7 @@ impl Quote {
             "原始发言者".into()
         };
         let text = if text.is_empty() {
-            "[引用没有可用文字；未读取图片或其他媒体内容]".into()
+            "[引用没有可用文字]".into()
         } else {
             text.chars().take(1000).collect::<String>()
         };
@@ -112,6 +123,7 @@ impl Quote {
                 "[引用消息；{source}] {}",
                 message_content(sender, nickname, card, &text)
             ),
+            images: None,
         }
     }
 
@@ -132,6 +144,11 @@ fn revoked(db: &Connection, key: &str) -> Result<bool> {
         [key],
         |r| r.get(0),
     )?)
+}
+
+async fn quote_revoked(host: &Host, key: &MessageKey) -> Result<bool> {
+    let key = key.key();
+    host.store.call(move |db| revoked(db, &key)).await
 }
 
 async fn local_quote(host: &Host, key: &MessageKey) -> Result<Option<Quote>> {
@@ -375,6 +392,11 @@ impl Ingress {
         key: MessageKey,
         cancel: &CancellationToken,
     ) -> Quote {
+        match quote_revoked(host, &key).await {
+            Ok(true) => return Quote::revoked(key),
+            Err(_) => return Quote::unavailable(key),
+            Ok(false) => {}
+        }
         // Congestion is an unavailable quote, never an unbounded wait or task.
         let Ok(_permit) = self.lookups.clone().try_acquire_owned() else {
             return Quote::unavailable(key);
@@ -384,6 +406,11 @@ impl Ingress {
             _ = cancel.cancelled() => None,
             result = tokio::time::timeout(LOOKUP_TIMEOUT, host.milky.get_message(&key)) => result.ok().and_then(Result::ok),
         };
+        match quote_revoked(host, &key).await {
+            Ok(true) => return Quote::revoked(key),
+            Err(_) => return Quote::unavailable(key),
+            Ok(false) => {}
+        }
         match fetched {
             Some(message) => Quote::from_message(&message),
             None => Quote::unavailable(key),
@@ -400,6 +427,50 @@ impl Ingress {
             Some(quote) => Ok(quote),
             None => Ok(self.remote_quote(host, key, cancel).await),
         }
+    }
+
+    /// Enrich a usable quote only after the caller has admitted a vision turn.
+    /// Preserve the cached text and plugin attribution; only verified, bounded
+    /// top-level image identifiers cross this boundary.
+    pub async fn quote_images(
+        &self,
+        host: &Host,
+        quote: &Quote,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Images>> {
+        let Some(sender) = quote.sender.filter(|sender| *sender > 0) else {
+            return Ok(None);
+        };
+        if cancel.is_cancelled() || quote_revoked(host, &quote.key).await? {
+            return Ok(None);
+        }
+        let Ok(generation) = host.milky.scope_generation(&quote.key.scope) else {
+            return Ok(None);
+        };
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(images) = quote.images() {
+            return Ok(Some(images.clone()));
+        }
+        // Match quote lookup's bounded concurrency and fail-closed congestion.
+        let Ok(_permit) = self.lookups.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        let fetched = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout(LOOKUP_TIMEOUT, host.milky.get_message(&quote.key)) => result.ok().and_then(Result::ok),
+        };
+        if quote_revoked(host, &quote.key).await?
+            || cancel.is_cancelled()
+            || host.milky.check_generation(generation).is_err()
+        {
+            return Ok(None);
+        }
+        Ok(fetched
+            .filter(|message| message.key == quote.key && message.sender_id == sender)
+            .map(|message| Images::from_message(&message)))
     }
 
     async fn finish(&self, chat: &Arc<Chat>, job: &Pending, mut decision: Decision) -> Result<()> {
@@ -535,6 +606,311 @@ fn quote_key(message: &Incoming) -> Option<MessageKey> {
 mod tests {
     use super::*;
     use crate::{config::Config, types::Scope};
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn image_message() -> Incoming {
+        Incoming {
+            key: MessageKey {
+                scope: Scope {
+                    bot_id: 1,
+                    scene: Scene::Group,
+                    peer_id: 2,
+                },
+                message_seq: 7,
+            },
+            sender_id: 3,
+            sender_nickname: None,
+            sender_card: None,
+            text: "引用原文".into(),
+            mentions: vec![],
+            quote_seq: None,
+            received_at: 1,
+            raw_message: json!({"message_scene":"group","peer_id":2,"message_seq":7,"sender_id":3,
+            "segments":[
+                {"type":"text","data":{"text":"远端文字"}},
+                {"type":"image","data":{"resource_id":"top-image","temp_url":"https://qpic.cn/private-token"}},
+                {"type":"reply","data":{"message_seq":6,"segments":[
+                    {"type":"image","data":{"resource_id":"nested-image"}}
+                ]}},
+                {"type":"forward","data":{"messages":[{"segments":[
+                    {"type":"image","data":{"resource_id":"forwarded-image"}}
+                ]}]}}
+            ]}),
+            notification: None,
+        }
+    }
+
+    struct QuoteServer {
+        host: Arc<Host>,
+        calls: Arc<AtomicUsize>,
+        requested: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl QuoteServer {
+        async fn start(message: Value, wait: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let requested = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let observed = calls.clone();
+            let arrived = requested.clone();
+            let proceed = release.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/api/get_login_info",
+                    axum::routing::post(|| async {
+                        axum::Json(json!({"status":"ok","retcode":0,"data":{"uin":1}}))
+                    }),
+                )
+                .route(
+                    "/api/get_message",
+                    axum::routing::post(move || {
+                        let observed = observed.clone();
+                        let arrived = arrived.clone();
+                        let proceed = proceed.clone();
+                        let message = message.clone();
+                        async move {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            arrived.notify_one();
+                            if wait {
+                                tokio::time::timeout(Duration::from_secs(5), proceed.notified())
+                                    .await
+                                    .expect("quote test did not release the mock response");
+                            }
+                            axum::Json(
+                                json!({"status":"ok","retcode":0,"data":{"message":message}}),
+                            )
+                        }
+                    }),
+                );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut config = Config::default();
+            config.app.database = ":memory:".into();
+            config.plugins.ai.enabled = false;
+            config.milky.url = url;
+            let host = Host::create(config).await.unwrap();
+            host.milky.login().await.unwrap();
+            Self {
+                host,
+                calls,
+                requested,
+                release,
+                task,
+            }
+        }
+
+        async fn stop(self) {
+            self.task.abort();
+            self.host.store.stop().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_quote_keeps_bounded_top_level_image_ids_without_raw_urls_or_nested_media() {
+        let mut message = image_message();
+        let quote = Quote::from_message(&message);
+        let snapshot = quote.images().unwrap().raw_snapshot();
+        assert_eq!(snapshot["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["segments"][0]["data"]["resource_id"], "top-image");
+        assert!(!snapshot.to_string().contains("private-token"));
+        assert!(!snapshot.to_string().contains("nested-image"));
+        assert!(!snapshot.to_string().contains("forwarded-image"));
+        assert!(quote.content.contains("引用原文"));
+        for i in 0..5 {
+            message.raw_message["segments"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"image","data":{"resource_id":format!("extra-{i}")}}));
+        }
+        let snapshot = Quote::from_message(&message)
+            .images()
+            .unwrap()
+            .raw_snapshot();
+        let segments = snapshot["segments"].as_array().unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|segment| segment["data"]["resource_id"].is_string())
+                .count(),
+            4
+        );
+        assert_eq!(
+            segments.len(),
+            5,
+            "one marker preserves skipped-image status"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_images_are_enriched_on_demand_without_replacing_local_text_or_origin() {
+        let mut message = image_message();
+        message.sender_id = 1;
+        message.raw_message["sender_id"] = json!(1);
+        let server = QuoteServer::start(message.raw_message.clone(), false).await;
+        let ingress = Ingress::new(&Limits::default());
+        let cancel = CancellationToken::new();
+        let quote = Quote::message(
+            message.key.clone(),
+            1,
+            None,
+            None,
+            "本地原文",
+            Some("plugin"),
+        );
+        assert!(quote.images().is_none());
+        let before = quote.content.clone();
+        assert!(before.contains("来源插件：plugin"));
+        let images = ingress
+            .quote_images(&server.host, &quote, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            images.raw_snapshot()["segments"][0]["data"]["resource_id"],
+            "top-image"
+        );
+        assert_eq!(quote.content, before);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        let cached = Quote::from_message(&message);
+        assert!(
+            ingress
+                .quote_images(&server.host, &cached, &cancel)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut empty = message.clone();
+        empty.raw_message = json!({"segments":[]});
+        let empty = Quote::from_message(&empty);
+        assert!(
+            ingress
+                .quote_images(&server.host, &empty, &cancel)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            server.calls.load(Ordering::SeqCst),
+            1,
+            "known metadata must not refetch"
+        );
+        let wrong_sender = Quote::message(message.key.clone(), 9, None, None, "本地原文", None);
+        assert!(
+            ingress
+                .quote_images(&server.host, &wrong_sender, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong_key = quote.clone();
+        wrong_key.key.message_seq += 1;
+        assert!(
+            ingress
+                .quote_images(&server.host, &wrong_key, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server.calls.load(Ordering::SeqCst), 3);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn revoked_cached_or_local_quotes_and_unavailable_work_never_fetch_images() {
+        let message = image_message();
+        let server = QuoteServer::start(message.raw_message.clone(), false).await;
+        let ingress = Ingress::new(&Limits::default());
+        let cancel = CancellationToken::new();
+        let local = Quote::message(message.key.clone(), 3, None, None, "本地原文", None);
+        let first = ingress.lookups.clone().try_acquire_owned().unwrap();
+        let second = ingress.lookups.clone().try_acquire_owned().unwrap();
+        assert!(
+            ingress
+                .quote_images(&server.host, &local, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop((first, second));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            ingress
+                .quote_images(&server.host, &local, &cancelled)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let unavailable = Quote::unavailable(message.key.clone());
+        assert!(
+            ingress
+                .quote_images(&server.host, &unavailable, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server
+            .host
+            .store
+            .call(|db| {
+                db.execute("INSERT INTO ai_revoked_sources VALUES('1:group:2:7',1)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for quote in [local, Quote::from_message(&message)] {
+            assert!(
+                ingress
+                    .quote_images(&server.host, &quote, &cancel)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let remote = ingress
+            .remote_quote(&server.host, message.key, &cancel)
+            .await;
+        assert_eq!(remote.content, "[引用已遗忘]");
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn quote_images_forgotten_during_lookup_are_discarded() {
+        let message = image_message();
+        let server = QuoteServer::start(message.raw_message.clone(), true).await;
+        let ingress = Ingress::new(&Limits::default());
+        let cancel = CancellationToken::new();
+        let quote = Quote::message(message.key, 3, None, None, "本地原文", None);
+        let fetch = ingress.quote_images(&server.host, &quote, &cancel);
+        let forget = async {
+            tokio::time::timeout(Duration::from_secs(1), server.requested.notified())
+                .await
+                .unwrap();
+            server
+                .host
+                .store
+                .call(|db| {
+                    db.execute("INSERT INTO ai_revoked_sources VALUES('1:group:2:7',1)", [])?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            server.release.notify_one();
+        };
+        let (images, _) = tokio::join!(fetch, forget);
+        assert!(images.unwrap().is_none());
+        assert_eq!(quote.content(&server.host).await.unwrap(), "[引用已遗忘]");
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        server.stop().await;
+    }
 
     #[tokio::test]
     async fn quote_lookup_is_scoped_bounded_and_never_resurrects_revoked_sources() {
@@ -579,7 +955,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .content
-                .contains("未读取图片")
+                .contains("引用没有可用文字")
         );
         for scope in [
             Scope {

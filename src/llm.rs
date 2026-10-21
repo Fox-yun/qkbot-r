@@ -13,6 +13,9 @@ use crate::milky::read_bounded;
 pub(crate) const MAX_INPUT_IMAGES: usize = 4;
 pub(crate) const MAX_IMAGE_URL_BYTES: usize = 1_400_000;
 
+type SourceValidation<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
@@ -165,12 +168,15 @@ impl Llm {
             permit,
             Some(crate::budget::RequestAdmission::Chat(admission)),
             None,
+            None,
         )
         .await
     }
 
     /// Visual inputs are tied to the QQ login that supplied their pixels,
-    /// including while waiting for an available model request slot.
+    /// including while waiting for an available model request slot. Revalidate
+    /// the source messages after that wait, before submitting any pixels.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_visual_admitted(
         &self,
         messages: Vec<Value>,
@@ -179,6 +185,7 @@ impl Llm {
         cancel: &CancellationToken,
         admission: crate::budget::Admission,
         account: (&crate::milky::Milky, u64),
+        revalidate_sources: impl std::future::Future<Output = Result<()>> + Send,
     ) -> Result<LlmResponse> {
         let permit = tokio::select! {
             biased;
@@ -193,6 +200,7 @@ impl Llm {
             permit,
             Some(crate::budget::RequestAdmission::Chat(admission)),
             Some(account),
+            Some(Box::pin(revalidate_sources)),
         )
         .await
     }
@@ -209,8 +217,10 @@ impl Llm {
             _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
             permit = self.requests.clone().acquire_owned() => permit.context("model request scheduler closed")?,
         };
-        self.request(messages, tools, max_output, cancel, permit, None, None)
-            .await
+        self.request(
+            messages, tools, max_output, cancel, permit, None, None, None,
+        )
+        .await
     }
 
     /// Background jobs never queue ahead of foreground requests and cannot use tools.
@@ -265,6 +275,7 @@ impl Llm {
             permit,
             admission,
             None,
+            None,
         )
         .await
         .map(Some)
@@ -280,6 +291,7 @@ impl Llm {
         _permit: OwnedSemaphorePermit,
         admission: Option<crate::budget::RequestAdmission>,
         account: Option<(&crate::milky::Milky, u64)>,
+        revalidate_sources: Option<SourceValidation<'_>>,
     ) -> Result<LlmResponse> {
         ensure!(
             (1..=32768).contains(&max_output),
@@ -330,6 +342,9 @@ impl Llm {
                     "model request requires a runtime admission"
                 );
                 budget.reserve_request(admission).await?;
+            }
+            if let Some(revalidate) = revalidate_sources {
+                revalidate.await?;
             }
             ensure!(!cancel.is_cancelled(), "model request cancelled");
             if let Some((milky, generation)) = account {
@@ -706,6 +721,70 @@ mod tests {
         }})
     }
 
+    #[tokio::test]
+    async fn visual_sources_are_revalidated_after_waiting_for_a_model_slot() {
+        use crate::types::{ContextGuard, Scene, Scope};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = config(format!("http://{}", listener.local_addr().unwrap()));
+        cfg.max_concurrent_requests = 1;
+        let client = Llm::new(cfg, reqwest::Client::new()).unwrap();
+        let (login_url, login_server) = crate::milky::tests::server(
+            "200 OK",
+            r#"{"status":"ok","retcode":0,"data":{"uin":123}}"#,
+        )
+        .await;
+        let milky = crate::milky::Milky::new(
+            crate::milky::MilkyConfig {
+                url: login_url,
+                bot_id: Some(123),
+                ..Default::default()
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        milky.login().await.unwrap();
+        login_server.await.unwrap();
+        let held = client.requests.clone().acquire_owned().await.unwrap();
+        let revoked = AtomicBool::new(false);
+        let checked = AtomicBool::new(false);
+        let cancel = CancellationToken::new();
+        let request = client.complete_visual_admitted(
+            vec![json!({"role":"user","content":[{"type":"text","text":"describe quote"},image_part()]})],
+            vec![], 128, &cancel,
+            crate::budget::Admission {
+                scope: Scope { bot_id: 123, scene: Scene::Group, peer_id: 456 },
+                actor: 789,
+                guard: ContextGuard { conversation_id: "visual-source-test".into(), epoch: 1 },
+                plugin_epoch: 1,
+            },
+            (&milky, milky.scope_generation(&Scope { bot_id: 123, scene: Scene::Group, peer_id: 456 }).unwrap()),
+            async {
+                checked.store(true, Ordering::SeqCst);
+                ensure!(!revoked.load(Ordering::SeqCst), "quoted source revoked");
+                Ok(())
+            },
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request bypassed held permit: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert!(!checked.load(Ordering::SeqCst));
+        revoked.store(true, Ordering::SeqCst);
+        drop(held);
+        let error = request.await.unwrap_err();
+        assert_eq!(error.to_string(), "quoted source revoked");
+        assert!(checked.load(Ordering::SeqCst));
+        assert_eq!(client.requests.available_permits(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn mixed_user_input_accepts_inline_jpeg_without_changing_tool_protocol() {
         let messages = vec![
@@ -916,6 +995,7 @@ mod tests {
                 plugin_epoch: 1,
             },
             (&milky, generation),
+            async { Ok(()) },
         );
         tokio::pin!(request);
         // Poll the request into the semaphore queue before replacing the login.

@@ -1,4 +1,4 @@
-//! Bounded images from this message only. Resource identifiers are verified by
+//! Bounded images from the current message and its explicit quote. Resources are verified by
 //! Milky; signed download URLs and provider errors never enter model context.
 use crate::{
     host::Host,
@@ -90,69 +90,153 @@ impl Images {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Current,
+    Quote,
+}
+
+impl Origin {
+    fn index(self) -> usize {
+        match self {
+            Self::Current => 0,
+            Self::Quote => 1,
+        }
+    }
+}
+
+pub(crate) struct LoadedImage {
+    pub url: String,
+    pub origin: Origin,
+}
+
 #[derive(Default)]
 pub(crate) struct Loaded {
-    pub images: Vec<String>,
+    pub images: Vec<LoadedImage>,
     pub note: String,
 }
 
 pub(crate) async fn load(
     host: &Host,
-    key: &MessageKey,
-    sources: &Images,
+    current_key: &MessageKey,
+    current: &Images,
+    quote: Option<(&MessageKey, &Images)>,
     cancel: &CancellationToken,
 ) -> Result<Loaded> {
     ensure!(!cancel.is_cancelled(), "图片处理已取消");
-    if sources.is_empty() {
+    validate_scope(current_key, quote)?;
+    if current.is_empty() && quote.is_none_or(|(_, images)| images.is_empty()) {
         return Ok(Loaded::default());
     }
-    let generation = host.milky.scope_generation(&key.scope)?;
-    let loaded = collect(sources, cancel, |resource| async move {
-        host.milky.check_generation(generation)?;
-        let url = host
-            .milky
-            .get_resource_temp_url(key, &resource)
-            .await
-            .inspect_err(|_| {
+    let generation = host.milky.scope_generation(&current_key.scope)?;
+    let loaded = collect(
+        current_key,
+        current,
+        quote,
+        cancel,
+        |key, resource| async move {
+            host.milky.check_generation(generation)?;
+            let url = host
+                .milky
+                .get_resource_temp_url(&key, &resource)
+                .await
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        stage = "resource_lookup",
+                        reason = "failed",
+                        "AI image processing failed"
+                    );
+                })?;
+            let bytes = download(&url).await.inspect_err(|_| {
                 tracing::warn!(
-                    stage = "resource_lookup",
+                    stage = "download",
                     reason = "failed",
                     "AI image processing failed"
                 );
             })?;
-        let bytes = download(&url).await.inspect_err(|_| {
-            tracing::warn!(
-                stage = "download",
-                reason = "failed",
-                "AI image processing failed"
-            );
-        })?;
-        host.milky.check_generation(generation)?;
-        Ok(bytes)
-    })
+            host.milky.check_generation(generation)?;
+            Ok(bytes)
+        },
+    )
     .await?;
     ensure!(!cancel.is_cancelled(), "图片处理已取消");
     host.milky.check_generation(generation)?;
     Ok(loaded)
 }
 
+fn validate_scope(current_key: &MessageKey, quote: Option<(&MessageKey, &Images)>) -> Result<()> {
+    ensure!(
+        quote.is_none_or(|(key, _)| key.scope == current_key.scope),
+        "引用图片不属于当前会话"
+    );
+    Ok(())
+}
+
 // The injectable operation lets tests exercise partial failure, cancellation
 // and bounded collection without a production exception for private hosts.
 async fn collect<F, Fut>(
-    sources: &Images,
+    current_key: &MessageKey,
+    current: &Images,
+    quote: Option<(&MessageKey, &Images)>,
     cancel: &CancellationToken,
+    fetch: F,
+) -> Result<Loaded>
+where
+    F: FnMut(MessageKey, String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    collect_with_timeouts(
+        current_key,
+        current,
+        quote,
+        cancel,
+        RESOURCE_TIMEOUT,
+        BATCH_TIMEOUT,
+        fetch,
+    )
+    .await
+}
+
+async fn collect_with_timeouts<F, Fut>(
+    current_key: &MessageKey,
+    current: &Images,
+    quote: Option<(&MessageKey, &Images)>,
+    cancel: &CancellationToken,
+    resource_timeout: Duration,
+    batch_timeout: Duration,
     mut fetch: F,
 ) -> Result<Loaded>
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(MessageKey, String) -> Fut,
     Fut: Future<Output = Result<Vec<u8>>>,
 {
+    ensure!(!cancel.is_cancelled(), "图片处理已取消");
+    validate_scope(current_key, quote)?;
     let mut loaded = Loaded::default();
-    let mut unreadable = sources.skipped > 0 || sources.invalid > 0;
+    let mut unreadable = [false; 2];
+    let mut jobs = Vec::with_capacity(MAX_IMAGES);
+    let inputs = std::iter::once((Origin::Current, current_key, current))
+        .chain(quote.map(|(key, images)| (Origin::Quote, key, images)));
+    for (origin, key, images) in inputs {
+        unreadable[origin.index()] = images.skipped > 0 || images.invalid > 0;
+        for resource in &images.resources {
+            if jobs.len() < MAX_IMAGES {
+                jobs.push((origin, key.clone(), resource.clone()));
+            } else {
+                unreadable[origin.index()] = true;
+            }
+        }
+    }
+    // The cap counts attempted resources, including failures. Current-message
+    // images have priority; equal resource IDs in distinct messages stay distinct.
+    let mut completed = 0;
     let work = async {
-        for resource in &sources.resources {
+        for (origin, key, resource) in &jobs {
+            if cancel.is_cancelled() {
+                break;
+            }
             let read_image = async {
-                let bytes = fetch(resource.clone()).await?;
+                let bytes = fetch(key.clone(), resource.clone()).await?;
                 decode(bytes, cancel).await.inspect_err(|_| {
                     if !cancel.is_cancelled() {
                         tracing::warn!(
@@ -163,24 +247,28 @@ where
                     }
                 })
             };
-            match tokio::time::timeout(RESOURCE_TIMEOUT, read_image).await {
-                Ok(Ok(image)) => loaded.images.push(image),
-                Ok(Err(_)) => unreadable = true,
+            match tokio::time::timeout(resource_timeout, read_image).await {
+                Ok(Ok(url)) => loaded.images.push(LoadedImage {
+                    url,
+                    origin: *origin,
+                }),
+                Ok(Err(_)) => unreadable[origin.index()] = true,
                 Err(_) => {
                     tracing::warn!(
                         stage = "image",
                         reason = "timeout",
                         "AI image processing failed"
                     );
-                    unreadable = true;
+                    unreadable[origin.index()] = true;
                 }
             }
+            completed += 1;
         }
     };
     let timed_out = tokio::select! {
         biased;
         _ = cancel.cancelled() => bail!("图片处理已取消"),
-        result = tokio::time::timeout(BATCH_TIMEOUT, work) => result.is_err(),
+        result = tokio::time::timeout(batch_timeout, work) => result.is_err(),
     };
     if timed_out {
         tracing::warn!(
@@ -188,16 +276,28 @@ where
             reason = "timeout",
             "AI image processing failed"
         );
-    }
-    unreadable |= timed_out;
-    ensure!(!cancel.is_cancelled(), "图片处理已取消");
-    if unreadable {
-        loaded.note = if loaded.images.is_empty() {
-            "当前消息的图片未能读取，请说明这一点，不要猜测图片内容。"
-        } else {
-            "当前消息的部分图片未能读取；附件按成功读取顺序排列，不能据此确定原消息中的图片编号。仅根据实际提供的图片回答，不要猜测未提供的内容。"
+        // A batch timeout can interrupt one source and leave the other queued.
+        // Attribute failure only to sources whose work did not finish.
+        for (origin, _, _) in &jobs[completed..] {
+            unreadable[origin.index()] = true;
         }
-        .into();
+    }
+    ensure!(!cancel.is_cancelled(), "图片处理已取消");
+    for (origin, source) in [(Origin::Current, "当前消息"), (Origin::Quote, "被引用消息")]
+    {
+        if unreadable[origin.index()] {
+            let partial = if loaded.images.iter().any(|image| image.origin == origin) {
+                "部分"
+            } else {
+                ""
+            };
+            loaded
+                .note
+                .push_str(&format!("{source}的{partial}图片未能读取。"));
+        }
+    }
+    if !loaded.note.is_empty() {
+        loaded.note.push_str("附件按各自来源成功读取的顺序排列，不能据此确定原消息中的图片编号。仅根据实际提供的图片回答，不要猜测未提供的内容。");
     }
     Ok(loaded)
 }
@@ -442,6 +542,12 @@ mod tests {
         }
     }
 
+    fn sources(ids: &[&str]) -> Images {
+        Images::from_message(&message(json!({"segments": ids.iter().map(|id|
+            json!({"type":"image","data":{"resource_id":id}})
+        ).collect::<Vec<_>>()})))
+    }
+
     #[test]
     fn only_bounded_unique_top_level_resources_survive_snapshot() {
         let mut segments = vec![
@@ -678,19 +784,27 @@ mod tests {
             .collect();
         let sources = Images::from_message(&message(json!({"segments":segments})));
         let mut fetched = Vec::new();
-        let loaded = collect(&sources, &CancellationToken::new(), |id| {
-            fetched.push(id.clone());
-            async move {
-                let color = match id.as_str() {
-                    "red" => [240, 20, 20],
-                    "green" => [20, 240, 20],
-                    "blue" => [20, 20, 240],
-                    "yellow" => [240, 240, 20],
-                    _ => panic!("excess image was fetched"),
-                };
-                Ok(png(color))
-            }
-        })
+        let current_key = message(Value::Null).key;
+        let loaded = collect(
+            &current_key,
+            &sources,
+            None,
+            &CancellationToken::new(),
+            |key, id| {
+                assert_eq!(key, current_key);
+                fetched.push(id.clone());
+                async move {
+                    let color = match id.as_str() {
+                        "red" => [240, 20, 20],
+                        "green" => [20, 240, 20],
+                        "blue" => [20, 20, 240],
+                        "yellow" => [240, 240, 20],
+                        _ => panic!("excess image was fetched"),
+                    };
+                    Ok(png(color))
+                }
+            },
+        )
         .await
         .unwrap();
         assert_eq!(fetched, ["red", "green", "blue", "yellow"]);
@@ -701,7 +815,8 @@ mod tests {
                 .iter()
                 .zip([[240, 20, 20], [20, 240, 20], [20, 20, 240], [240, 240, 20]])
         {
-            let pixel = jpeg_pixel(data);
+            assert_eq!(data.origin, Origin::Current);
+            let pixel = jpeg_pixel(&data.url);
             assert!(
                 pixel
                     .iter()
@@ -719,27 +834,277 @@ mod tests {
             skipped: 0,
             invalid: 0,
         };
-        let loaded = collect(&images, &CancellationToken::new(), |id| async move {
-            if id == "bad" {
-                bail!("provider secret and signed URL");
-            }
-            Ok(png([240, 20, 20]))
-        })
+        let current_key = message(Value::Null).key;
+        let loaded = collect(
+            &current_key,
+            &images,
+            None,
+            &CancellationToken::new(),
+            |_, id| async move {
+                if id == "bad" {
+                    bail!("provider secret and signed URL");
+                }
+                Ok(png([240, 20, 20]))
+            },
+        )
         .await
         .unwrap();
         assert_eq!(loaded.images.len(), 1);
-        assert!(jpeg_pixel(&loaded.images[0])[0] > 180);
+        assert!(jpeg_pixel(&loaded.images[0].url)[0] > 180);
         assert!(loaded.note.contains("图片") && loaded.note.contains("未能读取"));
         assert!(!loaded.note.contains("secret"));
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(
-            collect(&images, &cancel, |_| async {
+            collect(&current_key, &images, None, &cancel, |_, _| async {
                 panic!("cancelled operation fetched an image");
             })
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_sources_share_cap_and_preserve_origin_key_and_resource_order() {
+        let current_key = message(Value::Null).key;
+        let quote_key = MessageKey {
+            message_seq: 2,
+            ..current_key.clone()
+        };
+        let current = sources(&["same", "current-second", "same"]);
+        let quote = sources(&["same", "quote-second", "same", "over-cap"]);
+        let mut fetched = Vec::new();
+        let loaded = collect(
+            &current_key,
+            &current,
+            Some((&quote_key, &quote)),
+            &CancellationToken::new(),
+            |key, id| {
+                fetched.push((key.clone(), id.clone()));
+                let color = match (key.message_seq, id.as_str()) {
+                    (3, "same") => [240, 20, 20],
+                    (3, "current-second") => [20, 240, 20],
+                    (2, "same") => [20, 20, 240],
+                    (2, "quote-second") => [240, 240, 20],
+                    _ => panic!("resource outside the shared cap was fetched"),
+                };
+                async move { Ok(png(color)) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fetched,
+            [
+                (current_key.clone(), "same".into()),
+                (current_key, "current-second".into()),
+                (quote_key.clone(), "same".into()),
+                (quote_key, "quote-second".into()),
+            ]
+        );
+        assert_eq!(
+            loaded
+                .images
+                .iter()
+                .map(|image| image.origin)
+                .collect::<Vec<_>>(),
+            [
+                Origin::Current,
+                Origin::Current,
+                Origin::Quote,
+                Origin::Quote
+            ]
+        );
+        for (image, expected) in
+            loaded
+                .images
+                .iter()
+                .zip([[240, 20, 20], [20, 240, 20], [20, 20, 240], [240, 240, 20]])
+        {
+            assert!(
+                jpeg_pixel(&image.url)
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(expected) < 8)
+            );
+        }
+        assert!(loaded.note.starts_with("被引用消息的部分图片未能读取。"));
+        assert!(!loaded.note.contains("当前消息的"));
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_current_attempts_still_exhaust_the_shared_limit() {
+        let current_key = message(Value::Null).key;
+        let quote_key = MessageKey {
+            message_seq: 2,
+            ..current_key.clone()
+        };
+        let current = sources(&["a", "b", "c", "d"]);
+        let quote = sources(&["quote"]);
+        let mut attempted = 0;
+        let loaded = collect(
+            &current_key,
+            &current,
+            Some((&quote_key, &quote)),
+            &CancellationToken::new(),
+            |key, _| {
+                assert_eq!(key, current_key);
+                attempted += 1;
+                async { bail!("synthetic failure") }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempted, MAX_IMAGES);
+        assert!(loaded.images.is_empty());
+        assert!(loaded.note.contains("当前消息的图片未能读取。"));
+        assert!(loaded.note.contains("被引用消息的图片未能读取。"));
+    }
+
+    #[tokio::test]
+    async fn source_failures_and_invalid_images_are_attributed_to_their_own_message() {
+        let current_key = message(Value::Null).key;
+        let quote_key = MessageKey {
+            message_seq: 2,
+            ..current_key.clone()
+        };
+        for fail_current in [false, true] {
+            let current = sources(&["current"]);
+            let quote = sources(&["quote"]);
+            let loaded = collect(
+                &current_key,
+                &current,
+                Some((&quote_key, &quote)),
+                &CancellationToken::new(),
+                |key, _| async move {
+                    if (key.message_seq == 3) == fail_current {
+                        bail!("signed URL and provider secret");
+                    }
+                    Ok(png([240, 20, 20]))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(loaded.images.len(), 1);
+            let (origin, failed, successful) = if fail_current {
+                (Origin::Quote, "当前消息的图片未能读取。", "被引用消息的")
+            } else {
+                (Origin::Current, "被引用消息的图片未能读取。", "当前消息的")
+            };
+            assert_eq!(loaded.images[0].origin, origin);
+            assert!(loaded.note.starts_with(failed));
+            assert!(!loaded.note.contains(successful));
+            assert!(!loaded.note.contains("secret"));
+        }
+        let loaded = collect(
+            &current_key,
+            &Images::default(),
+            Some((&quote_key, &sources(&[""]))),
+            &CancellationToken::new(),
+            |_, _| async {
+                panic!("invalid resource must not be fetched");
+            },
+        )
+        .await
+        .unwrap();
+        assert!(loaded.images.is_empty());
+        assert!(loaded.note.starts_with("被引用消息的图片未能读取。"));
+        assert!(!loaded.note.contains("当前消息的"));
+    }
+
+    #[tokio::test]
+    async fn shared_batch_timeout_attributes_pending_quote_without_failing_completed_current() {
+        let current_key = message(Value::Null).key;
+        let quote_key = MessageKey {
+            message_seq: 2,
+            ..current_key.clone()
+        };
+        let current = sources(&["current"]);
+        let quote = sources(&["pending-quote", "queued-quote"]);
+        let mut fetched = Vec::new();
+        let loaded = collect_with_timeouts(
+            &current_key,
+            &current,
+            Some((&quote_key, &quote)),
+            &CancellationToken::new(),
+            Duration::from_secs(2),
+            Duration::from_millis(300),
+            |key, id| {
+                fetched.push(id);
+                async move {
+                    if key.message_seq == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(png([240, 20, 20]))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched, ["current", "pending-quote"]);
+        assert_eq!(loaded.images.len(), 1);
+        assert_eq!(loaded.images[0].origin, Origin::Current);
+        assert!(loaded.note.starts_with("被引用消息的图片未能读取。"));
+        assert!(!loaded.note.contains("当前消息的"));
+    }
+
+    #[tokio::test]
+    async fn quote_must_match_account_chat_type_and_peer_before_fetching() {
+        let current_key = message(Value::Null).key;
+        let mut other_bot = current_key.clone();
+        other_bot.scope.bot_id += 1;
+        let mut other_peer = current_key.clone();
+        other_peer.scope.peer_id += 1;
+        let mut other_scene = current_key.clone();
+        other_scene.scope.scene = Scene::Friend;
+        for quote_key in [other_bot, other_peer, other_scene] {
+            assert!(
+                collect(
+                    &current_key,
+                    &sources(&["current"]),
+                    Some((&quote_key, &sources(&["quote"]))),
+                    &CancellationToken::new(),
+                    |_, _| async {
+                        panic!("cross-scope resource must not be fetched");
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_reading_quote_propagates_instead_of_returning_partial_images() {
+        let current_key = message(Value::Null).key;
+        let quote_key = MessageKey {
+            message_seq: 2,
+            ..current_key.clone()
+        };
+        let current = sources(&["current"]);
+        let quote = sources(&["quote", "must-not-fetch-after-cancellation"]);
+        let cancel = CancellationToken::new();
+        let mut fetched = Vec::new();
+        let result = collect(
+            &current_key,
+            &current,
+            Some((&quote_key, &quote)),
+            &cancel,
+            |key, id| {
+                fetched.push(id);
+                let cancel = cancel.clone();
+                async move {
+                    if key.message_seq == 2 {
+                        cancel.cancel();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(png([240, 20, 20]))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(fetched, ["current", "quote"]);
     }
 
     #[tokio::test]

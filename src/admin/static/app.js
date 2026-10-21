@@ -50,7 +50,7 @@
       field("llm.max_concurrent_requests", "最大并发请求", "number", "前台聊天和后台整理共用请求额度。", { min: 1 }),
       field("llm.request_timeout_secs", "单次请求超时（秒）", "number", "", { min: 1 }),
       field("llm.tool_calling", "启用原生工具调用", "check", "模型需支持工具调用；工具仍由宿主检查权限和执行结果。"),
-      field("llm.vision", "启用图片识别", "check", "识别当前触发消息中的图片，最多 4 张；模型需支持视觉输入。关闭后按文字处理。"),
+      field("llm.vision", "启用图片识别", "check", "识别当前触发消息及其引用中的图片，合计最多 4 张；模型需支持视觉输入。关闭后按文字处理。"),
     ] },
     { title: "Milky 消息接口", description: "负责收发 QQ 消息。LLBot 常用端口 3010，请以实际配置为准。", fields: [
       field("milky.url", "Milky 地址", "text", "例如 http://127.0.0.1:3010，不填写 /api 后缀。", { placeholder: "http://127.0.0.1:3010" }),

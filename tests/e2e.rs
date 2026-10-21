@@ -300,6 +300,11 @@ async fn nicknames_follow_current_history_and_quoted_messages_without_changing_e
             "旧名片".into()
         )
     );
+    // Cached quote text still needs one on-demand media snapshot lookup.
+    assert_eq!(
+        within(mock.quotes.recv()).await.unwrap(),
+        json!({"message_scene":"group","peer_id":456,"message_seq":1})
+    );
     assert!(mock.quotes.try_recv().is_err());
     within(router.shutdown()).await.unwrap();
     assert!(mock.models.try_recv().is_err());
@@ -980,6 +985,10 @@ async fn reply_trigger_uses_local_plugin_messages_and_preserves_original_evidenc
     assert_eq!(stored, ("为什么？".into(), "user".into(), true));
     request.reply.send(answer("解释")).unwrap();
     assert_eq!(mock.sent().await, "解释");
+    assert_eq!(
+        within(mock.quotes.recv()).await.unwrap(),
+        json!({"message_scene":"group","peer_id":456,"message_seq":100000})
+    );
 
     // Native commands retain ownership even when quoting the bot.
     router
@@ -1004,6 +1013,10 @@ async fn reply_trigger_uses_local_plugin_messages_and_preserves_original_evidenc
     router.dispatch(overlapping).await.unwrap();
     mock.model().await.reply.send(answer("只回复一次")).unwrap();
     mock.sent().await;
+    assert_eq!(
+        within(mock.quotes.recv()).await.unwrap(),
+        json!({"message_scene":"group","peer_id":456,"message_seq":100000})
+    );
     within(router.shutdown()).await.unwrap();
     assert!(mock.models.try_recv().is_err() && mock.quotes.try_recv().is_err());
     mock.stop().await;
@@ -1298,6 +1311,10 @@ async fn reply_trigger_switch_can_disable_quotes_without_disabling_mentions_or_p
         .unwrap();
     mock.model().await.reply.send(answer("引用已开启")).unwrap();
     mock.sent().await;
+    assert_eq!(
+        within(mock.quotes.recv()).await.unwrap(),
+        json!({"message_scene":"group","peer_id":456,"message_seq":100000})
+    );
     within(router.shutdown()).await.unwrap();
     assert!(mock.quotes.try_recv().is_err());
     mock.stop().await;
@@ -2619,6 +2636,290 @@ async fn vision_disabled_skips_image_lookups_and_keeps_normal_text_chat_availabl
     assert!(mock.quote_requests.try_recv().is_err());
     assert!(mock.resources.try_recv().is_err());
     assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+fn quoted_image(body: &Value, text: &str) -> Value {
+    let mut response = quoted(body, 789, text);
+    let mut segments = vec![];
+    if !text.is_empty() {
+        segments.push(json!({"type":"text","data":{"text":text}}));
+    }
+    segments.push(json!({"type":"image","data":{
+        "resource_id":"quoted-pic-secret",
+        "temp_url":"https://qpic.cn/unused-preview?rkey=preview-secret"
+    }}));
+    response["data"]["message"]["segments"] = json!(segments);
+    response
+}
+
+async fn quoted_image_resource(mock: &mut MockServer, seq: i64, text: &str) -> ModelRequest {
+    // The quote snapshot discovers its media, and the resource lookup verifies
+    // its exact physical message key again before requesting a temporary URL.
+    for _ in 0..2 {
+        let lookup = within(mock.quote_requests.recv()).await.unwrap();
+        assert_eq!(
+            lookup.body,
+            json!({
+                "message_scene":"group","peer_id":456,"message_seq":seq
+            })
+        );
+        assert_eq!(within(mock.quotes.recv()).await.unwrap(), lookup.body);
+        assert!(mock.resources.try_recv().is_err());
+        let response = quoted_image(&lookup.body, text);
+        lookup.reply.send(response).unwrap();
+    }
+    let resource = within(mock.resources.recv()).await.unwrap();
+    assert_eq!(resource.body, json!({"resource_id":"quoted-pic-secret"}));
+    resource
+}
+
+fn fail_quoted_image_download(resource: ModelRequest) {
+    resource
+        .reply
+        .send(json!({"status":"ok","retcode":0,"data":{
+            "url":"https://127.0.0.1/quoted-image.png?rkey=signed-secret"
+        }}))
+        .unwrap();
+}
+
+fn assert_no_quoted_image_secrets(value: &str) {
+    for secret in [
+        "quoted-pic-secret",
+        "unused-preview",
+        "preview-secret",
+        "quoted-image.png",
+        "signed-secret",
+        "data:image",
+    ] {
+        assert!(
+            !value.contains(secret),
+            "image resource data leaked: {secret}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vision_quote_cached_text_does_not_hide_images_and_uses_the_quoted_message_key() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup(&mock, true).await;
+    let mut original = image_message(41, "本地引用文字必须保留");
+    original.mentions.clear();
+    router.dispatch(original).await.unwrap();
+    let mut incoming = message(42, "请结合我引用的图片和文字回答");
+    incoming.quote_seq = Some(41);
+    router.dispatch(incoming).await.unwrap();
+    let resource = quoted_image_resource(&mut mock, 41, "远端媒体快照不能覆盖本地引用文字").await;
+    fail_quoted_image_download(resource);
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    let current = request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(current.contains("本地引用文字必须保留"));
+    assert!(current.contains("被引用消息的图片未能读取"));
+    assert!(!payload.contains("远端媒体快照不能覆盖本地引用文字"));
+    assert_no_quoted_image_secrets(&payload);
+    request
+        .reply
+        .send(answer("已保留引用文字，图片暂时无法读取"))
+        .unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 1).await;
+
+    router.dispatch(message(43, "继续文字对话")).await.unwrap();
+    let request = mock.model().await;
+    assert_no_quoted_image_secrets(&request.body["messages"].to_string());
+    request.reply.send(answer("继续正常回答")).unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 2).await;
+    let stored = host
+        .store
+        .call(|db| {
+            let mut statement = db.prepare("SELECT content FROM messages")?;
+            Ok(statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    for content in stored {
+        assert_no_quoted_image_secrets(&content);
+    }
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_quote_image_only_remote_message_is_loaded_without_current_images() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup(&mock, true).await;
+    let mut incoming = message(1, "引用的纯图片画了什么");
+    incoming.quote_seq = Some(77);
+    router.dispatch(incoming).await.unwrap();
+    let resource = quoted_image_resource(&mut mock, 77, "").await;
+    fail_quoted_image_download(resource);
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(payload.contains("引用的纯图片画了什么"));
+    assert!(payload.contains("被引用消息的图片未能读取"));
+    assert_no_quoted_image_secrets(&payload);
+    request.reply.send(answer("引用图片暂时无法读取")).unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_quote_disabled_keeps_quote_text_without_extra_media_queries() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| config.llm.vision = false).await;
+    let mut original = image_message(41, "关闭识图仍保留引用文字");
+    original.mentions.clear();
+    router.dispatch(original).await.unwrap();
+    let mut incoming = message(42, "引用本地消息");
+    incoming.quote_seq = Some(41);
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    assert!(
+        request.body["messages"]
+            .to_string()
+            .contains("关闭识图仍保留引用文字")
+    );
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    request.reply.send(answer("引用文字正常")).unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 1).await;
+
+    let mut incoming = message(43, "引用远端消息");
+    incoming.quote_seq = Some(77);
+    router.dispatch(incoming).await.unwrap();
+    let lookup = within(mock.quote_requests.recv()).await.unwrap();
+    assert_eq!(
+        lookup.body,
+        json!({"message_scene":"group","peer_id":456,"message_seq":77})
+    );
+    assert_eq!(within(mock.quotes.recv()).await.unwrap(), lookup.body);
+    let response = quoted_image(&lookup.body, "远端引用文字");
+    lookup.reply.send(response).unwrap();
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(payload.contains("远端引用文字"));
+    assert!(payload.contains("识图已关闭"));
+    assert_no_quoted_image_secrets(&payload);
+    request.reply.send(answer("只根据引用文字回答")).unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 2).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn vision_quote_revoked_targets_never_trigger_remote_media_resurrection() {
+    for tombstone in [true, false] {
+        let mut mock = MockServer::start().await;
+        mock.control_quotes.store(true, Ordering::Relaxed);
+        let (_temp, host, router) = setup(&mock, true).await;
+        let mut original = image_message(41, "撤销后不能再读取的引用文字");
+        original.mentions.clear();
+        router.dispatch(original).await.unwrap();
+        host.store.call(move |db| {
+            if tombstone {
+                db.execute("INSERT INTO ai_revoked_sources(source_key,revoked_at) VALUES('123:group:456:41',1)", [])?;
+            } else {
+                db.execute("UPDATE messages SET revoked=1 WHERE key='123:group:456:41'", [])?;
+            }
+            Ok(())
+        }).await.unwrap();
+        let mut incoming = message(42, "请看这条已经撤销的引用");
+        incoming.quote_seq = Some(41);
+        router.dispatch(incoming).await.unwrap();
+        let request = mock.model().await;
+        let payload = request.body["messages"].to_string();
+        assert!(payload.contains("引用已遗忘"));
+        assert!(!payload.contains("撤销后不能再读取的引用文字"));
+        assert_no_quoted_image_secrets(&payload);
+        request.reply.send(answer("引用已经遗忘")).unwrap();
+        mock.sent().await;
+        wait_for_outbox(&host, "confirmed", 1).await;
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.quotes.try_recv().is_err());
+        assert!(mock.quote_requests.try_recv().is_err());
+        assert!(mock.resources.try_recv().is_err());
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn vision_quote_revoked_while_loading_images_never_reaches_the_model() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup(&mock, true).await;
+    let mut incoming = message(1, "引用图片加载期间撤销");
+    incoming.quote_seq = Some(77);
+    router.dispatch(incoming).await.unwrap();
+    let resource = quoted_image_resource(&mut mock, 77, "加载期间即将撤销的引用文字").await;
+    // Holding the resource response is a deterministic boundary: the quote's
+    // nonempty image snapshot is admitted, but image loading has not finished.
+    host.store.call(|db| {
+        db.execute("INSERT INTO ai_revoked_sources(source_key,revoked_at) VALUES('123:group:456:77',1)", [])?;
+        Ok(())
+    }).await.unwrap();
+    fail_quoted_image_download(resource);
+    let diagnostic = mock.sent().await;
+    assert!(diagnostic.starts_with("本次请求未完成："));
+    assert!(diagnostic.contains("引用图片来源已失效"));
+    assert_no_quoted_image_secrets(&diagnostic);
+    wait_for_outbox(&host, "confirmed", 1).await;
+    let assistants: i64 = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(assistants, 0);
+    within(router.shutdown()).await.unwrap();
+    assert!(
+        mock.models.try_recv().is_err(),
+        "revoked image context must never be sent to the model"
+    );
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
     assert!(mock.sends.try_recv().is_err());
     drop(host);
     mock.stop().await;
