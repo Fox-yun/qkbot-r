@@ -49,6 +49,7 @@ memory_recall_limit = 5        # 每次最多召回的记忆条数，可提高
 memory_recall_budget = 1000    # 召回文本预算，最终仍受会话总输入预算约束
 
 [plugins.ai.defaults]
+reply_to_bot = true            # 引用回复当前机器人账号的消息时触发 AI；插件命令仍优先
 mode = "group"                # group：同群共享；user：同群按用户隔离，回复仍公开
 input_budget = 6000
 output_budget = 800

@@ -317,7 +317,7 @@ impl Milky {
         normalize_message(key.scope.bot_id, &message, now())
     }
 
-    fn scope_generation(&self, scope: &Scope) -> Result<u64> {
+    pub(crate) fn scope_generation(&self, scope: &Scope) -> Result<u64> {
         let generation = self.verification.load(Ordering::Acquire);
         ensure!(
             scope.bot_id > 0
@@ -329,7 +329,7 @@ impl Milky {
         Ok(generation)
     }
 
-    fn check_generation(&self, generation: u64) -> Result<()> {
+    pub(crate) fn check_generation(&self, generation: u64) -> Result<()> {
         ensure!(
             self.verification.load(Ordering::Acquire) == generation,
             "Milky account verification expired during request"
@@ -1863,6 +1863,28 @@ pub(crate) mod tests {
                 .mentions,
             vec![123]
         );
+    }
+
+    #[test]
+    fn only_top_level_reply_sequences_are_used_with_old_and_new_protocol_metadata() {
+        for data in [
+            json!({"message_seq":7}),
+            json!({"message_seq":7,"sender_id":123}),
+        ] {
+            let value = event(json!([{"type":"reply","data":data}]));
+            let incoming = normalize_event(123, &serde_json::to_vec(&value).unwrap(), 1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(incoming.quote_seq, Some(7));
+        }
+        let value = event(json!([{"type":"forward","data":{"messages":[{
+            "sender_id":123,"segments":[{"type":"reply","data":{"message_seq":7,"sender_id":123}}]
+        }]}}]));
+        let incoming = normalize_event(123, &serde_json::to_vec(&value).unwrap(), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming.quote_seq, None);
+        assert!(!crate::plugins::ai::chat::triggered(&incoming, &[]));
     }
 
     #[test]

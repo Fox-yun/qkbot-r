@@ -24,6 +24,28 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     Milky::new(config.milky, http.clone()).unwrap();
     Llm::new(config.llm, http).unwrap();
     assert_eq!(config.plugins.ai.defaults.mode, "group");
+    assert!(config.plugins.ai.defaults.reply_to_bot);
+}
+
+#[test]
+fn reply_trigger_defaults_and_conversation_overrides_are_backward_compatible() {
+    let legacy: Config = toml::from_str("[plugins.ai.defaults]\nmode = 'user'").unwrap();
+    assert!(legacy.plugins.ai.defaults.reply_to_bot);
+    let defaults = legacy.plugins.ai.defaults;
+    let disabled =
+        qkbot::plugins::ai::resolve_settings(&defaults, r#"{"reply_to_bot":false}"#).unwrap();
+    assert!(!disabled.reply_to_bot);
+    let serialized = serde_json::to_string(&disabled).unwrap();
+    assert!(
+        !qkbot::plugins::ai::resolve_settings(&defaults, &serialized)
+            .unwrap()
+            .reply_to_bot
+    );
+    assert!(
+        qkbot::plugins::ai::resolve_settings(&disabled, r#"{"reply_to_bot":true}"#)
+            .unwrap()
+            .reply_to_bot
+    );
 }
 
 #[test]

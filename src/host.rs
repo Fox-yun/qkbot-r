@@ -438,17 +438,6 @@ impl Router {
         } else {
             None
         };
-        let trigger = ai::chat::triggered(&msg, &host.config.plugins.ai.keywords);
-        let learn = conv
-            .as_ref()
-            .is_some_and(|c| c.settings.memory_write && (!c.settings.paused || c.settings.once))
-            && command.is_none()
-            && (trigger || host.config.plugins.ai.learn_all_group_messages)
-            && !msg.is_self();
-        let keep = conv.is_some()
-            && !msg.is_self()
-            && command.is_none()
-            && (trigger || host.config.plugins.ai.read_group_background);
         let incoming = msg.clone();
         let context = conv.clone();
         let command_plugin = owner.clone();
@@ -456,9 +445,12 @@ impl Router {
             let tx=c.transaction()?;
             if crate::access::check_revision(&tx,&incoming.key.scope.key(),access_revision).is_err() { return Ok(None); }
             let (id,epoch)=context.as_ref().map(|v|(v.guard.conversation_id.clone(),v.guard.epoch)).unwrap_or((String::new(),0));
-            let role=if incoming.is_self(){"self_unknown"}else if keep||learn{"user"}else{"control"};
-            let text=if keep||learn{incoming.text.as_str()}else{""};
-            let origin=if command.is_some(){Some("control")}else if learn&&!keep {Some("memory_only")}else{None};
+            // Reserve identity and reception order before any quote lookup. AI
+            // preprocessing fills content/retention from one final decision.
+            let role=if incoming.is_self(){"self_unknown"}else{"control"};
+            let text="";
+            let learn=false;
+            let origin=if command.is_some()||context.is_some(){Some("control")}else{None};
             let nickname=crate::types::sanitize_display_name(incoming.sender_nickname.as_deref());
             let card=crate::types::sanitize_display_name(incoming.sender_card.as_deref());
             if let Some(plugin)=&command_plugin {crate::catalog::check_revision(&tx,&incoming.key.scope.key(),plugin,plugin_revision)?;}
@@ -612,39 +604,9 @@ impl Router {
         let Some(conv) = conv else {
             return Ok(());
         };
-        if !trigger || (conv.settings.paused && !conv.settings.once) {
-            return Ok(());
-        }
-        match self.chat.enqueue(&msg, position, &conv) {
-            Ok(()) => {
-                if conv.settings.once {
-                    let g = conv.guard.clone();
-                    host.store.call(move|c|{
-                        c.execute("UPDATE ai_conversations SET settings=json_set(settings,'$.once',json('false')) WHERE id=?1 AND epoch=?2",params![g.conversation_id,g.epoch])?;Ok(())
-                    }).await?;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error,"chat rejected at queue boundary");
-                // Feedback itself has the bounded control and send limits.
-                if let Ok(permit) = self.controls.clone().try_acquire_owned() {
-                    let host = host.clone();
-                    self.tasks.spawn(async move {
-                        let _permit = permit;
-                        let _ = host
-                            .send(
-                                &msg.key.scope,
-                                "host",
-                                None,
-                                position,
-                                "当前聊天队列已满，请稍后重试。".into(),
-                            )
-                            .await;
-                    });
-                }
-            }
-        }
-        Ok(())
+        self.chat
+            .prepare(msg, position, conv, access_revision)
+            .await
     }
 
     pub async fn maintenance(&self) -> Result<()> {

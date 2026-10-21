@@ -28,6 +28,7 @@ const TOKEN: &str = "bridge-test-only-credential-32-characters";
 #[derive(Default)]
 struct Peer {
     writes: AtomicUsize,
+    models: AtomicUsize,
     uncertain: AtomicBool,
 }
 async fn milky(
@@ -36,6 +37,10 @@ async fn milky(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let data = match api.as_str() {
+        "model" => {
+            peer.models.fetch_add(1, Ordering::SeqCst);
+            return Json(json!({"error":"unexpected model request"}));
+        }
         "get_login_info" => json!({"uin":123,"nickname":"fixture"}),
         "get_impl_info" => {
             json!({"impl_name":"test","impl_version":"1","qq_protocol_version":"1","qq_protocol_type":"windows","milky_version":"1.0"})
@@ -105,6 +110,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_ai(false).await
+    }
+    async fn with_ai(enable_ai: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let peer = Arc::new(Peer::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -124,7 +132,9 @@ impl Fixture {
         let address = listener.local_addr().unwrap().to_string();
         let base = format!("http://{address}");
         let mut config = Config::default();
-        config.plugins.ai.enabled = false;
+        config.plugins.ai.enabled = enable_ai;
+        config.llm.chat_completions_url = format!("{peer_url}/api/model");
+        config.llm.model = "mock".into();
         config.plugins.native.enabled.clear();
         config.app.database = directory
             .path()
@@ -168,7 +178,10 @@ impl Fixture {
         }
     }
     async fn event(&mut self, seq: i64, text: &str) -> Value {
-        self.router.dispatch(incoming(seq, text)).await.unwrap();
+        self.event_message(incoming(seq, text)).await
+    }
+    async fn event_message(&mut self, message: Incoming) -> Value {
+        self.router.dispatch(message).await.unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(3), self.socket.next())
             .await
             .unwrap()
@@ -412,7 +425,7 @@ async fn native_media_requires_send_binding_and_dies_on_plugin_revision_change()
 }
 #[tokio::test]
 async fn bearer_only_and_short_lease_ownership() {
-    let mut f = Fixture::new().await;
+    let mut f = Fixture::with_ai(true).await;
     assert_eq!(
         f.client
             .get(format!("{}/qkbot/catalog?access_token={TOKEN}", f.base))
@@ -436,8 +449,23 @@ async fn bearer_only_and_short_lease_ownership() {
             .status()
             .is_success()
     );
-    let follow = f.event(2, "ordinary answer").await;
+    let sent = f.send(&event, "quoted-prompt", 456).await;
+    let mut response = incoming(2, "ordinary answer");
+    response.quote_seq = Some(sent["data"]["message_seq"].as_i64().unwrap());
+    let follow = f.event_message(response).await;
     assert_eq!(follow["qkbot"]["plugin_id"], "nb_echo");
+    assert_eq!(f.peer.models.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.host
+            .store
+            .call(|db| Ok(
+                db.query_row("SELECT COUNT(*) FROM ai_conversations", [], |r| r
+                    .get::<_, i64>(0))?
+            ))
+            .await
+            .unwrap(),
+        0
+    );
     lease = follow["qkbot"].clone();
     lease["seconds"] = json!(0);
     assert!(

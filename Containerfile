@@ -10,13 +10,16 @@ COPY sidecar/nonebot/catalog.json ./sidecar/nonebot/catalog.json
 # A single compiler job also works on small deployment hosts.
 ARG BUILD_JOBS=1
 ARG CARGO_MIRROR=""
+# Source archives can have old mtimes; rebuild our crate while caching dependencies.
 RUN --mount=type=cache,id=qkbot-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=qkbot-cargo-target,target=/build/target \
+    set -- cargo; \
     if [ -n "${CARGO_MIRROR}" ]; then \
-      cargo --config 'source.crates-io.replace-with="build-mirror"' \
-        --config "source.build-mirror.registry=\"${CARGO_MIRROR}\"" \
-        build --release --locked --jobs "${BUILD_JOBS}"; \
-    else cargo build --release --locked --jobs "${BUILD_JOBS}"; fi \
+      set -- "$@" --config 'source.crates-io.replace-with="build-mirror"' \
+        --config "source.build-mirror.registry=\"${CARGO_MIRROR}\""; \
+    fi \
+    && "$@" clean --release --package qkbot --locked \
+    && "$@" build --release --locked --jobs "${BUILD_JOBS}" \
     && install -D target/release/qkbot /out/qkbot
 
 FROM ${RUNTIME_IMAGE} AS runtime

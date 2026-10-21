@@ -362,6 +362,20 @@ test("QQ offline status keeps disable-only contacts and a later account switch c
   assert.equal(h.ids.get("contacts-list").children.length, 0);
 });
 
+test("reply trigger switch roundtrips independently in global and conversation settings", async () => {
+  const h = harness(); await h.login();
+  const global = h.app.inputs.get("plugins.ai.defaults.reply_to_bot").control;
+  assert.equal(global.checked, true);
+  global.checked = false; await global.emit("change");
+  assert.equal(h.app.readForm().plugins.ai.defaults.reply_to_bot, false);
+  h.app.state.memory.detail = h.conversation(); h.app.renderSettings();
+  const local = h.app.settingInputs.get("reply_to_bot").input;
+  assert.equal(local.checked, true, "unsaved global changes do not overwrite conversation settings");
+  local.checked = false; await local.emit("change");
+  assert.equal(h.app.readSettings().reply_to_bot, false);
+  assert.equal(h.app.readSettings().memory_write, true);
+});
+
 test("default and conversation personas select merged templates with custom precedence", async () => {
   const h = harness(); await h.login();
   const defaults = h.app.inputs.get("plugins.ai.defaults.persona").control;

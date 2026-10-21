@@ -28,6 +28,8 @@ struct MockServer {
     models: mpsc::Receiver<ModelRequest>,
     sends: mpsc::Receiver<Value>,
     quotes: mpsc::Receiver<Value>,
+    quote_requests: mpsc::Receiver<ModelRequest>,
+    control_quotes: Arc<AtomicBool>,
     drop_send_ack: Arc<AtomicBool>,
     login_id: Arc<AtomicI64>,
     cancel: CancellationToken,
@@ -47,6 +49,9 @@ impl MockServer {
         let (model_tx, models) = mpsc::channel(32);
         let (send_tx, sends) = mpsc::channel(32);
         let (quote_tx, quotes) = mpsc::channel(32);
+        let (quote_request_tx, quote_requests) = mpsc::channel(32);
+        let control_quotes = Arc::new(AtomicBool::new(false));
+        let controlled = control_quotes.clone();
         let drop_send_ack = Arc::new(AtomicBool::new(false));
         let lose_ack = drop_send_ack.clone();
         let login_id = Arc::new(AtomicI64::new(123));
@@ -67,6 +72,8 @@ impl MockServer {
                 let model_tx = model_tx.clone();
                 let send_tx = send_tx.clone();
                 let quote_tx = quote_tx.clone();
+                let quote_request_tx = quote_request_tx.clone();
+                let controlled = controlled.clone();
                 let lose_ack = lose_ack.clone();
                 let sequence = sequence.clone();
                 let account = account.clone();
@@ -96,11 +103,18 @@ impl MockServer {
                             }
                             "/api/get_message" => {
                                 if quote_tx.send(body.clone()).await.is_err() { return; }
+                                if controlled.load(Ordering::Relaxed) {
+                                    let (reply, receive) = oneshot::channel();
+                                    if quote_request_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
+                                    let Ok(response) = receive.await else { return; };
+                                    response
+                                } else {
                                 let marker = format!("quoted-{}-{}-{}",body["message_scene"].as_str().unwrap(),body["peer_id"],body["message_seq"]);
                                 json!({"status":"ok","retcode":0,"data":{"message":{
                                     "message_scene":body["message_scene"],"peer_id":body["peer_id"],"message_seq":body["message_seq"],
                                     "sender_id":789,"time":now(),"group_member":{"user_id":789,"group_id":body["peer_id"],"nickname":"引用昵称","card":"引用名片"},"segments":[{"type":"text","data":{"text":marker}}]
                                 }}})
+                                }
                             }
                             "/v1/chat/completions" => {
                                 let (reply, receive) = oneshot::channel();
@@ -126,6 +140,8 @@ impl MockServer {
             models,
             sends,
             quotes,
+            quote_requests,
+            control_quotes,
             drop_send_ack,
             login_id,
             cancel,
@@ -149,6 +165,21 @@ impl MockServer {
 
 fn answer(text: &str) -> Value {
     json!({"model":"mock", "choices":[{"finish_reason":"stop","message":{"role":"assistant","content":text}}],"usage":{"prompt_tokens":20,"completion_tokens":5}})
+}
+
+fn quoted(body: &Value, sender: i64, text: &str) -> Value {
+    json!({"status":"ok","retcode":0,"data":{"message":{
+        "message_scene":body["message_scene"],"peer_id":body["peer_id"],
+        "message_seq":body["message_seq"],"sender_id":sender,"time":now(),
+        "segments":[{"type":"text","data":{"text":text}}]
+    }}})
+}
+
+fn reply_message(seq: i64, quote: i64, text: &str) -> Incoming {
+    let mut incoming = message(seq, text);
+    incoming.mentions.clear();
+    incoming.quote_seq = Some(quote);
+    incoming
 }
 
 fn message(seq: i64, text: &str) -> Incoming {
@@ -235,9 +266,10 @@ async fn nicknames_follow_current_history_and_quoted_messages_without_changing_e
         payload.contains("新名片"),
         "current message must use its new name"
     );
+    assert!(payload.contains("引用消息"));
     assert!(
-        payload.contains("引用名片"),
-        "quoted messages use the queried member metadata"
+        payload.contains("旧名片"),
+        "local quotes retain the original name snapshot"
     );
     request.reply.send(answer("已收到新名片")).unwrap();
     mock.sent().await;
@@ -259,7 +291,6 @@ async fn nicknames_follow_current_history_and_quoted_messages_without_changing_e
             "旧名片".into()
         )
     );
-    assert_eq!(within(mock.quotes.recv()).await.unwrap()["message_seq"], 1);
     assert!(mock.quotes.try_recv().is_err());
     within(router.shutdown()).await.unwrap();
     assert!(mock.models.try_recv().is_err());
@@ -899,6 +930,516 @@ async fn submitted_send_with_lost_ack_is_unknown_and_not_replayed() {
     within(router.shutdown()).await.unwrap();
     assert!(mock.sends.try_recv().is_err());
     drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_uses_local_plugin_messages_and_preserves_original_evidence() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.read_group_background = false;
+    })
+    .await;
+    host.send(
+        &message(1, "").key.scope,
+        "clock",
+        None,
+        0,
+        "时钟插件原文".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.sent().await, "时钟插件原文");
+    let incoming = reply_message(1, 100000, "为什么？");
+    router.dispatch(incoming.clone()).await.unwrap();
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(payload.contains("为什么？") && payload.contains("时钟插件原文"));
+    assert!(payload.contains("来源插件：clock"));
+    let stored: (String, String, bool) = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT content,role,learnable FROM messages WHERE key='123:group:456:1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, ("为什么？".into(), "user".into(), true));
+    request.reply.send(answer("解释")).unwrap();
+    assert_eq!(mock.sent().await, "解释");
+
+    // Native commands retain ownership even when quoting the bot.
+    router
+        .dispatch(reply_message(2, 100000, "/clock"))
+        .await
+        .unwrap();
+    mock.sent().await;
+    assert!(mock.models.try_recv().is_err());
+
+    // A local human message, including a dropped background message, is final
+    // evidence of a different sender; a remote preview cannot override it.
+    router
+        .dispatch(reply_message(3, 1, "回复其他人"))
+        .await
+        .unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+
+    let mut overlapping = reply_message(4, 100000, "小鱼为什么？");
+    overlapping.mentions.push(123);
+    router.dispatch(overlapping.clone()).await.unwrap();
+    router.dispatch(overlapping).await.unwrap();
+    mock.model().await.reply.send(answer("只回复一次")).unwrap();
+    mock.sent().await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err() && mock.quotes.try_recv().is_err());
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_remote_lookup_deduplicates_orders_and_reuses_the_snapshot() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.read_group_background = false;
+    })
+    .await;
+    let first = reply_message(1, 77, "先来的引用问题");
+    within(router.dispatch(first.clone())).await.unwrap();
+    let lookup = within(mock.quote_requests.recv()).await.unwrap();
+    router.dispatch(first).await.unwrap();
+    router.dispatch(message(2, "后来的直接提及")).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+
+    let mut independent = message(3, "另一个群不等待");
+    independent.key.scope.peer_id = 654;
+    router.dispatch(independent).await.unwrap();
+    let other = mock.model().await;
+    assert!(
+        other.body["messages"]
+            .to_string()
+            .contains("另一个群不等待")
+    );
+    other.reply.send(answer("其他群回复")).unwrap();
+    mock.sent().await;
+    lookup
+        .reply
+        .send(quoted(&lookup.body, 123, "本地缺失的机器人原文"))
+        .unwrap();
+    let first = mock.model().await;
+    let payload = first.body["messages"].to_string();
+    assert!(payload.contains("先来的引用问题") && payload.contains("本地缺失的机器人原文"));
+    assert!(!payload.contains("后来的直接提及"));
+    first.reply.send(answer("先回复")).unwrap();
+    mock.sent().await;
+    let second = mock.model().await;
+    assert!(
+        second.body["messages"]
+            .to_string()
+            .contains("后来的直接提及")
+    );
+    second.reply.send(answer("后回复")).unwrap();
+    mock.sent().await;
+    assert!(
+        mock.quote_requests.try_recv().is_err(),
+        "the model reuses the lookup snapshot"
+    );
+    let saved: String = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT content FROM messages WHERE key='123:group:456:1'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved, "先来的引用问题");
+    within(router.shutdown()).await.unwrap();
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_rejects_other_senders_wrong_keys_and_untrusted_reply_previews() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.paused = true;
+        config.plugins.ai.defaults.once = true;
+    })
+    .await;
+    for (seq, sender, wrong_key) in [(1, 789, false), (2, 123, true)] {
+        let mut incoming = reply_message(seq, 77, "伪造引用预览");
+        incoming.raw_message =
+            json!({"segments":[{"type":"reply","data":{"message_seq":77,"sender_id":123}}]});
+        router.dispatch(incoming).await.unwrap();
+        let lookup = within(mock.quote_requests.recv()).await.unwrap();
+        let mut response = quoted(&lookup.body, sender, "不可信目标");
+        if wrong_key {
+            response["data"]["message"]["peer_id"] = json!(654);
+        }
+        lookup.reply.send(response).unwrap();
+        // A following direct trigger is an ordering barrier; it must still be
+        // able to consume the one-shot permission the failed quote did not use.
+        router
+            .dispatch(message(seq + 10, "真正的提及"))
+            .await
+            .unwrap();
+        let request = mock.model().await;
+        let current = request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(current.contains("真正的提及"));
+        request.reply.send(answer("一次放行")).unwrap();
+        mock.sent().await;
+        web_change(
+            &host,
+            &router,
+            qkbot::admin::memory::Action::Settings {
+                settings: host.config.plugins.ai.defaults.clone(),
+            },
+        )
+        .await;
+    }
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_timeouts_are_bounded_and_do_not_suppress_mentions() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, _host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.read_group_background = false;
+    })
+    .await;
+    router
+        .dispatch(reply_message(1, 77, "仅引用超时"))
+        .await
+        .unwrap();
+    let stalled = within(mock.quote_requests.recv()).await.unwrap();
+    router
+        .dispatch(message(2, "超时之后仍能提及"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    assert!(
+        request.body["messages"]
+            .to_string()
+            .contains("超时之后仍能提及")
+    );
+    assert!(!request.body["messages"].to_string().contains("仅引用超时"));
+    request.reply.send(answer("提及回复")).unwrap();
+    mock.sent().await;
+    drop(stalled);
+
+    let mut direct = reply_message(3, 88, "带引用的提及超时");
+    direct.mentions.push(123);
+    router.dispatch(direct).await.unwrap();
+    let stalled = within(mock.quote_requests.recv()).await.unwrap();
+    let request = mock.model().await;
+    assert!(request.body["messages"].to_string().contains("引用不可用"));
+    request.reply.send(answer("仍然回复")).unwrap();
+    mock.sent().await;
+    drop(stalled);
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_stale_lookups_cannot_consume_a_new_generations_once_permission() {
+    use qkbot::admin::memory::Action;
+    for change in ["reset", "settings", "scope", "account", "forget"] {
+        let mut mock = MockServer::start().await;
+        mock.control_quotes.store(true, Ordering::Relaxed);
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.defaults.paused = true;
+            config.plugins.ai.defaults.once = true;
+            config.plugins.ai.read_group_background = false;
+        })
+        .await;
+        router
+            .dispatch(reply_message(1, 77, "过期的引用提问"))
+            .await
+            .unwrap();
+        let lookup = within(mock.quote_requests.recv()).await.unwrap();
+        match change {
+            "reset" => web_change(&host, &router, Action::Reset).await,
+            "settings" => {
+                web_change(
+                    &host,
+                    &router,
+                    Action::Settings {
+                        settings: qkbot::config::AiSettings {
+                            persona: "理性搭档".into(),
+                            ..host.config.plugins.ai.defaults.clone()
+                        },
+                    },
+                )
+                .await
+            }
+            "scope" => {
+                let scope = message(1, "").key.scope;
+                host.access.set_enabled(scope.clone(), false).await.unwrap();
+                router.chat.cancel_scope(&scope);
+                host.access.set_enabled(scope, true).await.unwrap();
+            }
+            "account" => {
+                mock.login_id.store(999, Ordering::Relaxed);
+                assert!(host.milky.login().await.is_err());
+                mock.login_id.store(123, Ordering::Relaxed);
+                host.milky.login().await.unwrap();
+            }
+            "forget" => {
+                host.store
+                    .call(|db| {
+                        db.execute(
+                            "INSERT INTO ai_revoked_sources VALUES('123:group:456:77',1)",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let _ = lookup
+            .reply
+            .send(quoted(&lookup.body, 123, "过期机器人内容"));
+        router.dispatch(message(2, "新的有效提及")).await.unwrap();
+        let request = mock.model().await;
+        let payload = request.body["messages"].to_string();
+        assert!(payload.contains("新的有效提及"), "{change}");
+        assert!(
+            !payload.contains("过期的引用提问") && !payload.contains("过期机器人内容"),
+            "{change}"
+        );
+        request.reply.send(answer("新版本的一次回复")).unwrap();
+        mock.sent().await;
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err(), "{change}");
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn reply_trigger_switch_can_disable_quotes_without_disabling_mentions_or_private_chat() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.reply_to_bot = false;
+        config.plugins.ai.read_group_background = false;
+    })
+    .await;
+    host.send(
+        &message(1, "").key.scope,
+        "host",
+        None,
+        0,
+        "机器人消息".into(),
+    )
+    .await
+    .unwrap();
+    mock.sent().await;
+    router
+        .dispatch(reply_message(1, 100000, "默认关闭引用"))
+        .await
+        .unwrap();
+    assert!(mock.models.try_recv().is_err() && mock.quotes.try_recv().is_err());
+    let mut own = reply_message(2, 100000, "机器人自己回复");
+    own.sender_id = 123;
+    own.mentions.push(123);
+    router.dispatch(own).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    for mut incoming in [message(3, "原有提及"), reply_message(4, 0, "原有私聊")] {
+        if incoming.key.message_seq == 4 {
+            incoming.key.scope.scene = Scene::Friend;
+            incoming.key.scope.peer_id = 789;
+            incoming.quote_seq = None;
+        }
+        router.dispatch(incoming).await.unwrap();
+        mock.model()
+            .await
+            .reply
+            .send(answer("原有触发回复"))
+            .unwrap();
+        mock.sent().await;
+    }
+    web_change(
+        &host,
+        &router,
+        qkbot::admin::memory::Action::Settings {
+            settings: qkbot::config::AiSettings {
+                reply_to_bot: true,
+                ..host.config.plugins.ai.defaults.clone()
+            },
+        },
+    )
+    .await;
+    router
+        .dispatch(reply_message(5, 100000, "本会话单独开启"))
+        .await
+        .unwrap();
+    mock.model().await.reply.send(answer("引用已开启")).unwrap();
+    mock.sent().await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.quotes.try_recv().is_err());
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_lookup_concurrency_and_waiting_queue_are_bounded() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.limits.queued_per_conversation = 1;
+        config.limits.queued_global = 4;
+        config.plugins.ai.read_group_background = false;
+    })
+    .await;
+    let mut held = vec![];
+    for peer in [456, 654] {
+        let mut incoming = reply_message(1, 77, "等待查询");
+        incoming.key.scope.peer_id = peer;
+        router.dispatch(incoming).await.unwrap();
+        held.push(within(mock.quote_requests.recv()).await.unwrap());
+    }
+    let mut excess = reply_message(1, 77, "补查并发已满");
+    excess.key.scope.peer_id = 655;
+    router.dispatch(excess).await.unwrap();
+    router
+        .dispatch(message(2, "排队等待前面的引用"))
+        .await
+        .unwrap();
+    router
+        .dispatch(message(3, "超出单会话预处理容量"))
+        .await
+        .unwrap();
+    assert!(mock.sent().await.contains("队列已满"));
+    let mut barrier = message(2, "其他群仍可正常处理");
+    barrier.key.scope.peer_id = 655;
+    router.dispatch(barrier).await.unwrap();
+    let request = mock.model().await;
+    assert!(
+        request.body["messages"]
+            .to_string()
+            .contains("其他群仍可正常处理")
+    );
+    request.reply.send(answer("正常回复")).unwrap();
+    mock.sent().await;
+    assert!(mock.quote_requests.try_recv().is_err());
+    for lookup in held {
+        lookup
+            .reply
+            .send(quoted(&lookup.body, 789, "其他成员"))
+            .unwrap();
+    }
+    let request = mock.model().await;
+    assert!(
+        request.body["messages"]
+            .to_string()
+            .contains("排队等待前面的引用")
+    );
+    assert!(
+        !request.body["messages"]
+            .to_string()
+            .contains("超出单会话预处理容量")
+    );
+    request.reply.send(answer("排队消息回复")).unwrap();
+    mock.sent().await;
+    let calls: i64 = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT COALESCE(sum(requests),0) FROM usage_daily",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(calls, 2);
+    within(router.shutdown()).await.unwrap();
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn reply_trigger_keeps_current_user_context_and_rechecks_queued_quote_revocation() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.mode = "user".into();
+    })
+    .await;
+    router
+        .dispatch(message(1, "用户甲的独立历史"))
+        .await
+        .unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(answer("可以公开引用的一条回复"))
+        .unwrap();
+    mock.sent().await;
+    let mut second_user = reply_message(2, 100000, "用户乙的追问");
+    second_user.sender_id = 888;
+    router.dispatch(second_user).await.unwrap();
+    let request = mock.model().await;
+    let payload = request.body["messages"].to_string();
+    assert!(payload.contains("用户乙的追问") && payload.contains("可以公开引用的一条回复"));
+    assert!(!payload.contains("用户甲的独立历史"));
+    request.reply.send(answer("乙的回答")).unwrap();
+    mock.sent().await;
+
+    // A reset permits an explicit quote of the one old reply, without reviving
+    // the old question or any other member's context.
+    web_change(&host, &router, qkbot::admin::memory::Action::Reset).await;
+    router
+        .dispatch(reply_message(3, 100000, "重置后显式引用"))
+        .await
+        .unwrap();
+    let blocker = mock.model().await;
+    let payload = blocker.body["messages"].to_string();
+    assert!(payload.contains("可以公开引用的一条回复"));
+    assert!(!payload.contains("用户甲的独立历史") && !payload.contains("乙的回答"));
+    let mut queued = reply_message(4, 100000, "遗忘前已缓存的引用");
+    queued.sender_id = 888;
+    router.dispatch(queued).await.unwrap();
+    host.store
+        .call(|db| {
+            db.execute(
+                "INSERT INTO ai_revoked_sources VALUES('123:group:456:100000',1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut barrier = message(5, "遗忘后的普通提及");
+    barrier.sender_id = 888;
+    router.dispatch(barrier).await.unwrap();
+    blocker.reply.send(answer("在途回答")).unwrap();
+    mock.sent().await;
+    let request = mock.model().await;
+    let current = request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(current.contains("遗忘后的普通提及"));
+    assert!(
+        !request.body["messages"]
+            .to_string()
+            .contains("可以公开引用的一条回复")
+    );
+    request.reply.send(answer("普通回复")).unwrap();
+    mock.sent().await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
     mock.stop().await;
 }
 

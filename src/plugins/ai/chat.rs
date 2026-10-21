@@ -4,6 +4,7 @@ use super::{
         BatchUpdate, ContextInput, SummaryRepair, build_context, parse_batch_update,
         validate_summary,
     },
+    trigger::{Decision, Ingress, Reason},
 };
 use crate::{
     host::Host,
@@ -29,6 +30,7 @@ struct Job {
     actor: i64,
     received_at: i64,
     quote_seq: Option<i64>,
+    trigger: Option<Decision>,
     position: i64,
     guard: ContextGuard,
     _queued: OwnedSemaphorePermit,
@@ -127,7 +129,8 @@ enum MaintenanceOutcome {
 }
 
 pub struct Chat {
-    host: Arc<Host>,
+    pub(super) host: Arc<Host>,
+    ingress: Arc<Ingress>,
     sessions: Mutex<HashMap<String, Session>>,
     background: Mutex<Option<Arc<BackgroundJob>>>,
     maintenance: Mutex<MaintenanceSchedule>,
@@ -138,6 +141,7 @@ pub struct Chat {
 impl Chat {
     pub fn new(host: Arc<Host>) -> Arc<Self> {
         Arc::new(Self {
+            ingress: Arc::new(Ingress::new(&host.config.limits)),
             queued: Arc::new(Semaphore::new(host.config.limits.queued_global)),
             turns: Arc::new(Semaphore::new(
                 host.config.llm.max_concurrent_requests.max(1),
@@ -154,6 +158,28 @@ impl Chat {
         msg: &Incoming,
         position: i64,
         conversation: &Conversation,
+    ) -> Result<()> {
+        self.enqueue_resolved(msg, position, conversation, None)
+    }
+
+    pub(crate) async fn prepare(
+        self: &Arc<Self>,
+        message: Incoming,
+        position: i64,
+        conversation: Conversation,
+        access_revision: i64,
+    ) -> Result<()> {
+        self.ingress
+            .submit(self, message, position, conversation, access_revision)
+            .await
+    }
+
+    pub(super) fn enqueue_resolved(
+        self: &Arc<Self>,
+        msg: &Incoming,
+        position: i64,
+        conversation: &Conversation,
+        trigger: Option<Decision>,
     ) -> Result<()> {
         let permit = self
             .queued
@@ -193,6 +219,7 @@ impl Chat {
             actor: msg.sender_id,
             received_at: msg.received_at,
             quote_seq: msg.quote_seq,
+            trigger,
             position,
             guard: conversation.guard.clone(),
             _queued: permit,
@@ -208,6 +235,9 @@ impl Chat {
         Ok(())
     }
     pub fn cancel(&self, guard: &ContextGuard) {
+        self.ingress.cancel(|active| {
+            active.conversation_id == guard.conversation_id && active.epoch == guard.epoch
+        });
         if let Some(state) = self
             .sessions
             .lock()
@@ -222,6 +252,8 @@ impl Chat {
     }
     pub fn cancel_scope(&self, scope: &Scope) {
         let prefix = format!("{}:", scope.key());
+        self.ingress
+            .cancel(|guard| guard.conversation_id.starts_with(&prefix));
         for (key, state) in self.sessions.lock().unwrap().iter_mut() {
             if key.starts_with(&prefix) {
                 state.queue.clear();
@@ -234,6 +266,8 @@ impl Chat {
     }
     /// A late web receipt must never cancel work accepted under its new generation.
     pub fn cancel_before(&self, conversation_id: &str, epoch: i64) {
+        self.ingress
+            .cancel(|guard| guard.conversation_id == conversation_id && guard.epoch < epoch);
         if let Some(state) = self.sessions.lock().unwrap().get_mut(conversation_id) {
             state.cancel_before(epoch);
         }
@@ -270,6 +304,7 @@ impl Chat {
     }
     pub async fn shutdown(&self) {
         self.host.cancel.cancel();
+        self.ingress.shutdown().await;
         self.cancel_background(|_| true);
         for state in self.sessions.lock().unwrap().values_mut() {
             state.queue.clear();
@@ -319,6 +354,7 @@ impl Chat {
                 actor,
                 received_at,
                 quote_seq,
+                trigger,
                 position,
                 guard,
                 _queued,
@@ -329,6 +365,7 @@ impl Chat {
                 actor,
                 received_at,
                 quote_seq,
+                trigger,
                 position,
                 guard,
             };
@@ -342,6 +379,9 @@ impl Chat {
             };
             if !self.host.valid(&run.guard).await.unwrap_or(false)
                 || self.host.cancel.is_cancelled()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<RevokedTrigger>())
             {
                 continue;
             }
@@ -370,22 +410,29 @@ impl Chat {
     async fn turn(&self, job: &Turn, cancel: &CancellationToken) -> Result<Reply> {
         let host = &self.host;
         let llm = host.llm.as_ref().context("AI disabled")?;
-        let (settings, summary, mut current, history) = load_context(host, job).await?;
-        if let Some(seq) = job.quote_seq {
-            let quote_key = MessageKey {
-                scope: job.key.scope.clone(),
-                message_seq: seq,
-            };
-            let quoted = if host.memory.is_revoked(&quote_key.key()).await? {
-                "[引用已遗忘]".into()
-            } else {
-                match host.milky.get_message(&quote_key).await {
-                    Ok(quote) => quote_content(&quote),
-                    Err(_) => "[引用不可用]".into(),
-                }
-            };
-            current.push_str(&format!("\n{quoted}"));
-        }
+        let (settings, summary, current, history) = load_context(host, job).await?;
+        let quote = if let Some(quote) = job
+            .trigger
+            .as_ref()
+            .and_then(|decision| decision.quote.clone())
+        {
+            Some(quote)
+        } else if let Some(seq) = job.quote_seq {
+            Some(
+                self.ingress
+                    .quote(
+                        host,
+                        MessageKey {
+                            scope: job.key.scope.clone(),
+                            message_seq: seq,
+                        },
+                        cancel,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         let memories = if settings.memory_read {
             host.memory
                 .retrieve(
@@ -446,6 +493,19 @@ impl Chat {
                 !cancel.is_cancelled() && host.valid(&job.guard).await?,
                 "任务已取消"
             );
+            let mut current = current.clone();
+            if let Some(quote) = &quote {
+                let content = quote.content(host).await?;
+                if job
+                    .trigger
+                    .as_ref()
+                    .is_some_and(|decision| decision.reason == Some(Reason::ReplyToBot))
+                    && content == "[引用已遗忘]"
+                {
+                    return Err(RevokedTrigger.into());
+                }
+                current.push_str(&format!("\n{content}"));
+            }
             let tools = if round < host.config.limits.max_tool_calls && round + 1 < effective_rounds
             {
                 definitions.clone()
@@ -1025,6 +1085,7 @@ struct Turn {
     actor: i64,
     received_at: i64,
     quote_seq: Option<i64>,
+    trigger: Option<Decision>,
     position: i64,
     guard: ContextGuard,
 }
@@ -1033,20 +1094,14 @@ struct Reply {
     text: String,
 }
 
-fn quote_content(quote: &Incoming) -> String {
-    let source = if quote.is_self() {
-        "本账号（仅凭引用无法确认来源插件）"
-    } else {
-        "原始发言者"
-    };
-    let content = message_content(
-        quote.sender_id,
-        quote.sender_nickname.as_deref(),
-        quote.sender_card.as_deref(),
-        &quote.text.chars().take(1000).collect::<String>(),
-    );
-    format!("[引用消息；{source}] {content}")
+#[derive(Debug)]
+struct RevokedTrigger;
+impl std::fmt::Display for RevokedTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("引用触发来源已遗忘")
+    }
 }
+impl std::error::Error for RevokedTrigger {}
 
 async fn load_context(
     host: &Host,
@@ -1076,12 +1131,7 @@ async fn load_context(
 }
 
 pub fn triggered(msg: &Incoming, keywords: &[String]) -> bool {
-    !msg.is_self()
-        && (msg.key.scope.scene == Scene::Friend
-            || msg.mentions.contains(&msg.key.scope.bot_id)
-            || keywords
-                .iter()
-                .any(|k| !k.is_empty() && msg.text.contains(k)))
+    super::trigger::direct_reason(msg, keywords).is_some()
 }
 
 #[cfg(test)]
@@ -1138,6 +1188,7 @@ mod tests {
             actor: 3,
             received_at: 1,
             quote_seq: None,
+            trigger: None,
             position: 2,
             guard: conv.guard,
         };
@@ -1154,7 +1205,10 @@ mod tests {
         quote.sender_nickname = Some("公开昵称".into());
         quote.sender_card = Some("同名\"},\"sender_id\":\"3".into());
         quote.text = "前一人的原文".into();
-        let quoted = quote_content(&quote);
+        let quoted = super::super::trigger::Quote::from_message(&quote)
+            .content(&host)
+            .await
+            .unwrap();
         let quoted: Value = serde_json::from_str(quoted.split_once("] ").unwrap().1).unwrap();
         assert_eq!(quoted["sender_id"], "4");
         assert_eq!(
@@ -1163,7 +1217,13 @@ mod tests {
         );
         assert_eq!(quoted["text"], past["text"]);
         quote.sender_id = quote.key.scope.bot_id;
-        assert!(quote_content(&quote).contains("仅凭引用无法确认来源插件"));
+        assert!(
+            super::super::trigger::Quote::from_message(&quote)
+                .content(&host)
+                .await
+                .unwrap()
+                .contains("仅凭引用无法确认来源插件")
+        );
         let bad_turn = Turn { actor: 4, ..turn };
         assert!(load_context(&host, &bad_turn).await.is_err());
         host.store.stop().await.unwrap();
@@ -1336,6 +1396,7 @@ mod tests {
             actor: 3,
             received_at: 1,
             quote_seq: None,
+            trigger: None,
             position: 3,
             guard,
         };
@@ -1554,6 +1615,7 @@ mod tests {
                 actor: 3,
                 received_at: 0,
                 quote_seq: None,
+                trigger: None,
                 position: guard.epoch,
                 guard,
                 _queued: permits.clone().try_acquire_owned().unwrap(),

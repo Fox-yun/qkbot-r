@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod memory;
+pub(crate) mod trigger;
 
 use crate::{
     config::AiSettings,

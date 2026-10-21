@@ -401,6 +401,7 @@ impl Default for ReminderConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
     pub mode: String,
+    pub reply_to_bot: bool,
     pub input_budget: usize,
     pub output_budget: usize,
     pub recent_messages: usize,
@@ -416,6 +417,7 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             mode: "group".into(),
+            reply_to_bot: true,
             input_budget: 6000,
             output_budget: 800,
             recent_messages: 24,

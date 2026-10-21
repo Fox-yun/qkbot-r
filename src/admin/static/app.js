@@ -76,6 +76,7 @@
       field("plugins.ai.defaults.allowed_tools", "允许模型使用的工具", "tools", "自动读取已注册工具，保存并应用后生效。不勾选即禁用全部工具；关闭插件会保留已有选择。", { full: true }),
       field("plugins.ai.defaults.summary", "生成并使用历史摘要", "check", "关闭后不生成或注入摘要，按历史条数读取原文。"),
       field("plugins.ai.defaults.memory_read", "检索长期记忆", "check", "将相关的、属于当前会话和用户的记忆加入回答。"),
+      field("plugins.ai.defaults.reply_to_bot", "回复机器人消息时触发 AI", "check", "在群内引用回复当前机器人账号的消息时，无需再次 @ 或输入关键词。插件命令仍优先处理。"),
       field("plugins.ai.defaults.memory_write", "自动提炼长期记忆", "check", "只接受带有效原文证据的事实变更。"),
       field("plugins.ai.read_group_background", "读取群内背景消息", "check", "未触发的群消息也可进入上下文，与长期记忆学习独立。"),
       field("plugins.ai.learn_all_group_messages", "学习群内背景消息", "check", "未触发的群消息也可用于长期记忆；仍受记忆写入开关约束。"),
@@ -1247,6 +1248,7 @@
     field("allowed_tools", "允许的工具", "tools", "只可勾选全局允许且所属插件已启用的工具。不勾选即禁用全部工具；修改全局工具或插件后，请先保存并应用，再配置会话。"),
     field("summary", "生成并使用摘要", "check", "关闭后不生成或注入摘要；保留原文按历史条数读取。"),
     field("memory_read", "读取长期记忆", "check", "将当前范围内相关记忆加入回复上下文。"),
+    field("reply_to_bot", "回复机器人消息时触发 AI", "check", "引用当前机器人账号的消息即可触发；插件命令仍优先处理。"),
     field("memory_write", "自动提炼记忆", "check", "与摘要开关独立，只处理有效的人类消息证据。"),
   ];
   const kindNames = { fact: "事实", preference: "偏好", task: "任务", event: "事件" };

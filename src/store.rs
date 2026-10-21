@@ -66,6 +66,9 @@ impl Store {
         store.call(|c| { c.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(plugin_id TEXT NOT NULL,version INTEGER NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(plugin_id,version));")?; Ok(()) }).await?;
         store.migrate("host", 1, HOST_SCHEMA).await?;
         store.migrate("host", 2, MESSAGE_DISPLAY_NAMES).await?;
+        store.migrate("host", 3,
+            "CREATE INDEX outbox_quote ON outbox(scope,message_seq,created_at) WHERE state='confirmed';"
+        ).await?;
         store
             .migrate(
                 "group_personas",
@@ -260,7 +263,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(count, 2);
+            assert_eq!(count, 3);
             store.stop().await.unwrap();
         }
     }
