@@ -4,18 +4,33 @@ use qkbot::{config::Config, host::Host, plugins::ai::chat::Chat, types::ContextG
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+
+#[derive(Default)]
+struct RepairBarrier {
+    entered: Notify,
+    release: Notify,
+}
 
 type Respond = dyn Fn(&Value) -> String + Send + Sync;
 #[derive(Clone)]
 struct Model {
     inputs: Arc<Mutex<Vec<Value>>>,
     respond: Arc<Respond>,
+    repair_barrier: Arc<Mutex<Option<Arc<RepairBarrier>>>>,
 }
 async fn model(State(state): State<Model>, Json(body): Json<Value>) -> Json<Value> {
     let content = body["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
     let input: Value = serde_json::from_str(content).unwrap();
+    let barrier = state.repair_barrier.lock().unwrap().clone();
+    if input.get("next_part").is_some()
+        && let Some(barrier) = barrier
+    {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+    }
     let answer = (state.respond)(&input);
     state.inputs.lock().unwrap().push(input);
     Json(
@@ -31,6 +46,7 @@ async fn setup(
     let state = Model {
         inputs: Arc::new(Mutex::new(vec![])),
         respond: Arc::new(respond),
+        repair_barrier: Arc::new(Mutex::new(None)),
     };
     let router = Router::new()
         .route("/model", post(model))
@@ -449,4 +465,295 @@ async fn oversized_old_summary_is_repaired_without_dropping_any_input_chunk() {
     chat.shutdown().await;
     host.store.stop().await.unwrap();
     server.abort();
+}
+
+const PENDING_REPAIR_OLD_SUMMARY: &str = "已有摘要：用户7喜欢白茶。";
+const PENDING_REPAIR_FINAL_SUMMARY: &str = "用户7喜欢白茶；保留已有喝茶偏好。";
+
+fn pending_repair_candidate() -> String {
+    // Within the 1,500-character ceiling but over the default 1,050-byte budget.
+    "用户7喜欢白茶。".repeat(60)
+}
+
+fn pending_repair_response(batch: &serde_json::Value, invalid_evidence: bool) -> String {
+    assert_eq!(batch["summary_enabled"], true);
+    assert_eq!(batch["memory_write"], true);
+    assert_eq!(batch["previous_summary"], PENDING_REPAIR_OLD_SUMMARY);
+    let candidate = pending_repair_candidate();
+    assert!(
+        qkbot::plugins::ai::memory::summary_cost(&candidate).unwrap()
+            > batch["summary_budget"].as_u64().unwrap() as usize
+    );
+    fenced(serde_json::json!({
+        "summary":candidate,
+        "changes":[{
+            "op":"upsert", "id":null, "subject_id":7,
+            "kind":"preference", "text":"喜欢白茶",
+            "evidence":[{
+                "source_key":batch["sources"][0]["key"],
+                "quote":if invalid_evidence { "喜欢咖啡" } else { "喜欢白茶" }
+            }], "ttl_days":null
+        }]
+    }))
+}
+
+async fn seed_pending_repair(host: &qkbot::host::Host) {
+    host.store
+        .call(|db| {
+            for position in 1..=3 {
+                seed(db, "pending-repair", 1, true, "{}", position)?;
+            }
+            db.execute(
+                "UPDATE ai_conversations SET summary=?1 WHERE id='pending-repair'",
+                [PENDING_REPAIR_OLD_SUMMARY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn assert_pending_repair_not_committed(host: &qkbot::host::Host, expected_revision: i64) {
+    host.store.call(move |db| {
+        let state: (String, i64, i64, i64) = db.query_row(
+            "SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='pending-repair'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        )?;
+        assert_eq!(state, (PENDING_REPAIR_OLD_SUMMARY.into(), 0, 0, expected_revision));
+        for table in ["ai_memories", "ai_memory_provenance", "ai_memory_search"] {
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r|r.get::<_,i64>(0))?, 0);
+        }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM messages WHERE conversation_id='pending-repair' AND revoked=0", [], |r|r.get::<_,i64>(0))?, 3);
+        Ok(())
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_new_summary_is_compressed_then_committed_with_original_valid_facts() {
+    let (host, chat, model, server) = setup(
+        |config| config.plugins.ai.defaults.recent_messages = 2,
+        |input| {
+            if input.get("sources").is_some() {
+                pending_repair_response(input, false)
+            } else {
+                assert_eq!(input["previous_summary"], "");
+                assert_eq!(input["next_part"], pending_repair_candidate());
+                assert!(input.get("changes").is_none());
+                assert!(input.get("allowed_memories").is_none());
+                fenced(serde_json::json!({"summary":PENDING_REPAIR_FINAL_SUMMARY,"changes":[]}))
+            }
+        },
+    )
+    .await;
+    seed_pending_repair(&host).await;
+    let barrier = Arc::new(RepairBarrier::default());
+    *model.repair_barrier.lock().unwrap() = Some(barrier.clone());
+    let pending_chat = chat.clone();
+    let work = tokio::spawn(async move { pending_chat.compact_idle().await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        barrier.entered.notified(),
+    )
+    .await
+    .expect("pending summary repair never reached the mock");
+    assert_pending_repair_not_committed(&host, 0).await;
+    barrier.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), work)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 2);
+    host.store.call(|db| {
+        let state: (String,i64,i64) = db.query_row(
+            "SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='pending-repair'",
+            [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        )?;
+        assert_eq!(state,(PENDING_REPAIR_FINAL_SUMMARY.into(),1,1));
+        let fact: (i64,String,String) = db.query_row(
+            "SELECT subject_id,text,evidence FROM ai_memories WHERE conversation_id='pending-repair'",
+            [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        )?;
+        assert_eq!((fact.0,fact.1.as_str()),(7,"喜欢白茶"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&fact.2)?,serde_json::json!([{"source_key":"pending-repair:1","quote":"喜欢白茶"}]));
+        for table in ["ai_memories", "ai_memory_provenance", "ai_memory_search"] {
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r|r.get::<_,i64>(0))?,1);
+        }
+        Ok(())
+    }).await.unwrap();
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn invalid_pending_summary_compression_cannot_partially_commit_facts_or_cursors() {
+    for failure in [
+        "extra_changes",
+        "still_oversized",
+        "empty_summary",
+        "invalid_json",
+    ] {
+        let (host, chat, model, server) = setup(
+            |config| config.plugins.ai.defaults.recent_messages = 2,
+            move |input| {
+                if input.get("sources").is_some() {
+                    return pending_repair_response(input, false);
+                }
+                match failure {
+                    "extra_changes" => fenced(serde_json::json!({"summary":PENDING_REPAIR_FINAL_SUMMARY,"changes":[{
+                        "op":"upsert", "id":null, "subject_id":7, "kind":"preference", "text":"压缩模型另造事实",
+                        "evidence":[{"source_key":"pending-repair:1","quote":"喜欢白茶"}], "ttl_days":null
+                    }]})),
+                    "still_oversized" => fenced(serde_json::json!({"summary":pending_repair_candidate(),"changes":[]})),
+                    "empty_summary" => fenced(serde_json::json!({"summary":"","changes":[]})),
+                    "invalid_json" => "invalid JSON".into(),
+                    _ => unreachable!(),
+                }
+            },
+        ).await;
+        seed_pending_repair(&host).await;
+        chat.compact_idle().await.unwrap();
+        assert_pending_repair_not_committed(&host, 0).await;
+        let attempts = model.inputs.lock().unwrap().len();
+        assert_eq!(
+            attempts, 2,
+            "invalid compression output must not be retried: {failure}"
+        );
+        chat.compact_idle().await.unwrap();
+        assert_eq!(model.inputs.lock().unwrap().len(), attempts);
+        chat.shutdown().await;
+        host.store.stop().await.unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn compressed_summary_never_authorizes_an_original_invalid_evidence_quote() {
+    let (host, chat, _model, server) = setup(
+        |config| config.plugins.ai.defaults.recent_messages = 2,
+        |input| {
+            if input.get("sources").is_some() {
+                pending_repair_response(input, true)
+            } else {
+                fenced(serde_json::json!({"summary":PENDING_REPAIR_FINAL_SUMMARY,"changes":[]}))
+            }
+        },
+    )
+    .await;
+    seed_pending_repair(&host).await;
+    chat.compact_idle().await.unwrap();
+    assert_pending_repair_not_committed(&host, 0).await;
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn pending_summary_compression_cancel_or_changed_revision_cannot_commit_the_original_batch() {
+    for change in ["cancel", "revision", "epoch"] {
+        let (host, chat, model, server) = setup(
+            |config| config.plugins.ai.defaults.recent_messages = 2,
+            |input| {
+                if input.get("sources").is_some() {
+                    pending_repair_response(input, false)
+                } else {
+                    fenced(json!({"summary":PENDING_REPAIR_FINAL_SUMMARY,"changes":[]}))
+                }
+            },
+        )
+        .await;
+        seed_pending_repair(&host).await;
+        let barrier = Arc::new(RepairBarrier::default());
+        *model.repair_barrier.lock().unwrap() = Some(barrier.clone());
+        let pending_chat = chat.clone();
+        let work = tokio::spawn(async move { pending_chat.compact_idle().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            barrier.entered.notified(),
+        )
+        .await
+        .expect("pending summary repair never reached the mock");
+        assert_pending_repair_not_committed(&host, 0).await;
+        match change {
+            "cancel" => chat.cancel(&ContextGuard { conversation_id:"pending-repair".into(), epoch:1 }),
+            "revision" => host.store.call(|db| {
+                db.execute("UPDATE ai_conversations SET memory_revision=memory_revision+1 WHERE id='pending-repair'", [])?;
+                Ok(())
+            }).await.unwrap(),
+            "epoch" => host.store.call(|db| {
+                db.execute("UPDATE ai_conversations SET epoch=epoch+1 WHERE id='pending-repair'", [])?;
+                Ok(())
+            }).await.unwrap(),
+            _ => unreachable!(),
+        }
+        barrier.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), work)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_pending_repair_not_committed(&host, i64::from(change == "revision")).await;
+        let epoch: i64 = host
+            .store
+            .call(|db| {
+                Ok(db.query_row(
+                    "SELECT epoch FROM ai_conversations WHERE id='pending-repair'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(epoch, if change == "epoch" { 2 } else { 1 });
+        chat.shutdown().await;
+        host.store.stop().await.unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn pending_summary_compression_enforces_candidate_size_and_two_chunk_limit() {
+    for size in [7000, 8193] {
+        let candidate = "甲".repeat(size);
+        let (host, chat, model, server) = setup(
+            |config| config.plugins.ai.defaults.recent_messages = 2,
+            move |input| {
+                if input.get("sources").is_some() {
+                    let mut response: Value = serde_json::from_str(
+                        pending_repair_response(input, false)
+                            .strip_prefix("```json\n")
+                            .unwrap()
+                            .strip_suffix("\n```")
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    response["summary"] = json!(candidate);
+                    fenced(response)
+                } else {
+                    fenced(json!({"summary":PENDING_REPAIR_FINAL_SUMMARY,"changes":[]}))
+                }
+            },
+        )
+        .await;
+        seed_pending_repair(&host).await;
+        chat.compact_idle().await.unwrap();
+        assert_pending_repair_not_committed(&host, 0).await;
+        let inputs = model.inputs.lock().unwrap().clone();
+        assert_eq!(inputs.len(), if size == 8193 { 1 } else { 3 });
+        if size == 7000 {
+            let consumed = inputs
+                .iter()
+                .skip(1)
+                .map(|input| input["next_part"].as_str().unwrap().len())
+                .sum::<usize>();
+            assert!(
+                consumed < size * 3,
+                "the remaining candidate must not be silently discarded"
+            );
+        }
+        chat.shutdown().await;
+        host.store.stop().await.unwrap();
+        server.abort();
+    }
 }
