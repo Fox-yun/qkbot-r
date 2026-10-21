@@ -2687,3 +2687,173 @@ async fn removed_management_commands_are_silent_and_never_stored_or_learned() {
     drop(host);
     mock.stop().await;
 }
+
+async fn assert_provider_blocked_response_is_not_conversation_data(response: Value) {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    let conversation = qkbot::plugins::ai::conversation(&host, &message(1, "lookup"))
+        .await
+        .unwrap();
+    const EXISTING_SUMMARY: &str = "既有摘要：此前讨论过白茶，必须保留。";
+    let conversation_id = conversation.guard.conversation_id.clone();
+    host.store
+        .call(move |db| {
+            db.execute(
+                "UPDATE ai_conversations SET summary=?1 WHERE id=?2",
+                [EXISTING_SUMMARY, &conversation_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    router
+        .dispatch(message(1, "first synthetic greeting"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    assert!(
+        request.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "clock_now")
+    );
+    request.reply.send(response).unwrap();
+    let diagnostic = mock.sent().await;
+    assert!(diagnostic.starts_with("本次请求未完成："), "{diagnostic}");
+    assert!(!diagnostic.contains("Google"));
+    assert!(!diagnostic.contains("blocked-content-must-not-be-sent"));
+    wait_for_outbox(&host, "confirmed", 1).await;
+    assert!(
+        mock.models.try_recv().is_err(),
+        "a blocked response must not start an automatic retry"
+    );
+    let (saved, tool_runs): ((String, String, String, i64, bool, String), i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row(
+                    "SELECT role,origin_plugin,conversation_id,epoch,learnable,content FROM messages WHERE key='123:group:456:100000'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )?,
+                db.query_row("SELECT COUNT(*) FROM tool_runs", [], |row| row.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        saved,
+        (
+            "system".into(),
+            "host".into(),
+            String::new(),
+            0,
+            false,
+            diagnostic.clone()
+        )
+    );
+    assert_eq!(
+        tool_runs, 0,
+        "a blocked response must execute no tool calls"
+    );
+
+    router
+        .dispatch(message(2, "请解释敏感词过滤这个术语"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    let messages = request.body["messages"].as_array().unwrap();
+    assert!(messages.iter().all(|entry| entry["role"] != "assistant"));
+    let prompt = request.body["messages"].to_string();
+    assert!(prompt.contains("first synthetic greeting"));
+    assert!(prompt.contains("请解释敏感词过滤这个术语"));
+    assert!(
+        prompt.contains(EXISTING_SUMMARY),
+        "existing summaries must not be cleared after a provider rejection"
+    );
+    assert!(!prompt.contains(&diagnostic));
+    assert!(!prompt.contains("The prompt could not be submitted"));
+    assert!(!prompt.contains("blocked-content-must-not-be-sent"));
+    const NORMAL_REPLY: &str = "敏感词过滤是一种检查文本的方式；讨论这个术语属于普通问答。";
+    request.reply.send(answer(NORMAL_REPLY)).unwrap();
+    assert_eq!(mock.sent().await, NORMAL_REPLY);
+    wait_for_outbox(&host, "confirmed", 2).await;
+
+    let conversation = qkbot::plugins::ai::conversation(&host, &message(2, "lookup"))
+        .await
+        .unwrap();
+    let through = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT inbound_position FROM messages WHERE key='123:group:456:2'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let batch = host
+        .memory
+        .prepare_batch(&conversation.guard, through, true)
+        .await
+        .unwrap();
+    assert_eq!(batch.previous_summary, EXISTING_SUMMARY);
+    assert_eq!(
+        batch.sources.len(),
+        3,
+        "only two user messages and the normal answer belong to the summary"
+    );
+    assert!(batch.sources.iter().all(|source| source.summary_eligible));
+    assert!(
+        batch
+            .sources
+            .iter()
+            .all(|source| source.key != "123:group:456:100000")
+    );
+    let assistant_sources: Vec<_> = batch
+        .sources
+        .iter()
+        .filter(|source| source.role == "assistant")
+        .collect();
+    assert_eq!(assistant_sources.len(), 1);
+    assert_eq!(assistant_sources[0].text, NORMAL_REPLY);
+    assert!(!assistant_sources[0].memory_eligible);
+
+    within(router.shutdown()).await.unwrap();
+    assert!(
+        mock.models.try_recv().is_err(),
+        "no delayed retry is allowed"
+    );
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn provider_blocked_content_filter_rejects_tool_calls_and_cannot_pollute_history_or_summary()
+{
+    assert_provider_blocked_response_is_not_conversation_data(json!({
+        "model": "mock",
+        "choices": [{
+            "finish_reason": "content_filter",
+            "message": {
+                "role": "assistant",
+                "content": "blocked-content-must-not-be-sent",
+                "tool_calls": [{
+                    "id": "blocked-clock-call",
+                    "type": "function",
+                    "function": {"name": "clock_now", "arguments": "{}"}
+                }]
+            }
+        }]
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn provider_blocked_google_error_text_cannot_pollute_history_or_summary() {
+    let error = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's [Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). Try rephrasing the prompt. If you think this was an error, [send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting).";
+    assert_provider_blocked_response_is_not_conversation_data(answer(error)).await;
+}

@@ -70,6 +70,20 @@ pub struct LlmResponse {
     pub model: String,
 }
 
+/// A provider refusal is a service result, never an assistant answer or tool call.
+/// Keep this error independent of the provider body so chat/logs cannot expose it.
+#[derive(Debug)]
+pub(crate) struct ProviderBlocked;
+
+impl std::fmt::Display for ProviderBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("上游模型拦截了本次请求，可能涉及当前消息或会话上下文，未返回可用回复。")
+    }
+}
+
+impl std::error::Error for ProviderBlocked {}
+
 #[derive(Clone)]
 pub struct Llm {
     config: LlmConfig,
@@ -526,7 +540,87 @@ fn validate_messages(messages: &[Value]) -> Result<usize> {
     Ok(images)
 }
 
+// This exact service notice has been observed inside a successful compatibility
+// response. Match the complete notice, including both official links and sentence
+// boundaries; quoting or explaining it is ordinary model text, not this fallback.
+const GOOGLE_PROMPT_BLOCKED_NOTICE: &str = concat!(
+    "The prompt could not be submitted. The prompt contains sensitive words that violate Google's ",
+    "[Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). ",
+    "Try rephrasing the prompt. If you think this was an error, ",
+    "[send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting)."
+);
+
+fn blocked_finish_reason(reason: &Value) -> bool {
+    reason.as_str().is_some_and(|reason| {
+        [
+            "content_filter",
+            "content_blocked",
+            "safety",
+            "blocklist",
+            "prohibited_content",
+            "spii",
+            "recitation",
+            "image_safety",
+            "image_prohibited_content",
+            "image_recitation",
+            "escalation",
+            "pup_limited_disabled",
+        ]
+        .iter()
+        .any(|blocked| reason.eq_ignore_ascii_case(blocked))
+    })
+}
+
+fn safety_blocked(value: &Value) -> bool {
+    ["safetyRatings", "safety_ratings"].iter().any(|field| {
+        value[*field]
+            .as_array()
+            .is_some_and(|ratings| ratings.iter().any(|rating| rating["blocked"] == true))
+    })
+}
+
+fn prompt_blocked(value: &Value) -> bool {
+    ["promptFeedback", "prompt_feedback"].iter().any(|field| {
+        let feedback = &value[*field];
+        ["blockReason", "block_reason"].iter().any(|reason| {
+            feedback[*reason].as_str().is_some_and(|reason| {
+                !reason.trim().is_empty()
+                    && !reason.eq_ignore_ascii_case("BLOCK_REASON_UNSPECIFIED")
+            })
+        }) || safety_blocked(feedback)
+    })
+}
+
+fn provider_blocked(value: &Value) -> bool {
+    if prompt_blocked(value)
+        || safety_blocked(value)
+        || blocked_finish_reason(&value["error"]["code"])
+    {
+        return true;
+    }
+    let choices = value["choices"].as_array().into_iter().flatten();
+    let candidates = value["candidates"].as_array().into_iter().flatten();
+    choices.chain(candidates).any(|choice| {
+        let message = &choice["message"];
+        blocked_finish_reason(&choice["finish_reason"])
+            || blocked_finish_reason(&choice["finishReason"])
+            || prompt_blocked(choice)
+            || safety_blocked(choice)
+            || message["refusal"]
+                .as_str()
+                .is_some_and(|refusal| !refusal.trim().is_empty())
+            || message["content"]
+                .as_str()
+                .is_some_and(|text| text.trim() == GOOGLE_PROMPT_BLOCKED_NOTICE)
+    })
+}
+
 fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmResponse> {
+    // Refuse the entire response before exposing text or even validating tool
+    // calls. A provider block must not reach the dispatcher or assistant history.
+    if provider_blocked(&value) {
+        return Err(ProviderBlocked.into());
+    }
     ensure!(
         value.get("error").is_none_or(Value::is_null),
         "model provider returned an error"
@@ -845,6 +939,129 @@ mod tests {
         );
         assert_eq!(client.requests.available_permits(), 1);
         login_server.abort();
+    }
+
+    #[test]
+    fn structured_provider_blocks_return_a_fixed_error_without_provider_details() {
+        let plain = response(json!({"role":"assistant","content":"provider body secret"}));
+        let mut cases = Vec::new();
+        for reason in [
+            "content_filter",
+            "SAFETY",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "RECITATION",
+            "IMAGE_SAFETY",
+            "PUP_LIMITED_DISABLED",
+        ] {
+            let mut blocked = plain.clone();
+            blocked["choices"][0]["finish_reason"] = json!(reason);
+            cases.push(blocked);
+        }
+        let mut refusal = plain.clone();
+        refusal["choices"][0]["message"]["refusal"] = json!("provider refusal secret");
+        cases.push(refusal);
+        let mut rating = plain.clone();
+        rating["choices"][0]["safetyRatings"] = json!([{"blocked":true}]);
+        cases.push(rating);
+        cases.extend([
+            json!({"promptFeedback":{"blockReason":"SAFETY"},"candidates":[]}),
+            json!({"promptFeedback":{"blockReason":"OTHER"},"candidates":[]}),
+            json!({"prompt_feedback":{"block_reason":"BLOCKLIST"},"choices":[]}),
+            json!({"promptFeedback":{"safetyRatings":[{"blocked":true}]}}),
+            json!({"candidates":[{"finishReason":"PROHIBITED_CONTENT"}]}),
+            json!({"error":{"code":"content_blocked","message":"provider error secret"}}),
+        ]);
+        for value in cases {
+            let error = parse_response(value, &HashSet::new()).unwrap_err();
+            assert!(error.is::<ProviderBlocked>());
+            assert_eq!(
+                error.to_string(),
+                "上游模型拦截了本次请求，可能涉及当前消息或会话上下文，未返回可用回复。"
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn known_google_gateway_notice_is_rejected_but_discussion_and_quotes_are_preserved() {
+        for text in [
+            GOOGLE_PROMPT_BLOCKED_NOTICE.to_owned(),
+            format!("\n{GOOGLE_PROMPT_BLOCKED_NOTICE}\n"),
+        ] {
+            let error = parse_response(
+                response(json!({"role":"assistant","content":text})),
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert!(error.is::<ProviderBlocked>());
+        }
+        for text in [
+            "我不能帮助实施伤害，但可以介绍安全的替代做法。".to_owned(),
+            "Google 的政策可能拒绝敏感内容；这不意味着所有请求都不可用。".to_owned(),
+            format!("这条错误的意思是：{GOOGLE_PROMPT_BLOCKED_NOTICE}"),
+            format!("\"{GOOGLE_PROMPT_BLOCKED_NOTICE}\""),
+            format!("> {GOOGLE_PROMPT_BLOCKED_NOTICE}"),
+            format!("```text\n{GOOGLE_PROMPT_BLOCKED_NOTICE}\n```"),
+            format!("{GOOGLE_PROMPT_BLOCKED_NOTICE}\n以上是服务错误示例。"),
+            GOOGLE_PROMPT_BLOCKED_NOTICE.replace(
+                "https://ai.google.dev/gemini-api/docs/troubleshooting",
+                "https://example.invalid/troubleshooting",
+            ),
+            GOOGLE_PROMPT_BLOCKED_NOTICE.replace(". Try rephrasing", ": Try rephrasing"),
+        ] {
+            let parsed = parse_response(
+                response(json!({"role":"assistant","content":text})),
+                &HashSet::new(),
+            )
+            .unwrap();
+            assert_eq!(parsed.message["content"], text);
+        }
+    }
+
+    #[test]
+    fn provider_block_rejects_the_entire_response_before_tool_dispatch() {
+        let allowed = HashSet::from(["clock_now".to_owned()]);
+        let clean = response(json!({
+            "role":"assistant", "content":null, "tool_calls":[call("clock")]
+        }));
+        assert!(parse_response(clean.clone(), &allowed).is_ok());
+        let mut filtered = clean.clone();
+        filtered["choices"][0]["finish_reason"] = json!("content_filter");
+        let mut refused = clean.clone();
+        refused["choices"][0]["message"]["refusal"] = json!("provider refusal secret");
+        let mut notice = clean.clone();
+        notice["choices"][0]["message"]["content"] = json!(GOOGLE_PROMPT_BLOCKED_NOTICE);
+        let mut prompt = clean;
+        prompt["promptFeedback"] = json!({"blockReason":"SAFETY"});
+        for value in [filtered, refused, notice, prompt] {
+            // No LlmResponse (and therefore no executable tool call) escapes.
+            let error = parse_response(value.clone(), &allowed).unwrap_err();
+            assert!(error.is::<ProviderBlocked>());
+            // Provider blocking is recognized even before offered-tool validation.
+            let error = parse_response(value, &HashSet::new()).unwrap_err();
+            assert!(error.is::<ProviderBlocked>());
+        }
+    }
+
+    #[test]
+    fn unblocked_provider_metadata_does_not_change_normal_answers_or_tools() {
+        for content in [json!("正常回答"), Value::Null] {
+            let mut value = response(json!({
+                "role":"assistant", "content":content, "refusal":null,
+                "tool_calls":[call("clock")]
+            }));
+            value["promptFeedback"] = json!({
+                "blockReason":"BLOCK_REASON_UNSPECIFIED",
+                "safetyRatings":[{"blocked":false,"probability":"LOW"}]
+            });
+            value["choices"][0]["finish_reason"] = json!("tool_calls");
+            value["choices"][0]["safety_ratings"] = json!([{"blocked":false}]);
+            let parsed = parse_response(value, &HashSet::from(["clock_now".to_owned()])).unwrap();
+            assert_eq!(parsed.message["content"], content);
+            assert_eq!(parsed.message["tool_calls"][0], call("clock"));
+        }
     }
 
     #[test]
