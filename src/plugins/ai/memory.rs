@@ -133,6 +133,7 @@ pub struct MessageSource {
     pub key: String,
     pub position: i64,
     pub inbound_position: i64,
+    pub received_at: chrono::DateTime<chrono::Utc>,
     pub subject_id: i64,
     pub sender_nickname: Option<String>,
     pub sender_card: Option<String>,
@@ -534,7 +535,24 @@ fn source_by_key(
     if is_revoked(db, key)? {
         return Ok(None);
     }
-    Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, subject_id:r.get(2)?, sender_nickname:r.get(8)?,sender_card:r.get(9)?,role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
+    Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card,received_at FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, received_at:source_received_at(r,10)?, subject_id:r.get(2)?, sender_nickname:r.get(8)?,sender_card:r.get(9)?,role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
+}
+
+fn source_received_at(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(row.get(column)?, 0).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid stored message timestamp",
+            )
+            .into(),
+        )
+    })
 }
 
 type MemoryRow = (i64, i64, String, String, String, Option<i64>, String);
@@ -865,7 +883,7 @@ fn prepare_batch_modes(
     let mut used = 0;
     let mut through_position = start;
     for position in positions {
-        let mut stmt=db.prepare("SELECT key,id,sender_id,role,content,learnable,revoked,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card FROM messages WHERE conversation_id=?1 AND epoch=?2 AND inbound_position=?3 AND COALESCE(origin_plugin,'')!='control' ORDER BY id LIMIT 49")?;
+        let mut stmt=db.prepare("SELECT key,id,sender_id,role,content,learnable,revoked,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card,received_at FROM messages WHERE conversation_id=?1 AND epoch=?2 AND inbound_position=?3 AND COALESCE(origin_plugin,'')!='control' ORDER BY id LIMIT 49")?;
         let mut turn = Vec::new();
         let mut turn_bytes = 0;
         let mut raw_rows = 0;
@@ -874,6 +892,7 @@ fn prepare_batch_modes(
                 MessageSource {
                     key: r.get(0)?,
                     position: r.get(1)?,
+                    received_at: source_received_at(r, 11)?,
                     subject_id: r.get(2)?,
                     sender_nickname: r.get(9)?,
                     sender_card: r.get(10)?,
@@ -1040,6 +1059,7 @@ fn validate_evidence(
         ensure!(
             current.position == frozen.position
                 && current.inbound_position == frozen.inbound_position
+                && current.received_at == frozen.received_at
                 && current.text == frozen.text
                 && current.subject_id == subject
                 && current.role == "user"
@@ -1181,6 +1201,7 @@ fn commit_batch_inner(
         ensure!(
             current.position == frozen.position
                 && current.inbound_position == frozen.inbound_position
+                && current.received_at == frozen.received_at
                 && current.text == frozen.text
                 && current.role == frozen.role
                 && current.subject_id == frozen.subject_id
@@ -1761,7 +1782,7 @@ mod tests {
     }
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT,sender_nickname TEXT,sender_card TEXT); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
+        db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT,sender_nickname TEXT,sender_card TEXT,received_at INTEGER NOT NULL DEFAULT 1); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(CURSOR_MIGRATION).unwrap();
         db.execute_batch(ADMIN_MIGRATION).unwrap();
@@ -1780,6 +1801,109 @@ mod tests {
             .unwrap();
         id
     }
+
+    #[test]
+    fn memory_source_timestamps_are_consistent_utc_rfc3339() {
+        let db = db();
+        let through = source(&db, "event", 7, "明天参加项目会议", "user");
+        db.execute(
+            "UPDATE messages SET received_at=946684800 WHERE id=?1",
+            [through],
+        )
+        .unwrap();
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        let single = source_by_key(&db, &guard(), "event").unwrap().unwrap();
+        assert_eq!(single.received_at, batch.sources[0].received_at);
+        let encoded = serde_json::to_value(&batch).unwrap();
+        assert_eq!(encoded["sources"][0]["received_at"], "2000-01-01T00:00:00Z");
+        let decoded: MessageSource = serde_json::from_value(encoded["sources"][0].clone()).unwrap();
+        assert_eq!(decoded.received_at.timestamp(), 946684800);
+    }
+
+    #[test]
+    fn memory_source_timestamps_reject_invalid_unix_seconds_without_fallback() {
+        let db = db();
+        let through = source(&db, "event", 7, "明确事件", "user");
+        for timestamp in [i64::MIN, i64::MAX] {
+            db.execute(
+                "UPDATE messages SET received_at=?1 WHERE id=?2",
+                params![timestamp, through],
+            )
+            .unwrap();
+            for error in [
+                source_by_key(&db, &guard(), "event").unwrap_err(),
+                prepare_batch(&db, &guard(), through, true).unwrap_err(),
+            ] {
+                assert!(matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::FromSqlConversionFailure(
+                        _,
+                        rusqlite::types::Type::Integer,
+                        _
+                    ))
+                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("invalid stored message timestamp")
+                );
+                assert!(!error.to_string().contains(&timestamp.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn memory_source_timestamp_changes_reject_evidence_and_atomic_commit() {
+        for (summary_enabled, memory_write) in [(true, false), (false, true), (true, true)] {
+            let mut db = db();
+            let through = source(&db, "event", 7, "明天参加项目会议", "user");
+            let batch =
+                prepare_batch_modes(&db, &guard(), through, memory_write, summary_enabled).unwrap();
+            db.execute(
+                "UPDATE messages SET received_at=received_at+1 WHERE id=?1",
+                [through],
+            )
+            .unwrap();
+            if memory_write {
+                let error =
+                    validate_evidence(&db, &batch, 7, &evidence("event", "明天参加项目会议"))
+                        .unwrap_err();
+                assert_eq!(memory_commit_failure_reason(&error), "evidence_changed");
+            }
+            let changes = if memory_write {
+                vec![MemoryChange::Upsert {
+                    id: None,
+                    subject_id: 7,
+                    kind: MemoryKind::Event,
+                    text: "计划参加项目会议".into(),
+                    evidence: evidence("event", "明天参加项目会议"),
+                    ttl_days: None,
+                }]
+            } else {
+                vec![]
+            };
+            let error = commit_batch(
+                &mut db,
+                batch,
+                BatchUpdate {
+                    summary: if summary_enabled {
+                        "会议计划".into()
+                    } else {
+                        String::new()
+                    },
+                    changes,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(memory_commit_failure_reason(&error), "source_changed");
+            let state: (String, i64, i64, i64, i64) = db.query_row(
+                "SELECT summary,compacted_until,memory_processed_until,memory_revision,(SELECT count(*) FROM ai_memories) FROM ai_conversations WHERE id='group'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+            assert_eq!(state, (String::new(), 0, 0, 0, 0));
+        }
+    }
+
     fn evidence(key: &str, quote: &str) -> Vec<Evidence> {
         vec![Evidence {
             source_key: key.into(),

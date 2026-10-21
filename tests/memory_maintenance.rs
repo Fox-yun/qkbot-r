@@ -16,10 +16,20 @@ type Respond = dyn Fn(&Value) -> String + Send + Sync;
 #[derive(Clone)]
 struct Model {
     inputs: Arc<Mutex<Vec<Value>>>,
+    systems: Arc<Mutex<Vec<String>>>,
     respond: Arc<Respond>,
     repair_barrier: Arc<Mutex<Option<Arc<RepairBarrier>>>>,
 }
 async fn model(State(state): State<Model>, Json(body): Json<Value>) -> Json<Value> {
+    let system = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.systems.lock().unwrap().push(system);
     let content = body["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
@@ -45,6 +55,7 @@ async fn setup(
     let url = format!("http://{}", listener.local_addr().unwrap());
     let state = Model {
         inputs: Arc::new(Mutex::new(vec![])),
+        systems: Arc::new(Mutex::new(vec![])),
         respond: Arc::new(respond),
         repair_barrier: Arc::new(Mutex::new(None)),
     };
@@ -756,4 +767,211 @@ async fn pending_summary_compression_enforces_candidate_size_and_two_chunk_limit
         host.store.stop().await.unwrap();
         server.abort();
     }
+}
+
+const EVENT_SOURCE_TIME: &str = "2026-02-03T09:00:00Z";
+const EVENT_SOURCE_TEXT: &str = "我今天完成了测试项目部署，明天下午复测";
+const EVENT_EVIDENCE: &str = "我今天完成了测试项目部署";
+const EVENT_MEMORY_TEXT: &str = "2026-02-03 完成了测试项目部署";
+
+fn seed_event(db: &rusqlite::Connection, id: &str) -> anyhow::Result<()> {
+    seed(db, id, 1, true, "{}", 1)?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(EVENT_SOURCE_TIME)?.timestamp();
+    db.execute(
+        "UPDATE messages SET content=?1,received_at=?2 WHERE conversation_id=?3",
+        params![EVENT_SOURCE_TEXT, timestamp, id],
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dated_event_is_learned_recalled_by_subject_and_expires_without_erasing_evidence() {
+    let (host, chat, model, server) = setup(
+        |_| {},
+        |batch| {
+            assert_eq!(batch["summary_enabled"], false);
+            assert_eq!(batch["memory_write"], true);
+            let sources = batch["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0]["received_at"], EVENT_SOURCE_TIME);
+            assert_eq!(sources[0]["subject_id"], 7);
+            assert_eq!(sources[0]["role"], "user");
+            assert_eq!(sources[0]["learnable"], true);
+            assert_eq!(sources[0]["memory_eligible"], true);
+            assert_eq!(sources[0]["text"], EVENT_SOURCE_TEXT);
+            // The mock fixes model output; the host must preserve its date and
+            // the original relative-time evidence independently of commit time.
+            fenced(json!({"summary":"","changes":[{
+                "op":"upsert","id":null,"subject_id":7,"kind":"event",
+                "text":EVENT_MEMORY_TEXT,
+                "evidence":[{"source_key":sources[0]["key"],"quote":EVENT_EVIDENCE}],
+                "ttl_days":30
+            }]}))
+        },
+    )
+    .await;
+    host.store.call(|db| seed_event(db, "event")).await.unwrap();
+    let started_at = qkbot::types::now();
+    chat.compact_idle().await.unwrap();
+    let systems = model.systems.lock().unwrap().clone();
+    assert_eq!(systems.len(), 1);
+    assert!(systems[0].contains("event"));
+    assert!(systems[0].contains("received_at"));
+    let memory_id = host.store.call(move |db| {
+        let row: (i64,String,i64,String,String,String,i64,i64,i64) = db.query_row(
+            "SELECT id,origin,subject_id,kind,text,evidence,created_at,updated_at,expires_at FROM ai_memories WHERE conversation_id='event'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        )?;
+        assert_eq!((row.1.as_str(),row.2,row.3.as_str(),row.4.as_str()),("auto",7,"event",EVENT_MEMORY_TEXT));
+        assert_eq!(serde_json::from_str::<Value>(&row.5)?,json!([{"source_key":"event:1","quote":EVENT_EVIDENCE}]));
+        assert!((started_at..=qkbot::types::now()).contains(&row.6));
+        assert_eq!(row.7,row.6);
+        assert_eq!(row.8-row.6,30*86_400);
+        let provenance: (String,String) = db.query_row(
+            "SELECT source_key,quote FROM ai_memory_provenance WHERE memory_id=?1",[row.0],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        assert_eq!(provenance,("event:1".into(),EVENT_EVIDENCE.into()));
+        let indexed: i64 = db.query_row(
+            "SELECT memory_id FROM ai_memory_search WHERE ai_memory_search MATCH ?1",["\"部署\""],|row| row.get(0),
+        )?;
+        assert_eq!(indexed,row.0);
+        let state: (i64,i64) = db.query_row(
+            "SELECT compacted_until,memory_processed_until FROM ai_conversations WHERE id='event'",[],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        assert_eq!(state,(0,1));
+        Ok(row.0)
+    }).await.unwrap();
+    let guard = ContextGuard {
+        conversation_id: "event".into(),
+        epoch: 1,
+    };
+    let recalled = host
+        .memory
+        .retrieve(&guard, 7, "测试项目部署", 5, 1000)
+        .await
+        .unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].id, memory_id);
+    assert_eq!(
+        recalled[0].kind,
+        qkbot::plugins::ai::memory::MemoryKind::Event
+    );
+    assert_eq!(recalled[0].subject_id, 7);
+    assert_eq!(recalled[0].text, EVENT_MEMORY_TEXT);
+    assert_eq!(recalled[0].evidence[0].quote, EVENT_EVIDENCE);
+    assert!(
+        host.memory
+            .retrieve(&guard, 8, "测试项目部署", 5, 1000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    host.store
+        .call(move |db| {
+            db.execute(
+                "UPDATE ai_memories SET expires_at=1 WHERE id=?1",
+                [memory_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        host.memory
+            .retrieve(&guard, 7, "测试项目部署", 5, 1000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(host.memory.list_page(&guard, 7, 1).await.unwrap().total, 0);
+    host.store
+        .call(move |db| {
+            let preserved: (String, String, i64) = db.query_row(
+                "SELECT text,evidence,active FROM ai_memories WHERE id=?1",
+                [memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(preserved.0, EVENT_MEMORY_TEXT);
+            assert_eq!(
+                serde_json::from_str::<Value>(&preserved.1)?,
+                json!([{"source_key":"event:1","quote":EVENT_EVIDENCE}])
+            );
+            assert_eq!(preserved.2, 1);
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM ai_memory_provenance WHERE memory_id=?1",
+                    [memory_id],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM ai_memory_search WHERE memory_id=?1",
+                    [memory_id],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn third_party_event_evidence_rejects_every_change_without_advancing_the_cursor() {
+    let (host, chat, model, server) = setup(
+        |_| {},
+        |batch| {
+            let sources = batch["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 2);
+            assert!(sources.iter().all(|source| source["subject_id"] == 7));
+            assert!(sources.iter().all(|source| source["memory_eligible"] == true));
+            fenced(json!({"summary":"","changes":[{
+                "op":"upsert","id":null,"subject_id":7,"kind":"event",
+                "text":EVENT_MEMORY_TEXT,
+                "evidence":[{"source_key":sources[0]["key"],"quote":EVENT_EVIDENCE}],"ttl_days":null
+            },{
+                "op":"upsert","id":null,"subject_id":8,"kind":"event",
+                "text":"2026-02-03 完成项目验收",
+                "evidence":[{"source_key":sources[1]["key"],"quote":"用户8今天完成了项目验收"}],"ttl_days":null
+            }]}))
+        },
+    )
+    .await;
+    host.store.call(|db| {
+        seed_event(db, "reported-event")?;
+        seed(db, "reported-event", 1, true, "{}", 2)?;
+        db.execute(
+            "UPDATE messages SET content='听说用户8今天完成了项目验收',received_at=?1 WHERE key='reported-event:2'",
+            [chrono::DateTime::parse_from_rfc3339(EVENT_SOURCE_TIME)?.timestamp()],
+        )?;
+        db.execute("UPDATE ai_conversations SET summary='保留既有摘要' WHERE id='reported-event'",[])?;
+        Ok(())
+    }).await.unwrap();
+    chat.compact_idle().await.unwrap();
+    host.store.call(|db| {
+        let state: (String,i64,i64,i64) = db.query_row(
+            "SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='reported-event'",[],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        )?;
+        assert_eq!(state,("保留既有摘要".into(),0,0,0));
+        for table in ["ai_memories","ai_memory_provenance","ai_memory_search"] {
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|row|row.get::<_,i64>(0))?,0);
+        }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM messages WHERE conversation_id='reported-event' AND revoked=0",[],|row|row.get::<_,i64>(0))?,2);
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
 }
