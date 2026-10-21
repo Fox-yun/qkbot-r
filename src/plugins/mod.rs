@@ -5,6 +5,7 @@ pub mod media;
 pub mod native;
 pub mod reminder;
 pub mod render;
+pub mod roll;
 pub mod roulette;
 pub mod social;
 
@@ -42,6 +43,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     plugins.register_handler(std::sync::Arc::new(clock::ClockPlugin))?;
     plugins.register_handler(std::sync::Arc::new(reminder::ReminderPlugin))?;
     plugins.register_handler(std::sync::Arc::new(crate::catalog::HelpPlugin))?;
+    plugins.register_handler(std::sync::Arc::new(roll::RollPlugin))?;
     plugins.register_handler(std::sync::Arc::new(native::CheckinPlugin))?;
     plugins.register_handler(std::sync::Arc::new(native::WordlePlugin))?;
     plugins.register_handler(std::sync::Arc::new(native::KfcPlugin))?;

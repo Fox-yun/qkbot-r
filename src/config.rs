@@ -180,6 +180,7 @@ impl Default for NativeConfig {
         Self {
             enabled: [
                 "help",
+                "roll",
                 "checkin",
                 "wordle",
                 "kfc",

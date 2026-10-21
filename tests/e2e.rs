@@ -3158,3 +3158,168 @@ async fn provider_blocked_google_error_text_cannot_pollute_history_or_summary() 
     let error = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's [Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). Try rephrasing the prompt. If you think this was an error, [send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting).";
     assert_provider_blocked_response_is_not_conversation_data(answer(error)).await;
 }
+
+fn roll_reply_text(sent: &Value, source_seq: i64) -> &str {
+    let segments = sent["message"].as_array().unwrap();
+    assert_eq!(segments.len(), 2, "roll has one quote and one result only");
+    assert_eq!(
+        segments[0],
+        json!({"type":"reply","data":{"message_seq":source_seq}})
+    );
+    assert_eq!(segments[1]["type"], "text");
+    segments[1]["data"]["text"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn roll_quotes_its_current_group_or_private_command_and_deduplicates_delivery() {
+    for scene in [Scene::Group, Scene::Friend] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.native.enabled = vec!["roll".into()];
+        })
+        .await;
+        let mut incoming = message(37, "/roll a b c");
+        incoming.key.scope.scene = scene;
+        incoming.key.scope.peer_id = if scene == Scene::Group { 456 } else { 789 };
+        incoming.quote_seq = Some(999);
+        let source_key = incoming.key.key();
+        router.dispatch(incoming.clone()).await.unwrap();
+        // Deduplication must work both while the command task is running and
+        // after its confirmed send. A replay cannot choose a second result.
+        router.dispatch(incoming.clone()).await.unwrap();
+        let sent = within(mock.sends.recv()).await.unwrap();
+        if scene == Scene::Group {
+            assert_eq!(sent["group_id"], 456);
+        } else {
+            assert_eq!(sent["user_id"], 789);
+        }
+        let result = roll_reply_text(&sent, 37).to_owned();
+        assert!(["a", "b", "c"].contains(&result.as_str()));
+        wait_for_outbox(&host, "confirmed", 1).await;
+        incoming.text = "/roll replay-must-not-replace-the-first-result".into();
+        router.dispatch(incoming).await.unwrap();
+        host.store.call(move |db| {
+            let source: (String,String,i64,String) = db.query_row(
+                "SELECT command_plugin,conversation_id,learnable,role FROM messages WHERE key=?1",[source_key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )?;
+            assert_eq!(source,("roll".into(),String::new(),0,"control".into()));
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM outbox WHERE origin_plugin='roll' AND state='confirmed'",[],|row|row.get::<_,i64>(0))?,1);
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM outbox",[],|row|row.get::<_,i64>(0))?,1);
+            assert_eq!(db.query_row("SELECT content FROM messages WHERE origin_plugin='roll'",[],|row|row.get::<_,String>(0))?,result);
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM ai_conversations",[],|row|row.get::<_,i64>(0))?,0);
+            Ok(())
+        }).await.unwrap();
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.sends.try_recv().is_err());
+        assert!(mock.models.try_recv().is_err());
+        assert!(
+            mock.quotes.try_recv().is_err(),
+            "the incoming quote is not an AI trigger"
+        );
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn roll_single_option_is_returned_and_empty_options_show_usage_without_ai() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.native.enabled = vec!["roll".into()];
+    })
+    .await;
+    for (seq, command) in [(11, "/roll 唯一选项"), (12, "/roll"), (13, "/roll \t\n")] {
+        let mut incoming = message(seq, command);
+        incoming.quote_seq = Some(777);
+        router.dispatch(incoming).await.unwrap();
+        let sent = within(mock.sends.recv()).await.unwrap();
+        let result = roll_reply_text(&sent, seq);
+        if seq == 11 {
+            assert_eq!(result, "唯一选项");
+        } else {
+            assert!(result.contains("用法") && result.contains("/roll") && result.contains("选项"));
+        }
+    }
+    wait_for_outbox(&host, "confirmed", 3).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn roll_disabled_globally_or_in_the_chat_retains_command_ownership_without_ai() {
+    for globally_disabled in [true, false] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.native.enabled = if globally_disabled {
+                vec![]
+            } else {
+                vec!["roll".into()]
+            };
+        })
+        .await;
+        let mut incoming = message(19, "/roll a b c");
+        incoming.quote_seq = Some(888);
+        if !globally_disabled {
+            qkbot::catalog::set_enabled(
+                &host.store,
+                incoming.key.scope.clone(),
+                "roll".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let (owner, handler) = host
+            .plugins
+            .select(&host, &incoming)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner, "roll");
+        assert_eq!(handler.is_none(), globally_disabled);
+        router.dispatch(incoming).await.unwrap();
+        if globally_disabled {
+            let sent = within(mock.sends.recv()).await.unwrap();
+            let segments = sent["message"].as_array().unwrap();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0]["type"], "text");
+            assert!(
+                segments[0]["data"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("未在当前运行配置中启用")
+            );
+            wait_for_outbox(&host, "confirmed", 1).await;
+        }
+        host.store
+            .call(|db| {
+                assert_eq!(
+                    db.query_row("SELECT COUNT(*) FROM ai_conversations", [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT COUNT(*) FROM outbox WHERE origin_plugin='roll'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.sends.try_recv().is_err());
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.quotes.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}

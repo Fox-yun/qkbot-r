@@ -26,6 +26,7 @@ pub struct Feature {
 }
 pub const NATIVE_IDS: &[&str] = &[
     "help",
+    "roll",
     "checkin",
     "wordle",
     "kfc",
@@ -45,6 +46,13 @@ pub fn features(config: &Config) -> Vec<Feature> {
             "帮助",
             "查看当前会话可用功能及用法",
             &["/help", "/帮助"],
+            false,
+        ),
+        (
+            "roll",
+            "随机选择",
+            "/roll 选项1 选项2 …；按空白分隔选项，随机抽取一项并引用原消息回复",
+            &["/roll"],
             false,
         ),
         (

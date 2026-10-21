@@ -77,7 +77,7 @@ llm_writes_require_confirmation = true  # 首版必须保持 true
 
 [plugins.native]
 # 群/好友默认可用；管理页可分别关闭某插件。戳一戳、禁言游戏按需勾选。
-enabled = ["help", "checkin", "wordle", "kfc", "meal", "daily_partner", "mc_status", "sticker_save", "mock_chat_image", "mock_forward"]
+enabled = ["help", "roll", "checkin", "wordle", "kfc", "meal", "daily_partner", "mc_status", "sticker_save", "mock_chat_image", "mock_forward"]
 superusers = []               # QQ号整数；管理食物图片、MC等原插件管理员能力
 image_font_path = ""          # 自动寻找系统中文字体，也可指定 Noto Sans CJK 路径
 meal_cooldown_secs = 10
