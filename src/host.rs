@@ -208,6 +208,53 @@ impl Host {
         message: OutgoingMessage,
         id: String,
     ) -> Result<SendOutcome> {
+        self.send_authorized_message(scope, plugin, guard, inbound_position, message, id, None)
+            .await
+    }
+
+    pub(crate) async fn send_ai_reply(
+        &self,
+        scope: &Scope,
+        guard: ContextGuard,
+        inbound_position: i64,
+        reply: crate::plugins::ai::reply::PreparedReply,
+        id: String,
+    ) -> Result<SendOutcome> {
+        ensure!(
+            self.config.llm.tool_calling
+                && self
+                    .config
+                    .plugins
+                    .ai
+                    .defaults
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "reply_message"),
+            "结构化回复工具未启用"
+        );
+        self.send_authorized_message(
+            scope,
+            "ai",
+            Some(guard),
+            inbound_position,
+            reply.message,
+            id,
+            Some(reply.authorization),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_authorized_message(
+        &self,
+        scope: &Scope,
+        plugin: &str,
+        guard: Option<ContextGuard>,
+        inbound_position: i64,
+        message: OutgoingMessage,
+        id: String,
+        authorization: Option<crate::plugins::ai::reply::Authorization>,
+    ) -> Result<SendOutcome> {
         message.validate(self.config.limits.max_message_bytes)?;
         self.media
             .bind(self, scope, plugin, inbound_position, &message)
@@ -256,6 +303,8 @@ impl Host {
             let body = serialized.clone();
             let origin = plugin.to_owned();
             let g = guard.clone();
+            let authorization = authorization.clone();
+            let destination = scope.clone();
             let delay=self.store.call(move|c| {
             let tx=c.transaction()?;
             crate::access::check_revision(&tx,&scope_key,access_revision)?;
@@ -263,6 +312,9 @@ impl Host {
             check_source_policy(&tx,&scope_key,&origin,inbound_position)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g { check_guard(&tx,g)?; }
+            if let Some(authorization)=&authorization {
+                authorization.check(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?)?;
+            }
             let count:i64=tx.query_row("SELECT COUNT(*) FROM outbox WHERE scope=?1 AND created_at>?2 AND state IN('prepared','submitted','confirmed','unknown')",params![scope_key,now()-3600],|r|r.get(0))?;
             ensure!(count<hourly,"发送额度已用完，请稍后重试");
             if cooldown>0 {
@@ -283,6 +335,7 @@ impl Host {
         let origin = plugin.to_owned();
         let g = guard.clone();
         let scope_key = scope.key();
+        let destination = scope.clone();
         let _delivery = self.access.delivery_guard(scope).await?;
         let submit=self.store.call(move|c|{
             let tx=c.transaction()?;
@@ -291,6 +344,9 @@ impl Host {
             check_source_policy(&tx,&scope_key,&origin,inbound_position)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g {check_guard(&tx,g)?;}
+            if let Some(authorization)=&authorization {
+                authorization.check(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?)?;
+            }
             ensure!(tx.execute("UPDATE outbox SET state='submitted',updated_at=?2 WHERE id=?1 AND state='prepared'",params![id1,now()])?==1,"发送已取消");
             tx.commit()?;Ok(())
         }).await;

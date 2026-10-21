@@ -25,6 +25,40 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     Llm::new(config.llm, http).unwrap();
     assert_eq!(config.plugins.ai.defaults.mode, "group");
     assert!(config.plugins.ai.defaults.reply_to_bot);
+    assert_eq!(
+        config.plugins.ai.defaults.allowed_tools,
+        ["clock_now", "reply_message"]
+    );
+}
+
+#[test]
+fn final_reply_tool_is_default_but_explicit_permissions_remain_unchanged() {
+    let defaults = Config::default().plugins.ai.defaults;
+    assert!(
+        defaults
+            .allowed_tools
+            .iter()
+            .any(|name| name == "reply_message")
+    );
+    let legacy: Config =
+        toml::from_str("[plugins.ai.defaults]\nallowed_tools = ['clock_now']").unwrap();
+    assert_eq!(legacy.plugins.ai.defaults.allowed_tools, ["clock_now"]);
+    let empty: Config = toml::from_str("[plugins.ai.defaults]\nallowed_tools = []").unwrap();
+    assert!(empty.plugins.ai.defaults.allowed_tools.is_empty());
+    let conversation =
+        qkbot::plugins::ai::resolve_settings(&defaults, r#"{"allowed_tools":["clock_now"]}"#)
+            .unwrap();
+    assert_eq!(conversation.allowed_tools, ["clock_now"]);
+    let (plugins, tools, _) = qkbot::plugins::assemble(&Config::default()).unwrap();
+    assert!(
+        plugins
+            .specs()
+            .find(|plugin| plugin.id == "ai")
+            .unwrap()
+            .tools
+            .contains(&"reply_message")
+    );
+    assert!(tools.names().any(|name| name == "reply_message"));
 }
 
 #[test]

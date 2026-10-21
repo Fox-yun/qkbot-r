@@ -427,7 +427,7 @@ impl Default for AiSettings {
             summary: true,
             paused: false,
             once: false,
-            allowed_tools: vec!["clock_now".into()],
+            allowed_tools: vec!["clock_now".into(), "reply_message".into()],
         }
     }
 }

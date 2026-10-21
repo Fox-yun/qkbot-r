@@ -823,6 +823,26 @@ test("tool metadata stays literal, prototype names are safe, and malformed catal
   checkbox.checked = false; await checkbox.emit("change"); assert.equal(checkbox.checked, true); assert.equal({}.polluted, undefined);
 });
 
+test("final reply tools display their own effect and retain global and conversation permissions", async () => {
+  const h = harness(); await h.login(); const saved = h.snapshot();
+  saved.tool_catalog.push({ name: "reply_message", description: "提交本轮唯一回复，可引用及 @", plugin_id: "ai", effect: "reply" });
+  h.setHandler(async () => ({ body: saved })); await h.app.loadConfig();
+  assert.match(globalTools(h).textContent, /本轮回复 · ai/u);
+  const reply = toolCheckbox(globalTools(h), "reply_message"); assert.equal(reply.disabled, false); assert.equal(reply.checked, false);
+  reply.checked = true; await reply.emit("change");
+  assert.deepEqual([...h.app.readForm().plugins.ai.defaults.allowed_tools], ["reply_message"]);
+  h.app.state.memory.detail = h.conversation(); h.app.renderSettings();
+  assert.equal(toolCheckbox(conversationTools(h), "reply_message").disabled, true);
+  saved.config.plugins.ai.defaults.allowed_tools = ["reply_message"];
+  await h.app.loadConfig();
+  assert.equal(toolCheckbox(conversationTools(h), "reply_message").disabled, false);
+  const conversationReply = toolCheckbox(conversationTools(h), "reply_message"); conversationReply.checked = true; await conversationReply.emit("change");
+  assert.deepEqual([...h.app.readSettings().allowed_tools], ["reply_message"]);
+  const enabled = h.app.inputs.get("plugins.ai.enabled").control; enabled.checked = false; await enabled.emit("input");
+  assert.match(globalTools(h).textContent, /所属插件已关闭/u);
+  assert.equal(toolCheckbox(globalTools(h), "reply_message").checked, true);
+});
+
 function pluginSnapshot(h) {
   const snapshot = h.snapshot();
   snapshot.config.plugins.native = { enabled: ["wordle", "retired"], superusers: [], mc_servers: [], today_waifu: { allow_change: true }, poke: { send_text: true } };

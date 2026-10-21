@@ -308,10 +308,13 @@ fn tool_calls(message: &Value) -> Result<Vec<(String, String)>> {
         return Ok(Vec::new());
     };
     let calls = calls.as_array().context("tool_calls must be an array")?;
+    // The dispatcher rejects multi-call batches without executing them, then
+    // reports a result for every ID. Preserve bounded batches for that protocol.
     ensure!(
-        calls.len() <= 1,
-        "at most one tool call is accepted per response"
+        calls.len() <= 32,
+        "at most 32 tool calls may be parsed per response"
     );
+    let mut ids = HashSet::new();
     calls
         .iter()
         .map(|call| {
@@ -321,6 +324,7 @@ fn tool_calls(message: &Value) -> Result<Vec<(String, String)>> {
                 !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control),
                 "invalid tool call id"
             );
+            ensure!(ids.insert(id), "duplicate tool call id in response");
             let name = call["function"]["name"]
                 .as_str()
                 .context("tool call missing function name")?;
@@ -471,6 +475,108 @@ mod tests {
         assert!(parse_response(response(message.clone()), &allowed).is_ok());
         message["tool_calls"][0]["function"]["arguments"] = json!("{bad}");
         assert!(parse_response(response(message), &allowed).is_err());
+    }
+
+    #[test]
+    fn bounded_batches_are_preserved_for_dispatcher_rejection() {
+        let mut calls: Vec<_> = (0..32)
+            .map(|index| call(&format!("call-{index}")))
+            .collect();
+        calls[31]["function"]["name"] = json!("reply_message");
+        calls[31]["function"]["arguments"] = json!(r#"{"text":"final response"}"#);
+        let allowed = HashSet::from(["clock_now".to_owned(), "reply_message".to_owned()]);
+        let message = json!({"role":"assistant","content":null,"tool_calls":calls});
+        let parsed = parse_response(response(message.clone()), &allowed).unwrap();
+        assert_eq!(parsed.message, message);
+
+        let mut oversized = message;
+        oversized["tool_calls"]
+            .as_array_mut()
+            .unwrap()
+            .push(call("overflow"));
+        assert!(parse_response(response(oversized), &allowed).is_err());
+    }
+
+    #[test]
+    fn any_invalid_member_rejects_the_entire_batch() {
+        let allowed = HashSet::from(["clock_now".to_owned()]);
+        let mut invalid = Vec::new();
+        invalid.push(call("first")); // A duplicate of the first member.
+        invalid.push(call("bad\nid"));
+        invalid.push(call(&"x".repeat(129)));
+        for (field, value) in [("type", json!("not-a-function")), ("id", Value::Null)] {
+            let mut entry = call("second");
+            entry[field] = value;
+            invalid.push(entry);
+        }
+        for (field, value) in [
+            ("name", json!("not_offered")),
+            ("name", json!("bad name")),
+            ("arguments", json!({})),
+            ("arguments", json!("{invalid}")),
+            ("arguments", json!("[]")),
+            (
+                "arguments",
+                json!(format!(r#"{{"value":"{}"}}"#, "x".repeat(8192))),
+            ),
+        ] {
+            let mut entry = call("second");
+            entry["function"][field] = value;
+            invalid.push(entry);
+        }
+        for entry in invalid {
+            let message =
+                json!({"role":"assistant","content":null,"tool_calls":[call("first"),entry]});
+            assert!(parse_response(response(message), &allowed).is_err());
+        }
+    }
+
+    #[test]
+    fn rejected_batch_protocol_requires_each_result_once_before_continuing() {
+        let assistant = json!({"role":"assistant","content":null,"tool_calls":[call("one"),call("two"),call("three")]});
+        let result = |id: &str| json!({"role":"tool","tool_call_id":id,"content":"batch rejected; not executed"});
+        let complete = vec![
+            assistant.clone(),
+            result("one"),
+            result("two"),
+            result("three"),
+        ];
+        assert!(validate_messages(&complete).is_ok());
+        assert!(validate_messages(&complete[..3]).is_err());
+        assert!(
+            validate_messages(&[
+                assistant.clone(),
+                result("one"),
+                result("one"),
+                result("three")
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_messages(&[
+                assistant.clone(),
+                result("one"),
+                result("two"),
+                result("unknown")
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_messages(&[
+                assistant.clone(),
+                result("one"),
+                json!({"role":"user","content":"interleaved"}),
+                result("two"),
+                result("three")
+            ])
+            .is_err()
+        );
+        let mut continued = complete;
+        continued.push(json!({"role":"assistant","content":"one corrected final response"}));
+        assert!(validate_messages(&continued).is_ok());
+        continued.push(json!({"role":"assistant","content":null,"tool_calls":[call("one")]}));
+        continued.push(result("one"));
+        assert!(validate_messages(&continued).is_err());
     }
 
     #[test]

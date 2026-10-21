@@ -728,7 +728,13 @@ mod tests {
         let view = snapshot(&before, &environment).unwrap();
         let catalog = crate::plugins::tool_catalog(&config).unwrap();
         assert_eq!(view["tool_catalog"], json!(catalog));
-        assert_eq!(catalog.len(), 4);
+        assert_eq!(catalog.len(), 5);
+        let reply = catalog
+            .iter()
+            .find(|entry| entry.name == "reply_message")
+            .unwrap();
+        assert_eq!(reply.plugin_id, "ai");
+        assert_eq!(reply.effect, crate::tools::Effect::Reply);
         assert_eq!(view["revision"], revision(&before));
         assert!(view["config"].get("tool_catalog").is_none());
         assert_eq!(
@@ -747,11 +753,11 @@ mod tests {
         );
         for entry in &catalog {
             assert!(!entry.name.is_empty() && !entry.description.is_empty());
-            assert!(matches!(entry.plugin_id, "clock" | "reminder"));
+            assert!(matches!(entry.plugin_id, "clock" | "reminder" | "ai"));
             let value = serde_json::to_value(entry).unwrap();
             assert!(matches!(
                 value["effect"].as_str(),
-                Some("read" | "local_write")
+                Some("read" | "local_write" | "reply")
             ));
             assert_eq!(value.as_object().unwrap().len(), 4);
         }

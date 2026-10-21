@@ -55,7 +55,7 @@ pub(super) struct Decision {
 #[derive(Clone)]
 pub(super) struct Quote {
     pub key: MessageKey,
-    sender: Option<i64>,
+    pub(super) sender: Option<i64>,
     content: String,
 }
 impl Quote {

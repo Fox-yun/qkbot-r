@@ -295,7 +295,7 @@
   }
 
   function validateToolCatalog(value) {
-    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "local_write"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
+    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "local_write", "reply"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
   }
   function toolUnavailable(tool, mode) {
     if (!tool) return "未注册的旧工具，可取消选择";
@@ -332,7 +332,8 @@
       checkbox.setAttribute("aria-label", name + (unavailable ? "，" + unavailable : ""));
       const copy = element("span", "tool-copy"); copy.append(element("strong", "tool-name", name));
       if (tool) {
-        copy.append(element("span", "tool-meta", `${tool.effect === "read" ? "只读" : "本地写入"} · ${tool.plugin_id}`));
+        const effectLabel = { read: "只读", local_write: "本地写入", reply: "本轮回复" }[tool.effect];
+        copy.append(element("span", "tool-meta", `${effectLabel} · ${tool.plugin_id}`));
         copy.append(element("span", "tool-description", tool.description));
       }
       if (unavailable) copy.append(element("span", "tool-warning", unavailable));

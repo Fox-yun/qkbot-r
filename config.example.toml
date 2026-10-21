@@ -60,7 +60,7 @@ memory_write = true
 summary = true
 paused = false
 once = false
-allowed_tools = ["clock_now"]  # 可加入 reminder_list/create/cancel，需开启提醒插件
+allowed_tools = ["clock_now", "reply_message"]  # 本轮回复可引用消息和 @；提醒工具需开启提醒插件
 
 [plugins.ai.personas]
 # 内置：雄小鬼、清朗青年、温柔学长、理性搭档、沉稳前辈，无须在这里重复填写。

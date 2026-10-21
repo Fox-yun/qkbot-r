@@ -36,7 +36,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     plugins.register(PluginSpec {
         id: "ai",
         commands: &[],
-        tools: &[],
+        tools: &["reply_message"],
         dependencies: &["host"],
     })?;
     plugins.register_handler(std::sync::Arc::new(clock::ClockPlugin))?;
@@ -78,6 +78,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
         );
     }
     let mut tools = ToolRegistry::new();
+    crate::tools::register_reply(&mut tools)?;
     clock::register(&mut tools)?;
     reminder::register(&mut tools, config.plugins.reminder.max_active_per_user)?;
     for name in &config.plugins.ai.defaults.allowed_tools {

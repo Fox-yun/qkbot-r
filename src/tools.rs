@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 pub enum Effect {
     Read,
     LocalWrite,
+    /// Ends the current AI turn; handled by chat, never by the transaction gateway.
+    Reply,
 }
 
 /// Administrator display metadata, not an authorization grant or a model tool
@@ -77,6 +79,80 @@ pub trait Tool: Send + Sync {
         operation_id: &str,
         now: i64,
     ) -> Result<ToolResult>;
+}
+
+/// Publishes the final-reply contract to the model and administrator catalog.
+/// The chat dispatcher validates host-issued references and queues the response.
+struct ReplyTool;
+
+impl Tool for ReplyTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "reply_message",
+            plugin: "ai",
+            version: 1,
+            description: "提交本轮唯一的最终回复并结束本轮，可引用消息及 @ 最多三人。reply_to 和 mention_users 只接受本轮宿主提供的消息/用户引用，不接受任意消息序号或用户 ID；无引用或 @ 需求时省略对应参数。调用后不要再输出另一份回答。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "reply_to": {
+                        "type": ["string", "null"],
+                        "description": "本轮宿主提供的消息引用；省略或 null 表示不引用。"
+                    },
+                    "mention_users": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 3,
+                        "description": "本轮宿主提供的用户引用，最多三人。"
+                    },
+                    "text": {"type": "string", "minLength": 1, "description": "最终回复的非空正文。"}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+            effect: Effect::Reply,
+            max_output_bytes: 0,
+        }
+    }
+
+    fn prepare(
+        &self,
+        _args: Value,
+        _scope: &Scope,
+        _actor: i64,
+        _received_at: i64,
+        _timezone: Tz,
+    ) -> Result<Value> {
+        bail!("final replies must be handled by the chat dispatcher")
+    }
+
+    fn preview(&self, _args: &Value, _timezone: Tz) -> Result<String> {
+        bail!("final replies cannot request transaction confirmation")
+    }
+
+    fn apply(
+        &self,
+        _tx: &Transaction<'_>,
+        _args: &Value,
+        _scope: &Scope,
+        _actor: i64,
+        _operation_id: &str,
+        _now: i64,
+    ) -> Result<ToolResult> {
+        bail!("final replies cannot execute inside a tool transaction")
+    }
+}
+
+pub fn register_reply(registry: &mut ToolRegistry) -> Result<()> {
+    registry.register(Arc::new(ReplyTool))
+}
+
+fn require_transaction_tool(spec: &ToolSpec) -> Result<()> {
+    ensure!(
+        spec.effect != Effect::Reply,
+        "final replies must be handled by the chat dispatcher"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -201,6 +277,7 @@ fn apply_and_record(
     cancel: &CancellationToken,
 ) -> Result<ToolOutcome> {
     let spec = tool.spec();
+    require_transaction_tool(&spec)?;
     authorize(&tx, bound, spec.plugin)?;
     ensure!(
         tool.permits(&bound.scope, bound.actor_id),
@@ -437,6 +514,7 @@ impl Gateway {
         ensure!(self.allowed.contains(name), "tool is not allowed");
         let tool = self.registry.get(name)?;
         let spec = tool.spec();
+        require_transaction_tool(&spec)?;
         ensure!(
             tool.permits(&ctx.scope, ctx.actor_id),
             "tool is not permitted in this context"
@@ -512,6 +590,9 @@ impl Gateway {
         received_at: i64,
         source_key: Option<String>,
     ) -> Result<ToolOutcome> {
+        let tool = self.registry.get(name)?;
+        let spec = tool.spec();
+        require_transaction_tool(&spec)?;
         let key = scope.key();
         let access_revision = self
             .store
@@ -520,8 +601,6 @@ impl Gateway {
                 None => crate::access::require_enabled(db, &key),
             })
             .await?;
-        let tool = self.registry.get(name)?;
-        let spec = tool.spec();
         ensure!(
             tool.permits(&scope, actor),
             "tool is not permitted in this context"
@@ -560,6 +639,7 @@ impl Gateway {
         cancel: CancellationToken,
     ) -> Result<ToolOutcome> {
         let spec = tool.spec();
+        require_transaction_tool(&spec)?;
         check_runtime(self.epochs()?, &bound, spec.plugin)?;
         let args_json = canonical(&args)?;
         let args_hash = hash(&args_json);
@@ -619,6 +699,7 @@ impl Gateway {
             ensure!(allowed.contains(&name), "tool is no longer allowed");
             let tool = registry.get(&name)?;
             let spec = tool.spec();
+            require_transaction_tool(&spec)?;
             ensure!(tool.permits(&scope,actor),"tool is not permitted in this context");
             ensure!(spec.version == version && spec.plugin == plugin, "tool changed; request again");
             ensure!(schema_hash == hash(&canonical(&spec.parameters)?),"tool schema changed; request again");
@@ -676,6 +757,7 @@ mod tests {
             .unwrap();
         store.call(|conn|{conn.execute("INSERT INTO ai_conversations(id,scope,mode,epoch) VALUES('conversation','1:group:2','group',1)",[])?;Ok(())}).await.unwrap();
         let mut registry = ToolRegistry::new();
+        register_reply(&mut registry).unwrap();
         clock::register(&mut registry).unwrap();
         reminder::register(&mut registry, 10).unwrap();
         reminder::migrate(&store).await.unwrap();
@@ -712,6 +794,95 @@ mod tests {
             } => (operation_id, token),
             _ => panic!("expected confirmation"),
         }
+    }
+
+    #[tokio::test]
+    async fn final_reply_is_advertised_but_never_runs_as_a_transaction() {
+        let (store, gateway, ctx) = setup().await;
+        let definitions = gateway.definitions(&ctx).await.unwrap();
+        let reply = definitions
+            .iter()
+            .find(|definition| definition["function"]["name"] == "reply_message")
+            .unwrap();
+        assert_eq!(
+            reply["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(reply["function"]["parameters"]["required"], json!(["text"]));
+        assert_eq!(
+            reply["function"]["parameters"]["properties"]["mention_users"]["maxItems"],
+            3
+        );
+        let args = json!({"reply_to":null,"mention_users":[],"text":"reply"});
+        let error = gateway
+            .execute(&ctx, "reply_message", args.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("chat dispatcher"));
+        let error = gateway
+            .direct(
+                ctx.scope.clone(),
+                ctx.actor_id,
+                "reply_message",
+                args.clone(),
+                now(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("chat dispatcher"));
+        let bound = BoundContext {
+            scope: ctx.scope.clone(),
+            actor_id: ctx.actor_id,
+            guard: Some(ctx.guard.clone()),
+            ai_epoch: Some(ctx.ai_epoch),
+            provider_epoch: ctx.provider_epochs["ai"],
+            access_revision: ctx.access_revision,
+        };
+        let error = gateway
+            .run(
+                Arc::new(ReplyTool),
+                args,
+                bound.clone(),
+                "must-not-exist".into(),
+                true,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("chat dispatcher"));
+        let context_json = serde_json::to_string(&bound).unwrap();
+        store.call(move |db| {
+            let count: i64 = db.query_row("SELECT count(*) FROM tool_runs", [], |row| row.get(0))?;
+            assert_eq!(count, 0);
+            // A stale or forged confirmation row must not turn a final reply
+            // into a transactional operation, including successful replays.
+            db.execute("INSERT INTO tool_runs(operation_id,tool_name,tool_version,plugin_id,context_json,args_json,scope_key,actor_id,args_hash,schema_hash,status,token,expires_at,result_json,receipt,created_at) VALUES('legacy-reply','reply_message',1,'ai',?1,'{}',?2,?3,'unused','unused','succeeded','reply-token',?4,'{}','reply',?5)", params![context_json,bound.scope.key(),bound.actor_id,now()+300,now()])?;
+            Ok(())
+        }).await.unwrap();
+        let error = gateway
+            .confirm(&ctx.scope, ctx.actor_id, "reply-token")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("chat dispatcher"));
+        let only_clock = Gateway::new(
+            store.clone(),
+            "UTC",
+            gateway.registry.clone(),
+            vec!["clock_now".into()],
+        )
+        .unwrap();
+        only_clock.migrate().await.unwrap();
+        assert!(
+            only_clock
+                .definitions(&ctx)
+                .await
+                .unwrap()
+                .iter()
+                .all(|definition| definition["function"]["name"] != "reply_message")
+        );
+        ctx.cancel.cancel();
+        assert!(gateway.definitions(&ctx).await.unwrap().is_empty());
+        store.stop().await.unwrap();
     }
 
     #[tokio::test]
