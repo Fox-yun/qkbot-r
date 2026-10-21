@@ -10,14 +10,30 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> Result<()> {
     let mut path = PathBuf::from("config.toml");
     let mut check = false;
+    let mut rebuild = None;
+    let mut rebuild_status = None;
+    let mut rebuild_batches = 1000;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => path = PathBuf::from(args.next().context("--config 需要文件路径")?),
             "--check" => check = true,
+            "--rebuild-memory" => {
+                rebuild = Some(args.next().context("--rebuild-memory 需要任务名")?)
+            }
+            "--memory-rebuild-status" => {
+                rebuild_status = Some(args.next().context("--memory-rebuild-status 需要任务名")?)
+            }
+            "--rebuild-max-batches" => {
+                rebuild_batches = args
+                    .next()
+                    .context("--rebuild-max-batches 需要数量")?
+                    .parse::<usize>()
+                    .context("回扫批次数无效")?
+            }
             "--help" | "-h" => {
                 println!(
-                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN、QKBOT_NONEBOT_TOKEN"
+                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n--rebuild-memory TASK [--rebuild-max-batches N] 补整理当前会话保留的可学历史，同名任务可续跑；不启动机器人、不改变摘要和正常游标。\n--memory-rebuild-status TASK 查看回扫统计。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN、QKBOT_NONEBOT_TOKEN"
                 );
                 return Ok(());
             }
@@ -27,6 +43,27 @@ async fn main() -> Result<()> {
             }
             _ => anyhow::bail!("未知参数：{arg}"),
         }
+    }
+    anyhow::ensure!(
+        usize::from(check) + usize::from(rebuild.is_some()) + usize::from(rebuild_status.is_some())
+            <= 1,
+        "校验、历史回扫和状态查询不能同时运行"
+    );
+    if let Some(id) = rebuild_status {
+        return qkbot::plugins::ai::memory_rebuild::show_status(&path, &id);
+    }
+    if let Some(id) = rebuild {
+        let result = qkbot::plugins::ai::memory_rebuild::run(&path, &id, rebuild_batches).await;
+        if let Err(error) = result {
+            // Only the outer fixed stage is logged. Provider output, source
+            // quotes, SQL parameters and credentials must not reach the CLI.
+            eprintln!(
+                "{}",
+                qkbot::plugins::ai::memory_rebuild::failure_diagnostic(&error)
+            );
+            anyhow::bail!("历史回扫未完成，已提交进度保留，可使用同一任务名续跑");
+        }
+        return Ok(());
     }
     if check {
         let config = Config::load(&path)?;

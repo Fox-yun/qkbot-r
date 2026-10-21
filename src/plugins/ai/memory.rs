@@ -1,4 +1,5 @@
 //! Bounded lexical memory and context assembly. No embedding model or vector service.
+pub mod rebuild;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -706,9 +707,9 @@ fn retrieve(
             .map(|r| decode_memory(r?))
             .collect::<Result<Vec<_>>>()?;
     }
-    // Stable preferences and pending tasks remain useful when the user's wording changes.
+    // Explicit personal background also helps when the question has no lexical match.
     let mut seen: HashSet<i64> = found.iter().map(|m| m.id).collect();
-    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND kind IN('preference','task') AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
+    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (kind IN('preference','task') OR (kind='fact' AND substr(trim(text),1,5) IN('人物背景：','人物背景:'))) AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
     for row in stmt.query_map(
         params![guard.conversation_id, subject_id, now(), candidates],
         memory_row,
@@ -746,6 +747,37 @@ pub(crate) fn validate_ttl(ttl: Option<u16>) -> Result<()> {
         ttl.is_none_or(|days| (1..=365).contains(&days)),
         "memory TTL must be 1..=365 days"
     );
+    Ok(())
+}
+
+fn validate_profile(
+    kind: MemoryKind,
+    text: &str,
+    evidence: &[Evidence],
+    ttl: Option<u16>,
+) -> Result<()> {
+    let text = text.trim_start();
+    if text.starts_with("聊天观察：") || text.starts_with("聊天观察:") {
+        ensure!(
+            kind == MemoryKind::Preference,
+            "chat observations must be preferences"
+        );
+        ensure!(
+            ttl.is_some_and(|days| (7..=30).contains(&days)),
+            "chat observations need a 7..30 day TTL"
+        );
+        let sources: HashSet<_> = evidence.iter().map(|item| &item.source_key).collect();
+        ensure!(
+            sources.len() >= 2,
+            "chat observations need two distinct human messages"
+        );
+    }
+    if text.starts_with("人物背景：") || text.starts_with("人物背景:") {
+        ensure!(
+            kind == MemoryKind::Fact,
+            "personal background must be a fact"
+        );
+    }
     Ok(())
 }
 
@@ -1124,6 +1156,11 @@ fn memory_commit_failure_reason(error: &anyhow::Error) -> &'static str {
         "summary exceeds 1500 characters" => "summary_character_limit",
         "summary exceeds next-input byte budget" => "summary_byte_budget",
         "too many memory changes" => "change_count",
+        "chat observations must be preferences" | "personal background must be a fact" => {
+            "profile_kind"
+        }
+        "chat observations need a 7..30 day TTL" => "profile_ttl",
+        "chat observations need two distinct human messages" => "profile_evidence",
         "automatic memory writes are disabled" => "memory_write_disabled",
         "summary generation is disabled for this batch" => "summary_disabled",
         "conversation changed; stale memory operation rejected" => "stale_conversation",
@@ -1218,13 +1255,14 @@ fn commit_batch_inner(
             MemoryChange::Upsert {
                 id,
                 subject_id,
-                kind: _,
+                kind,
                 text,
                 evidence,
                 ttl_days,
             } => {
                 validate_text(text)?;
                 validate_ttl(*ttl_days)?;
+                validate_profile(*kind, text, evidence, *ttl_days)?;
                 (*id, *subject_id, evidence)
             }
         };

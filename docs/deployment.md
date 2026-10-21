@@ -369,6 +369,46 @@ QKBOT_CONTAINER=qkbot-restored QKBOT_VOLUME=qkbot-restored sh deploy/podman.sh s
 
 跨机器 UID 映射不同、或从普通目录导入时，先验证 UID 10001 可读写。保留备份，直到登录、历史和插件状态核对完毕。[卷导出文档](https://docs.podman.io/en/stable/markdown/podman-volume-export.1.html)
 
+### 9.1 历史记忆重整
+
+升级到支持此命令的版本后，可为仍保留的历史原文创建一次可续跑的补整理任务。先短暂停止小鱼主进程，按本节步骤完整备份配置和数据库所在数据卷，再恢复服务；Quadlet 使用 `systemctl --user stop qkbot.service` 后直接导出 `qkbot-data`，备份完成后执行 `systemctl --user start qkbot.service`。备份包含凭据和历史，使用 `umask 077` 创建并妥善保管。回扫期间小鱼可以继续服务，LLBot／Milky 也须保持在线，命令需要核验当前机器人账号。
+
+原生部署使用相同配置和数据库路径运行：
+
+```bash
+# 创建任务并冻结来源窗口，不调用模型。
+qkbot --config /path/to/config.toml --rebuild-memory daily-memory-20261021 --rebuild-max-batches 0
+
+# 每次最多处理 20 批；再次执行同一命令会从已提交进度续跑。
+qkbot --config /path/to/config.toml --rebuild-memory daily-memory-20261021 --rebuild-max-batches 20
+
+# 查询任务统计，不调用模型。
+qkbot --config /path/to/config.toml --memory-rebuild-status daily-memory-20261021
+```
+
+`TASK` 为 1–64 个 ASCII 字母、数字、`-`、`_` 或 `.`。`--rebuild-max-batches N` 限制本次运行的处理批数，默认 `1000`，允许 `0–10000`。`0` 会核验 Milky 账号、写入任务记录并冻结窗口，不是只读预览。任务名与首次核验的账号、会话边界和来源上限绑定；同名续跑不扩大范围，也不重复提交已完成批次。状态包含已完成子任务、处理批数、来源数、新增数、重复数和已过期候选数。
+
+容器部署推荐在完成备份并恢复服务后，直接在当前容器执行维护命令，复用已经部署的程序、配置、凭据和网络：
+
+```bash
+podman exec qkbot /usr/local/bin/qkbot --config /data/config.toml \
+  --rebuild-memory daily-memory-20261021 --rebuild-max-batches 0
+
+podman exec qkbot /usr/local/bin/qkbot --config /data/config.toml \
+  --rebuild-memory daily-memory-20261021 --rebuild-max-batches 20
+
+podman exec qkbot /usr/local/bin/qkbot --config /data/config.toml \
+  --memory-rebuild-status daily-memory-20261021
+```
+
+容器名称或配置路径不同时替换为实际值。维护命令通过事务检查来源和记忆版本；正常后台整理并发更新时，当前批次不会以旧快照提交，会重新读取后再尝试。无需为了整个回扫过程保持停机，也不要并行执行多个同名回扫命令。
+
+任务只选取当前账号、当前会话版本、当前有效聊天范围内，未暂停且允许记忆写入的会话。来源必须是当时已标记可学习的真人原文，并继续通过撤回、遗忘和人物归属检查。首次冻结的窗口包括符合条件的已处理及未处理原文；冻结的是范围，并不额外保存原文副本。已过保留期被清理的消息、旧会话版本及当时不可学习的消息无法补回。会话边界、权限或配置发生变化时，检查可能中止本次执行，应先核对原因；额度暂时耗尽或请求失败时，已提交进度保留，可稍后使用同名任务续跑。
+
+重整只插入缺失项。模型会只读参考同一会话、同一人物的全部既有记忆，包括人工、锁定、停用和过期记录；不修改或删除旧记忆，不恢复停用或过期项。临时记忆按证据原消息时间计算有效期，已到期候选跳过。人物背景、兴趣习惯及交流偏好须有本人原文；“聊天观察”须有本人两条不同消息的证据，并设置 7–30 天有效期。记忆容量限制仍生效，不通过淘汰旧记忆为回扫腾出空间。
+
+维护命令不启动 `Host`，不启动 QQ 消息处理或管理服务，不修改发送账本（outbox）、人设、摘要或正常记忆整理游标。它会写入自己的任务进度、新增记忆和模型用量；模型调用与日常后台整理共用现有每小时额度。当前回扫输入预算为 `32768`，输出预算读取 `[plugins.ai].memory_output_budget`（默认 `3200`），不会将预算或其他参数写回配置。原文和完整去重参考放不进预算时会停止，不通过截断既有记忆绕过去重。
+
 ## 10. 从原生部署迁移
 
 1. 正常停止原进程，备份配置、SQLite 和管理员凭据。

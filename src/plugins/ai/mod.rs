@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod memory;
+pub mod memory_rebuild;
 pub(crate) mod reply;
 pub(crate) mod trigger;
 pub(crate) mod vision;
