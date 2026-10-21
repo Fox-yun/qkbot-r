@@ -141,12 +141,14 @@ pub(crate) async fn load(
             host.milky.check_generation(generation)?;
             let url = host
                 .milky
-                .get_resource_temp_url(&key, &resource)
+                .get_image_resource_temp_url(&key, &resource, false)
                 .await
-                .inspect_err(|_| {
+                .inspect_err(|error| {
+                    let classified = error.downcast_ref::<crate::milky::ResourceLookupError>();
                     tracing::warn!(
                         stage = "resource_lookup",
-                        reason = "failed",
+                        step = classified.map_or("unknown", |error| error.stage),
+                        reason = classified.map_or("unclassified", |error| error.reason),
                         "AI image processing failed"
                     );
                 })?;
@@ -715,6 +717,35 @@ mod tests {
             .get_pixel(4, 4)
             .0;
         assert!(pixel[0] > 180 && pixel[2] < 80);
+    }
+
+    #[test]
+    fn transparent_webp_sticker_is_normalized_to_inline_jpeg() {
+        let image = image::RgbaImage::from_fn(16, 16, |x, _| {
+            if x < 8 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([230, 20, 20, 255])
+            }
+        });
+        let mut webp = Cursor::new(Vec::new());
+        image.write_to(&mut webp, ImageFormat::WebP).unwrap();
+        let encoded = encode_image(webp.into_inner()).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.strip_prefix("data:image/jpeg;base64,").unwrap())
+            .unwrap();
+        assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Jpeg);
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (16, 16));
+        assert!(
+            decoded
+                .get_pixel(2, 8)
+                .0
+                .iter()
+                .all(|channel| *channel > 245)
+        );
+        let red = decoded.get_pixel(13, 8).0;
+        assert!(red[0] > 210 && red[1] < 40 && red[2] < 40);
     }
 
     #[test]

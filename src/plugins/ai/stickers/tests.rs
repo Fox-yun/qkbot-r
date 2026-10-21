@@ -26,6 +26,7 @@ fn fixture() -> (Connection, Job, Import) {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(FIXTURE).unwrap();
     db.execute_batch(MIGRATION).unwrap();
+    db.execute_batch(ADMIN_MIGRATION).unwrap();
     db.execute("INSERT INTO ai_sticker_control VALUES(1,1,1,60)", [])
         .unwrap();
     let job = Job {
@@ -633,4 +634,482 @@ async fn cleanup_cannot_delete_an_import_file_before_its_metadata_commit() {
     drop(worker);
     library.cleanup().await.unwrap();
     assert!(!path.exists());
+}
+
+fn admin_actor() -> admin::AdminActor {
+    admin::AdminActor {
+        admin_id: "administrator".into(),
+        session_id: "session-a".into(),
+    }
+}
+
+#[test]
+fn admin_delete_blocks_old_imports_and_reindex_but_allows_a_new_received_source() {
+    let (mut db, mut job, image) = fixture();
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    let item = candidate(&db);
+    let pending = next_reindex(&db, "new-space", 64, 1).unwrap().unwrap();
+    admin::delete_entry(
+        &mut db,
+        &admin_actor(),
+        "delete",
+        &scope().key(),
+        item.id,
+        item.revision,
+    )
+    .unwrap();
+    assert!(commit_import(&mut db, &job, &image, &StickerConfig::default()).is_err());
+    assert!(commit_reindex(&mut db, &pending, "new-space", 64, &image.vector).is_err());
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM ai_sticker_sources", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // Same timestamp deliberately: the reception ID, not time precision, is the boundary.
+    db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,access_revision) VALUES('1:group:2:4','1:group:2','conversation',1,7,'user','',100,0)", []).unwrap();
+    job.key.message_seq = 4;
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    let restored = candidate(&db);
+    assert_ne!(restored.id, item.id);
+    assert!(check(&db, &item).is_err());
+    check(&db, &restored).unwrap();
+}
+
+#[test]
+fn admin_delete_is_scoped_revision_checked_and_session_bound_idempotent() {
+    let (mut db, job, image) = fixture();
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    let item = candidate(&db);
+    let actor = admin_actor();
+    let wrong_scope = admin::delete_entry(
+        &mut db,
+        &actor,
+        "scope",
+        "1:group:99",
+        item.id,
+        item.revision,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        wrong_scope.downcast_ref::<admin::AdminError>(),
+        Some(admin::AdminError::NotFound(_))
+    ));
+    let stale = admin::delete_entry(
+        &mut db,
+        &actor,
+        "stale",
+        &scope().key(),
+        item.id,
+        item.revision + 1,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        stale.downcast_ref::<admin::AdminError>(),
+        Some(admin::AdminError::Conflict(_))
+    ));
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM ai_sticker_deletions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let result = admin::delete_entry(
+        &mut db,
+        &actor,
+        "same-id",
+        &scope().key(),
+        item.id,
+        item.revision,
+    )
+    .unwrap();
+    assert_eq!(
+        admin::delete_entry(
+            &mut db,
+            &actor,
+            "same-id",
+            &scope().key(),
+            item.id,
+            item.revision
+        )
+        .unwrap(),
+        result
+    );
+    let changed_payload =
+        admin::request_reindex(&mut db, &actor, "same-id", &scope().key(), None, None).unwrap_err();
+    assert!(matches!(
+        changed_payload.downcast_ref::<admin::AdminError>(),
+        Some(admin::AdminError::Conflict(_))
+    ));
+    for actor in [
+        admin::AdminActor {
+            session_id: "session-b".into(),
+            ..actor.clone()
+        },
+        admin::AdminActor {
+            admin_id: "other-administrator".into(),
+            ..actor.clone()
+        },
+    ] {
+        let err = admin::delete_entry(
+            &mut db,
+            &actor,
+            "same-id",
+            &scope().key(),
+            item.id,
+            item.revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<admin::AdminError>(),
+            Some(admin::AdminError::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn admin_forced_reindex_keeps_vector_and_new_requests_supersede_inflight_work() {
+    let (mut db, job, image) = fixture();
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    let item = candidate(&db);
+    let actor = admin_actor();
+    assert!(next_reindex(&db, "space", 64, 1).unwrap().is_none());
+    admin::request_reindex(
+        &mut db,
+        &actor,
+        "first",
+        &scope().key(),
+        Some(item.id),
+        Some(item.revision),
+    )
+    .unwrap();
+    let pending = next_reindex(&db, "space", 64, 1).unwrap().unwrap();
+    assert_eq!(
+        db.query_row("SELECT vector FROM ai_stickers", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        image.vector
+    );
+    admin::request_reindex(
+        &mut db,
+        &actor,
+        "second",
+        &scope().key(),
+        Some(item.id),
+        Some(pending.revision),
+    )
+    .unwrap();
+    assert!(commit_reindex(&mut db, &pending, "space", 64, &image.vector).is_err());
+    let latest = next_reindex(&db, "space", 64, 1).unwrap().unwrap();
+    commit_reindex(&mut db, &latest, "space", 64, &image.vector).unwrap();
+    assert!(next_reindex(&db, "space", 64, 1).unwrap().is_none());
+    assert!(
+        !db.query_row("SELECT reindex_requested FROM ai_stickers", [], |r| r
+            .get::<_, bool>(0))
+            .unwrap()
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM ai_sticker_sources", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn admin_group_reindex_replay_does_not_enqueue_new_images_and_resets_backoff() {
+    let (mut db, job, image) = fixture();
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    db.execute("UPDATE ai_stickers SET retry_after=?1", [now() + 300])
+        .unwrap();
+    let actor = admin_actor();
+    let first =
+        admin::request_reindex(&mut db, &actor, "group", &scope().key(), None, None).unwrap();
+    assert_eq!(first["affected"], 1);
+    assert!(next_reindex(&db, "space", 64, 1).unwrap().is_some());
+    commit_import(&mut db, &job, &import(b"second"), &StickerConfig::default()).unwrap();
+    assert_eq!(
+        admin::request_reindex(&mut db, &actor, "group", &scope().key(), None, None).unwrap(),
+        first
+    );
+    assert_eq!(
+        db.query_row("SELECT SUM(reindex_requested) FROM ai_stickers", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    let other = admin::request_reindex(&mut db, &actor, "other", "2:group:2", None, None).unwrap();
+    assert_eq!(other["affected"], 0);
+}
+
+async fn admin_fixture() -> (tempfile::TempDir, Store, StickerStore, admin::StickerAdmin) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db"), 32).await.unwrap();
+    store.call(|db| {
+        db.execute_batch("CREATE TABLE ai_revoked_sources(source_key TEXT PRIMARY KEY,revoked_at INTEGER); INSERT INTO plugin_states VALUES('ai',1,1); INSERT INTO ai_conversations(id,scope,mode,epoch) VALUES('conversation','1:group:2','group',1); INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,access_revision) VALUES('1:group:2:3','1:group:2','conversation',1,7,'user','',100,0);")?;
+        Ok(())
+    }).await.unwrap();
+    let library = StickerStore::new(
+        store.clone(),
+        StickerConfig::default(),
+        dir.path().join("stickers"),
+    )
+    .unwrap();
+    library.init().await.unwrap();
+    let (_, job, image) = fixture();
+    store
+        .call(move |db| commit_import(db, &job, &image, &StickerConfig::default()))
+        .await
+        .unwrap();
+    let (original, thumb) = library.paths(&scope(), &hash(b"original")).unwrap();
+    write_blob(&original, b"original").await.unwrap();
+    write_blob(&thumb, b"thumb").await.unwrap();
+    let admin = admin::StickerAdmin::new(
+        store.clone(),
+        dir.path().join("stickers"),
+        Some(admin::IndexTarget {
+            fingerprint: "space".into(),
+            model: "synthetic-model".into(),
+            dimensions: 64,
+            enabled: false,
+        }),
+    )
+    .unwrap();
+    (dir, store, library, admin)
+}
+
+#[tokio::test]
+async fn admin_offline_browsing_checks_files_and_deletion_leaves_files_for_worker_gc() {
+    let (_dir, store, library, admin) = admin_fixture().await;
+    store
+        .call(|db| {
+            db.execute_batch(
+                "UPDATE ai_sticker_control SET enabled=0; UPDATE plugin_states SET enabled=0;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let groups = admin.groups(1).await.unwrap();
+    assert_eq!(groups["groups"][0]["count"], 1);
+    assert_eq!(groups["index"]["enabled"], false);
+    let items = admin.items(&scope().key(), 1).await.unwrap();
+    let item = &items["items"][0];
+    let id = item["id"].as_i64().unwrap();
+    let revision = item["revision"].as_i64().unwrap();
+    assert_eq!(item["index_status"], "ready");
+    assert_eq!(item["source_available"], true);
+    for private in ["hash", "thumbnail_hash", "vector", "path", "fingerprint"] {
+        assert!(item.get(private).is_none());
+    }
+    assert_eq!(
+        admin
+            .image(&scope().key(), id, None, admin::AssetKind::Preview)
+            .await
+            .unwrap()
+            .bytes,
+        b"thumb"
+    );
+    assert_eq!(
+        admin
+            .image(
+                &scope().key(),
+                id,
+                Some(revision),
+                admin::AssetKind::Original
+            )
+            .await
+            .unwrap()
+            .bytes,
+        b"original"
+    );
+    assert!(
+        admin
+            .image("1:group:99", id, None, admin::AssetKind::Original)
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .image(
+                &scope().key(),
+                id,
+                Some(revision + 1),
+                admin::AssetKind::Original
+            )
+            .await
+            .is_err()
+    );
+    let (original, thumb) = library.paths(&scope(), &hash(b"original")).unwrap();
+    tokio::fs::write(&thumb, b"wrong").await.unwrap();
+    assert!(
+        admin
+            .image(&scope().key(), id, None, admin::AssetKind::Preview)
+            .await
+            .is_err()
+    );
+    admin
+        .delete(&admin_actor(), "delete", &scope().key(), id, revision)
+        .await
+        .unwrap();
+    assert!(original.exists() && thumb.exists());
+    assert!(
+        admin
+            .image(&scope().key(), id, None, admin::AssetKind::Original)
+            .await
+            .is_err()
+    );
+    library.cleanup().await.unwrap();
+    assert!(!original.exists() && !thumb.exists());
+    store.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_queue_survives_store_reopen_and_lists_pending_or_failed_without_network() {
+    let (dir, store, _library, admin) = admin_fixture().await;
+    let value = admin
+        .reindex(&admin_actor(), "queue", &scope().key(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(value["affected"], 1);
+    let pending = admin.items(&scope().key(), 1).await.unwrap();
+    assert_eq!(pending["items"][0]["index_status"], "pending");
+    store.stop().await.unwrap();
+    let reopened = Store::open(dir.path().join("test.db"), 32).await.unwrap();
+    init_store(&reopened).await.unwrap();
+    let api =
+        admin::StickerAdmin::new(reopened.clone(), dir.path().join("stickers"), None).unwrap();
+    assert_eq!(
+        api.items(&scope().key(), 1).await.unwrap()["items"][0]["index_status"],
+        "pending"
+    );
+    assert_eq!(
+        api.reindex(&admin_actor(), "queue", &scope().key(), None, None)
+            .await
+            .unwrap(),
+        value
+    );
+    reopened
+        .call(|db| {
+            db.execute("UPDATE ai_stickers SET retry_after=?1", [now() + 300])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        api.items(&scope().key(), 1).await.unwrap()["items"][0]["index_status"],
+        "failed"
+    );
+    assert_eq!(api.groups(1).await.unwrap()["groups"][0]["failed"], 1);
+    reopened.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_pagination_validates_inputs_and_revoked_assets_are_not_readable() {
+    let (_dir, store, _library, admin) = admin_fixture().await;
+    let (_, job, _) = fixture();
+    store
+        .call(move |db| {
+            for i in 0..20 {
+                commit_import(
+                    db,
+                    &job,
+                    &import(format!("extra-{i}").as_bytes()),
+                    &StickerConfig::default(),
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let first = admin.items(&scope().key(), 1).await.unwrap();
+    let second = admin.items(&scope().key(), 2).await.unwrap();
+    assert_eq!(first["total"], 21);
+    assert_eq!(first["total_pages"], 2);
+    assert_eq!(first["items"].as_array().unwrap().len(), 20);
+    assert_eq!(second["items"].as_array().unwrap().len(), 1);
+    assert!(admin.groups(0).await.is_err());
+    for bad in ["1:friend:2", "01:group:2", "1:group:0", "../1:group:2"] {
+        assert!(admin.items(bad, 1).await.is_err());
+    }
+    assert!(
+        admin
+            .reindex(&admin_actor(), "bad", &scope().key(), Some(1), None)
+            .await
+            .is_err()
+    );
+    store
+        .call(|db| {
+            db.execute("INSERT INTO ai_sticker_revoked VALUES('1:group:2:3',1)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        admin.items(&scope().key(), 2).await.unwrap()["items"][0]["source_available"],
+        false
+    );
+    assert!(
+        admin
+            .image(
+                &scope().key(),
+                second["items"][0]["id"].as_i64().unwrap(),
+                None,
+                admin::AssetKind::Original
+            )
+            .await
+            .is_err()
+    );
+    store.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_v2_migration_preserves_v1_vector_and_does_not_enable_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db"), 32).await.unwrap();
+    store.migrate("ai_stickers", 1, MIGRATION).await.unwrap();
+    store.call(|db| {
+        db.execute("INSERT INTO ai_sticker_control VALUES(1,0,7,120)",[])?;
+        let image=import(b"legacy");
+        db.execute("INSERT INTO ai_stickers(scope,hash,mime,original_bytes,thumbnail_bytes,thumbnail_hash,fingerprint,dimensions,vector,created_at,updated_at) VALUES('1:group:2',?1,'image/gif',6,5,?2,'space',64,?3,1,1)",params![image.hash,image.thumbnail_hash,image.vector])?;
+        Ok(())
+    }).await.unwrap();
+    init_store(&store).await.unwrap();
+    init_store(&store).await.unwrap();
+    store
+        .call(|db| {
+            assert_eq!(
+                db.query_row(
+                    "SELECT enabled,revision,cooldown_secs FROM ai_sticker_control",
+                    [],
+                    |r| Ok((
+                        r.get::<_, bool>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?
+                    ))
+                )?,
+                (false, 7, 120)
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT vector,reindex_requested FROM ai_stickers",
+                    [],
+                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, bool>(1)?))
+                )?,
+                (import(b"legacy").vector, false)
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE plugin_id='ai_stickers'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                2
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.stop().await.unwrap();
 }

@@ -149,6 +149,110 @@ impl std::fmt::Display for MilkyAccountChanged {
 }
 impl std::error::Error for MilkyAccountChanged {}
 
+// These classifications contain only local, fixed reasons. Provider bodies,
+// resource identifiers and signed URLs must never become diagnostic messages.
+#[derive(Debug, Clone, Copy)]
+enum ReadFailure {
+    Transport,
+    Http(u16),
+    BodyRead,
+    BodyLimit,
+    InvalidJson,
+    ApiRejected,
+    InvalidEnvelope,
+}
+
+impl ReadFailure {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Http(408 | 429 | 500..=599) => "http_unavailable",
+            Self::Http(_) => "http_rejected",
+            Self::BodyRead => "body_read",
+            Self::BodyLimit => "body_limit",
+            Self::InvalidJson => "invalid_json",
+            Self::ApiRejected => "api_rejected",
+            Self::InvalidEnvelope => "invalid_envelope",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Transport
+                | Self::Http(408 | 429 | 500..=599)
+                | Self::BodyRead
+                | Self::ApiRejected
+        )
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => formatter.write_str("Milky transport failed"),
+            Self::Http(status) => write!(formatter, "Milky HTTP status {status}"),
+            Self::BodyRead => formatter.write_str("HTTP response body could not be read"),
+            Self::BodyLimit => formatter.write_str("HTTP response exceeds configured limit"),
+            Self::InvalidJson => formatter.write_str("invalid Milky JSON"),
+            Self::ApiRejected | Self::InvalidEnvelope => {
+                formatter.write_str("Milky API returned failure or malformed envelope")
+            }
+        }
+    }
+}
+impl std::error::Error for ReadFailure {}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResourceLookupError {
+    pub stage: &'static str,
+    pub reason: &'static str,
+    retryable: bool,
+}
+
+impl ResourceLookupError {
+    fn rejected(stage: &'static str, reason: &'static str) -> Self {
+        Self {
+            stage,
+            reason,
+            retryable: false,
+        }
+    }
+
+    fn read(stage: &'static str, error: anyhow::Error) -> Self {
+        let failure = error.downcast_ref::<ReadFailure>().copied();
+        Self {
+            stage,
+            reason: failure.map_or("unclassified", ReadFailure::reason),
+            retryable: failure.is_some_and(ReadFailure::retryable),
+        }
+    }
+
+    pub(crate) fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl std::fmt::Display for ResourceLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Milky resource lookup failed ({}: {})",
+            self.stage, self.reason
+        )
+    }
+}
+impl std::error::Error for ResourceLookupError {}
+
+#[derive(Clone, Copy)]
+enum ResourceKind {
+    Any,
+    Image { sticker: bool },
+}
+
+const RESOURCE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const RESOURCE_RETRY_WINDOW: Duration = Duration::from_secs(2);
+
 impl Milky {
     pub fn new(config: MilkyConfig, http: reqwest::Client) -> Result<Self> {
         let mut base = reqwest::Url::parse(&config.url).context("invalid Milky URL")?;
@@ -209,15 +313,19 @@ impl Milky {
             .request(api, body)?
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("Milky transport failed"))?;
-        ensure!(
-            response.status().is_success(),
-            "Milky HTTP status {}",
-            response.status().as_u16()
-        );
+            .map_err(|_| ReadFailure::Transport)?;
+        if !response.status().is_success() {
+            return Err(ReadFailure::Http(response.status().as_u16()).into());
+        }
         let body = read_bounded(response, self.config.max_response_bytes).await?;
-        let response: Value = serde_json::from_slice(&body).context("invalid Milky JSON")?;
-        check_envelope(&response)?;
+        let response: Value =
+            serde_json::from_slice(&body).map_err(|_| ReadFailure::InvalidJson)?;
+        if response["status"] == "failed"
+            && response["retcode"].as_i64().is_some_and(|code| code != 0)
+        {
+            return Err(ReadFailure::ApiRejected.into());
+        }
+        check_envelope(&response).map_err(|_| ReadFailure::InvalidEnvelope)?;
         Ok(response["data"].clone())
     }
 
@@ -346,13 +454,16 @@ impl Milky {
                 json!({"message_scene": key.scope.scene.as_str(),
             "peer_id": key.scope.peer_id, "message_seq": key.message_seq}),
             )
-            .await?;
+            .await
+            .map_err(|error| ResourceLookupError::read("message_lookup", error))?;
         self.check_generation(generation)?;
-        let message = normalize_message(key.scope.bot_id, &data["message"], now())?;
-        ensure!(
-            message.key == *key,
-            "Milky quote response does not match requested message key"
-        );
+        let message = normalize_message(key.scope.bot_id, &data["message"], now())
+            .map_err(|_| ResourceLookupError::rejected("message_validation", "invalid_message"))?;
+        if message.key != *key {
+            return Err(
+                ResourceLookupError::rejected("message_validation", "message_mismatch").into(),
+            );
+        }
         Ok(data["message"].clone())
     }
 
@@ -424,29 +535,151 @@ impl Milky {
         key: &MessageKey,
         resource_id: &str,
     ) -> Result<String> {
-        ensure!(
-            !resource_id.is_empty() && resource_id.len() <= 4096,
-            "invalid resource ID"
-        );
-        let generation = self.scope_generation(&key.scope)?;
-        let message = self.get_message_raw(key).await?;
+        self.resource_temp_url(key, resource_id, ResourceKind::Any)
+            .await
+    }
+
+    /// Image collection validates its subtype in the same fresh message lookup
+    /// as resource ownership; a retry cannot turn a regular image into a sticker.
+    pub(crate) async fn get_image_resource_temp_url(
+        &self,
+        key: &MessageKey,
+        resource_id: &str,
+        require_sticker: bool,
+    ) -> Result<String> {
+        self.resource_temp_url(
+            key,
+            resource_id,
+            ResourceKind::Image {
+                sticker: require_sticker,
+            },
+        )
+        .await
+    }
+
+    async fn resource_temp_url(
+        &self,
+        key: &MessageKey,
+        resource_id: &str,
+        kind: ResourceKind,
+    ) -> Result<String> {
+        let generation = self.scope_generation(&key.scope).map_err(|_| {
+            ResourceLookupError::rejected("account_validation", "account_unverified")
+        })?;
+        let deadline = tokio::time::Instant::now() + RESOURCE_RETRY_WINDOW;
+        for attempt in 1..=2 {
+            self.check_generation(generation).map_err(|_| {
+                ResourceLookupError::rejected("account_validation", "account_changed")
+            })?;
+            let lookup = self.resource_temp_url_once(key, resource_id, kind);
+            // Do not multiply the caller's configured read timeout. Only quick
+            // failures can retry, and the retry consumes this short window.
+            let result = if attempt == 1 {
+                lookup.await
+            } else {
+                tokio::time::timeout_at(deadline, lookup)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ResourceLookupError::rejected("retry", "retry_timeout").into())
+                    })
+            };
+            match result {
+                Ok(url) => {
+                    self.check_generation(generation).map_err(|_| {
+                        ResourceLookupError::rejected("account_validation", "account_changed")
+                    })?;
+                    if attempt > 1 {
+                        tracing::info!(
+                            stage = "resource_lookup",
+                            status = "recovered",
+                            attempt,
+                            "Milky resource lookup recovered"
+                        );
+                    }
+                    return Ok(url);
+                }
+                Err(error) => {
+                    self.check_generation(generation).map_err(|_| {
+                        ResourceLookupError::rejected("account_validation", "account_changed")
+                    })?;
+                    let classified = error.downcast_ref::<ResourceLookupError>();
+                    let retrying = attempt == 1
+                        && classified.is_some_and(ResourceLookupError::retryable)
+                        && tokio::time::Instant::now() + RESOURCE_RETRY_DELAY < deadline;
+                    tracing::warn!(
+                        stage = "resource_lookup",
+                        step = classified.map_or("unknown", |error| error.stage),
+                        reason = classified.map_or("unclassified", |error| error.reason),
+                        attempt,
+                        retrying,
+                        "Milky resource lookup failed"
+                    );
+                    if !retrying {
+                        return Err(error);
+                    }
+                    // Dropping the calling future (vision timeout, cancellation
+                    // or shutdown) also cancels this wait and the second read.
+                    tokio::time::sleep(RESOURCE_RETRY_DELAY).await;
+                }
+            }
+        }
+        unreachable!("the second lookup always returns")
+    }
+
+    async fn resource_temp_url_once(
+        &self,
+        key: &MessageKey,
+        resource_id: &str,
+        kind: ResourceKind,
+    ) -> Result<String> {
+        if resource_id.is_empty() || resource_id.len() > 4096 {
+            return Err(
+                ResourceLookupError::rejected("resource_validation", "invalid_resource").into(),
+            );
+        }
+        let generation = self.scope_generation(&key.scope).map_err(|_| {
+            ResourceLookupError::rejected("account_validation", "account_unverified")
+        })?;
+        let message = self.get_message_raw(key).await.map_err(|error| {
+            if error.is::<ResourceLookupError>() {
+                error
+            } else {
+                ResourceLookupError::rejected("message_validation", "source_unavailable").into()
+            }
+        })?;
         let contains = message["segments"].as_array().is_some_and(|segments| {
             segments.iter().any(|segment| {
-                matches!(segment["type"].as_str(), Some("image" | "record" | "video"))
+                let allowed_kind = match kind {
+                    ResourceKind::Any => {
+                        matches!(segment["type"].as_str(), Some("image" | "record" | "video"))
+                    }
+                    ResourceKind::Image { sticker } => {
+                        segment["type"] == "image"
+                            && (!sticker || segment["data"]["sub_type"] == "sticker")
+                    }
+                };
+                allowed_kind
                     && (segment["data"]["resource_id"].as_str() == Some(resource_id)
-                        || segment["data"]["thumb_resource_id"].as_str() == Some(resource_id))
+                        || (matches!(kind, ResourceKind::Any)
+                            && segment["data"]["thumb_resource_id"].as_str() == Some(resource_id)))
             })
         });
-        ensure!(
-            contains,
-            "resource does not belong to the requested message"
-        );
+        if !contains {
+            return Err(
+                ResourceLookupError::rejected("resource_membership", "resource_mismatch").into(),
+            );
+        }
         let data = self
             .call("get_resource_temp_url", json!({"resource_id":resource_id}))
-            .await?;
-        self.check_generation(generation)?;
-        let url = data["url"].as_str().context("Milky resource URL missing")?;
-        validate_media_uri(url)?;
+            .await
+            .map_err(|error| ResourceLookupError::read("temp_url_lookup", error))?;
+        self.check_generation(generation)
+            .map_err(|_| ResourceLookupError::rejected("account_validation", "account_changed"))?;
+        let url = data["url"]
+            .as_str()
+            .ok_or_else(|| ResourceLookupError::rejected("url_validation", "missing_url"))?;
+        validate_media_uri(url)
+            .map_err(|_| ResourceLookupError::rejected("url_validation", "invalid_url"))?;
         Ok(url.to_owned())
     }
 
@@ -1082,22 +1315,17 @@ fn check_envelope(value: &Value) -> Result<()> {
 }
 
 pub(crate) async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
-    ensure!(
-        response
-            .content_length()
-            .is_none_or(|length| length <= limit as u64),
-        "HTTP response exceeds configured limit"
-    );
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| anyhow::anyhow!("HTTP response body could not be read"))?
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
     {
-        ensure!(
-            chunk.len() <= limit.saturating_sub(bytes.len()),
-            "HTTP response exceeds configured limit"
-        );
+        return Err(ReadFailure::BodyLimit.into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ReadFailure::BodyRead)? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(ReadFailure::BodyLimit.into());
+        }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
@@ -1439,6 +1667,229 @@ pub(crate) mod tests {
         milky.logged_in.store(123, Ordering::Release);
         milky.verification.store(1, Ordering::Release);
         milky
+    }
+
+    struct ResourcePeer {
+        milky: Milky,
+        calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ResourcePeer {
+        async fn new(responses: Vec<Value>) -> Self {
+            use axum::{
+                Json, Router,
+                extract::{Path, State},
+                routing::post,
+            };
+            use std::{collections::VecDeque, sync::Mutex};
+            type StateData = (
+                Arc<Mutex<Vec<(String, Value)>>>,
+                Arc<Mutex<VecDeque<Value>>>,
+            );
+            async fn reply(
+                State((calls, responses)): State<StateData>,
+                Path(api): Path<String>,
+                Json(body): Json<Value>,
+            ) -> Json<Value> {
+                calls.lock().unwrap().push((api, body));
+                Json(responses.lock().unwrap().pop_front().unwrap_or_else(
+                    || json!({"status":"failed","retcode":-1,"message":"unexpected extra call"}),
+                ))
+            }
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let milky = verified(format!("http://{}", listener.local_addr().unwrap()));
+            let cancel = CancellationToken::new();
+            let shutdown = cancel.clone();
+            let app = Router::new()
+                .route("/api/{api}", post(reply))
+                .with_state((calls.clone(), Arc::new(Mutex::new(responses.into()))));
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+            });
+            Self {
+                milky,
+                calls,
+                cancel,
+                task,
+            }
+        }
+
+        async fn close(self) {
+            self.cancel.cancel();
+            self.task.await.unwrap();
+        }
+    }
+
+    fn resource_key() -> MessageKey {
+        MessageKey {
+            scope: Scope {
+                bot_id: 123,
+                scene: Scene::Group,
+                peer_id: 456,
+            },
+            message_seq: 7,
+        }
+    }
+
+    fn resource_message() -> Value {
+        json!({"status":"ok","retcode":0,"data":{"message":{
+            "message_scene":"group","peer_id":456,"message_seq":7,"sender_id":789,
+            "segments":[{"type":"image","data":{"resource_id":"synthetic-resource","sub_type":"sticker"}}]
+        }}})
+    }
+
+    fn resource_url() -> Value {
+        json!({"status":"ok","retcode":0,"data":{"url":"https://gchat.qpic.cn/synthetic-image"}})
+    }
+
+    #[tokio::test]
+    async fn resource_lookup_retries_temporary_message_failure_for_sticker_collection() {
+        let peer = ResourcePeer::new(vec![
+            json!({"status":"failed","retcode":-1,"message":"synthetic unavailable"}),
+            resource_message(),
+            resource_url(),
+        ])
+        .await;
+        assert_eq!(
+            peer.milky
+                .get_image_resource_temp_url(&resource_key(), "synthetic-resource", true)
+                .await
+                .unwrap(),
+            "https://gchat.qpic.cn/synthetic-image"
+        );
+        let calls = peer.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(
+            calls[0],
+            (
+                "get_message".into(),
+                json!({"message_scene":"group","peer_id":456,"message_seq":7})
+            )
+        );
+        assert_eq!(
+            calls[2],
+            (
+                "get_resource_temp_url".into(),
+                json!({"resource_id":"synthetic-resource"})
+            )
+        );
+        peer.close().await;
+    }
+
+    #[tokio::test]
+    async fn resource_lookup_rechecks_original_message_before_retrying_temp_url() {
+        let peer = ResourcePeer::new(vec![
+            resource_message(),
+            json!({"status":"failed","retcode":-1,"message":"synthetic unavailable"}),
+            resource_message(),
+            resource_url(),
+        ])
+        .await;
+        peer.milky
+            .get_resource_temp_url(&resource_key(), "synthetic-resource")
+            .await
+            .unwrap();
+        let calls = peer.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], calls[2]);
+        assert_eq!(calls[1], calls[3]);
+        assert_eq!(calls[0].0, "get_message");
+        assert_eq!(calls[1].0, "get_resource_temp_url");
+        peer.close().await;
+    }
+
+    #[tokio::test]
+    async fn resource_lookup_never_retries_source_or_sticker_classification_mismatch() {
+        let mut cases = Vec::new();
+        let mut wrong_scope = resource_message();
+        wrong_scope["data"]["message"]["peer_id"] = json!(457);
+        cases.push((wrong_scope, "message_validation", "message_mismatch"));
+        let mut wrong_seq = resource_message();
+        wrong_seq["data"]["message"]["message_seq"] = json!(8);
+        cases.push((wrong_seq, "message_validation", "message_mismatch"));
+        let mut wrong_resource = resource_message();
+        wrong_resource["data"]["message"]["segments"][0]["data"]["resource_id"] =
+            json!("other-resource");
+        cases.push((wrong_resource, "resource_membership", "resource_mismatch"));
+        let mut regular = resource_message();
+        regular["data"]["message"]["segments"][0]["data"]["sub_type"] = json!("normal");
+        cases.push((regular, "resource_membership", "resource_mismatch"));
+        let mut invalid = resource_message();
+        invalid["data"]["message"]["sender_id"] = json!(0);
+        cases.push((invalid, "message_validation", "invalid_message"));
+        for (response, stage, reason) in cases {
+            let peer = ResourcePeer::new(vec![response, resource_message(), resource_url()]).await;
+            let error = peer
+                .milky
+                .get_image_resource_temp_url(&resource_key(), "synthetic-resource", true)
+                .await
+                .unwrap_err();
+            let classified = error.downcast_ref::<ResourceLookupError>().unwrap();
+            assert_eq!((classified.stage, classified.reason), (stage, reason));
+            assert!(!classified.retryable());
+            assert_eq!(peer.calls.lock().unwrap().len(), 1);
+            peer.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_lookup_retries_once_and_redacts_provider_error_content() {
+        let rejection = json!({"status":"failed","retcode":-1,
+            "message":"sensitive-resource https://qpic.cn/signed?secret=synthetic"});
+        let peer = ResourcePeer::new(vec![rejection.clone(), rejection]).await;
+        let error = peer
+            .milky
+            .get_resource_temp_url(&resource_key(), "synthetic-resource")
+            .await
+            .unwrap_err();
+        let classified = error.downcast_ref::<ResourceLookupError>().unwrap();
+        assert_eq!(
+            (classified.stage, classified.reason),
+            ("message_lookup", "api_rejected")
+        );
+        let rendered = format!("{error:#}");
+        for private in [
+            "sensitive-resource",
+            "synthetic-resource",
+            "https://",
+            "secret",
+        ] {
+            assert!(!rendered.contains(private));
+        }
+        assert_eq!(peer.calls.lock().unwrap().len(), 2);
+        peer.close().await;
+    }
+
+    #[test]
+    fn resource_lookup_retry_policy_does_not_retry_permissions_or_malformed_data() {
+        for failure in [
+            ReadFailure::Transport,
+            ReadFailure::BodyRead,
+            ReadFailure::Http(408),
+            ReadFailure::Http(429),
+            ReadFailure::Http(503),
+            ReadFailure::ApiRejected,
+        ] {
+            assert!(ResourceLookupError::read("message_lookup", failure.into()).retryable());
+        }
+        for failure in [
+            ReadFailure::Http(400),
+            ReadFailure::Http(401),
+            ReadFailure::Http(403),
+            ReadFailure::Http(404),
+            ReadFailure::BodyLimit,
+            ReadFailure::InvalidJson,
+            ReadFailure::InvalidEnvelope,
+        ] {
+            assert!(!ResourceLookupError::read("message_lookup", failure.into()).retryable());
+        }
     }
     #[test]
     fn administrator_moderation_never_bypasses_the_bots_actual_group_role() {

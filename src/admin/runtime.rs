@@ -221,6 +221,7 @@ impl Runtime {
                 )
                 .init()
                 .await?;
+                crate::plugins::ai::stickers::init_store(&store).await?;
                 crate::budget::Budget::new(store.clone(), config.limits.clone())
                     .init()
                     .await?;

@@ -37,6 +37,7 @@
         <button class="nav-item" type="button" data-view="qq"><span aria-hidden="true">◎</span>QQ 登录</button>
         <button class="nav-item" type="button" data-view="contacts"><span aria-hidden="true">◉</span>群与好友</button>
         <button class="nav-item" type="button" data-view="memory"><span aria-hidden="true">▤</span>记忆与上下文</button>
+        <button class="nav-item" type="button" data-view="stickers"><span aria-hidden="true">▧</span>图库管理</button>
         <button class="nav-item" type="button" data-view="config"><span aria-hidden="true">≡</span>配置管理</button>
       </nav>
       <div class="sidebar-bottom"><span class="sidebar-label">轻量运行，随时调控</span><button id="open-security" class="text-button" type="button">账户安全</button><button id="logout" class="text-button" type="button">退出管理台 ↗</button></div>
@@ -97,6 +98,21 @@
         </div>
       </section>
 
+      <section id="view-stickers" class="view" aria-labelledby="stickers-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">STICKER LIBRARY</p><h1 id="stickers-title">图库管理</h1><p class="muted">按群查看已保存的表情，管理图片与向量索引。</p></div><button id="refresh-stickers" class="button secondary" type="button">刷新图库</button></div>
+        <article class="card">
+          <div class="sticker-toolbar"><div><label for="sticker-group">选择群图库</label><select id="sticker-group"><option value="">请选择群</option></select></div><button id="reindex-sticker-group" class="button secondary" type="button" disabled>重建本群索引</button></div>
+          <div id="sticker-group-pagination" class="pagination" hidden><button id="sticker-groups-prev" class="text-button" type="button">← 上一页群</button><span id="sticker-groups-page" class="hint"></span><button id="sticker-groups-next" class="text-button" type="button">下一页群 →</button></div>
+          <p id="sticker-summary" class="hint">进入此页后加载群列表，选择群后查看图片。</p>
+          <p class="hint">仅列出已有图库的群，各群图片独立使用。本群暂无图片时，在群内发送 QQ 表情可自动收集，普通图片请引用并发送 /save。</p>
+          <p id="sticker-index-info" class="hint"></p>
+          <p id="sticker-message" class="muted" role="status" aria-live="polite"></p>
+          <div id="sticker-operation" class="notice warning" hidden><span id="sticker-operation-text"></span><button id="retry-sticker-operation" class="button secondary" type="button">核对并重试原操作</button></div>
+          <div id="sticker-grid" class="sticker-grid" aria-label="当前群图片"></div>
+          <div class="pagination"><button id="stickers-prev" class="text-button" type="button" disabled>← 上一页</button><span id="stickers-page" class="hint">尚未选择群</span><button id="stickers-next" class="text-button" type="button" disabled>下一页 →</button></div>
+        </article>
+      </section>
+
       <section id="view-config" class="view" aria-labelledby="config-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1 id="config-title">配置管理</h1><p class="muted">先保存，再应用。运行中的会话只使用已应用的配置。</p></div><div class="button-row config-top-actions"><button id="reload-config" class="button secondary" type="button" data-action>重新载入</button><button id="save-config-top" class="button primary" type="button" data-action>保存当前配置</button></div></div>
         <div class="config-state-panel" role="status" aria-live="polite"><span id="config-state" class="badge neutral">正在读取配置</span><p id="config-state-detail" class="hint">读取配置与当前运行版本后显示生效状态。</p></div>
@@ -120,6 +136,11 @@
       <footer class="footer">小鱼 QKBOT <span>·</span> 管理操作通过本机服务完成</footer>
     </main>
   </div>
+  <dialog id="sticker-preview-dialog" class="dialog sticker-preview-dialog" aria-labelledby="sticker-preview-title">
+    <div class="dialog-heading"><h2 id="sticker-preview-title">原图预览</h2><button class="dialog-close" type="button" data-close="sticker-preview-dialog" aria-label="关闭图片预览">×</button></div>
+    <p id="sticker-preview-detail" class="hint"></p><p id="sticker-preview-message" class="hint" role="status"></p>
+    <img id="sticker-preview-image" class="sticker-original" alt="所选表情原图">
+  </dialog>
   <dialog id="scope-plugins-dialog" class="dialog wide-dialog">
     <div class="dialog-heading"><h2 id="scope-plugins-title">会话插件</h2><button class="dialog-close" type="button" data-close="scope-plugins-dialog" aria-label="关闭会话插件">×</button></div>
     <p id="scope-plugins-scope" class="hint"></p>

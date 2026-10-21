@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -1172,4 +1172,148 @@ test("authoritative polling clears a recovered apply failure but retains the sav
   assert.equal(h.app.state.applyFailure, null);
   assert.equal(h.ids.get("config-state").textContent, "不可应用");
   assert.match(h.ids.get("config-apply-error").textContent, /当前环境中的 NoneBot 令牌无效/u);
+});
+
+const stickerGroup = (group = 10) => ({ scope: `1:group:${group}`, bot_id: 1, group_id: group, count: 2, bytes: 2048, pending: 1, failed: 0 });
+const stickerGroups = (groups = [stickerGroup()], page = 1, totalPages = 1) => ({ groups, page, total_pages: totalPages, total: groups.length });
+const stickerItem = (id = 1, overrides = {}) => ({ id, revision: 2, mime: 'image/gif', bytes: 1024, thumbnail_bytes: 100, created_at: 1800000000, updated_at: 1800000001, index_status: 'pending', ...overrides });
+const stickerPage = (scope = '1:group:10', items = [stickerItem()], page = 1, totalPages = 1) => ({ scope, items, total: items.length, page, total_pages: totalPages, page_size: 20, index: { enabled: true, model: 'synthetic-model', dimensions: 1024 }, running: true });
+async function gallery(h, groups = [stickerGroup()]) {
+  await h.login(); h.app.state.view = 'stickers';
+  h.setHandler(async (path) => ({ body: path.startsWith('/api/stickers/groups') ? stickerGroups(groups) : stickerPage(new URL(path, 'https://local.test').searchParams.get('scope')) }));
+  await h.app.loadStickerGroups(); await h.app.selectStickerGroup(groups[0].scope);
+}
+
+test('sticker gallery is lazy, paginated, and uses only authenticated same-origin image routes', async () => {
+  const h = harness(); await h.login(); assert.equal(h.calls.some((call) => call.path.startsWith('/api/stickers')), false);
+  h.app.state.view = 'stickers';
+  h.setHandler(async (path) => ({ body: path.startsWith('/api/stickers/groups') ? stickerGroups([stickerGroup()], 1, 2) : stickerPage('1:group:10', [stickerItem(), stickerItem(2, { index_status: 'failed' })], 1, 2) }));
+  await h.app.loadStickerGroups(); await h.app.selectStickerGroup('1:group:10');
+  assert.equal(h.document.querySelectorAll('.sticker-card').length, 2);
+  assert.equal(h.ids.get('stickers-next').disabled, false); assert.equal(h.ids.get('sticker-groups-next').disabled, false);
+  const image = h.document.querySelectorAll('.sticker-image')[0];
+  assert.equal(image.src, '/api/stickers/items/1/image?scope=1%3Agroup%3A10&variant=thumbnail&revision=2');
+  assert.match(h.ids.get('sticker-grid').textContent, /等待索引/u); assert.match(h.ids.get('sticker-grid').textContent, /索引失败/u);
+  h.app.openStickerPreview(h.app.state.stickers.rows[0]);
+  const original = h.ids.get('sticker-preview-image'); assert.match(original.src, /variant=original/u);
+  original.onload(); assert.match(h.ids.get('sticker-preview-message').textContent, /GIF/u);
+  await h.app.selectStickerGroup(''); assert.equal(original.src, ''); assert.equal(image.src, ''); assert.equal(h.ids.get('sticker-preview-dialog').open, false);
+  h.setHandler(async () => ({ body: stickerGroups([stickerGroup(20)], 2, 2) })); await h.app.changeStickerGroupPage(2);
+  assert.equal(h.app.state.stickers.groupPage, 2); assert.match(h.ids.get('sticker-group').textContent, /20/u); assert.equal(h.app.state.stickers.scope, '');
+});
+
+test('sticker item responses are bound to session, selected group, and latest request', async () => {
+  const h = harness(); await gallery(h, [stickerGroup(), stickerGroup(20)]); let old;
+  h.setHandler((path) => new URL(path, 'https://local.test').searchParams.get('scope') === '1:group:10' ? new Promise((resolve) => { old = resolve; }) : Promise.resolve({ body: stickerPage('1:group:20', [stickerItem(20)]) }));
+  const first = h.app.loadStickerItems(); await Promise.resolve(); await h.app.selectStickerGroup('1:group:20');
+  old({ body: stickerPage('1:group:10', [stickerItem(10)]) }); await first;
+  assert.equal(h.app.state.stickers.rows[0].id, 20); assert.doesNotMatch(h.ids.get('sticker-grid').textContent, /#10\b/u);
+  let earlier; h.setHandler(() => new Promise((resolve) => { earlier = resolve; })); const stale = h.app.loadStickerItems(); await Promise.resolve();
+  h.setHandler(async () => ({ body: stickerPage('1:group:20', [stickerItem(21)]) })); await h.app.loadStickerItems();
+  earlier({ body: stickerPage('1:group:20', [stickerItem(22)]) }); await stale; assert.equal(h.app.state.stickers.rows[0].id, 21);
+  let afterLogout; h.setHandler(() => new Promise((resolve) => { afterLogout = resolve; })); const pending = h.app.loadStickerItems(); await Promise.resolve();
+  h.app.clearSession(); afterLogout({ body: stickerPage('1:group:20', [stickerItem(23)]) }); await pending;
+  assert.equal(h.app.state.stickers.rows.length, 0); assert.equal(h.document.querySelectorAll('.sticker-image').length, 0); assert.equal(h.ids.get('sticker-preview-image').src, '');
+});
+
+test('sticker gallery rejects wrong scopes and malformed image identities before constructing URLs', async () => {
+  for (const invalid of [stickerPage('1:group:99'), stickerPage('1:group:10', [stickerItem('../escape')]), stickerPage('1:group:10', [stickerItem(1, { mime: 'image/svg+xml' })]), stickerPage('1:group:10', [stickerItem(1, { scope: '1:group:99' })])]) {
+    const h = harness(); await gallery(h); h.setHandler(async () => ({ body: invalid })); await h.app.loadStickerItems();
+    assert.equal(h.app.state.stickers.rows.length, 0); assert.equal(h.document.querySelectorAll('.sticker-image').length, 0); assert.match(h.ids.get('sticker-message').textContent, /范围或格式/u);
+  }
+});
+
+test('sticker deletion confirms exact group and item; cancellation never submits', async () => {
+  const h = harness(); await gallery(h); const before = h.calls.length; let confirmation;
+  h.window.confirm = (text) => { confirmation = text; return false; };
+  await h.app.mutateSticker('delete', h.app.state.stickers.rows[0]);
+  assert.match(confirmation, /群 10.*机器人 1.*#1/u); assert.equal(h.calls.length, before);
+  h.window.confirm = () => true;
+  h.setHandler(async (path, options) => {
+    if (path === '/api/stickers/delete') { const payload = JSON.parse(options.body); return { body: { request_id: payload.request_id, scope: payload.scope, action: 'delete', affected: 1, receipt: 'deleted' } }; }
+    return { body: path.startsWith('/api/stickers/groups') ? stickerGroups() : stickerPage('1:group:10', []) };
+  });
+  await h.app.mutateSticker('delete', h.app.state.stickers.rows[0]);
+  const write = h.calls.find((call) => call.path === '/api/stickers/delete');
+  assert.equal(write.body.id, 1); assert.equal(write.body.revision, 2); assert.equal(write.body.scope, '1:group:10'); assert.equal(write.options.headers['X-CSRF-Token'], 'csrf-test');
+  assert.equal(h.app.state.stickers.operation, null); assert.match(h.ids.get('sticker-message').textContent, /已删除 1/u);
+});
+
+test('ambiguous sticker writes retain the exact request id, block duplicate actions, and retry idempotently', async () => {
+  for (const failure of [{ error: new Error('timeout') }, { raw: 'not JSON' }, { body: { request_id: 'wrong', scope: '1:group:10', action: 'reindex', affected: 1, receipt: 'queued' } }]) {
+    const h = harness(); await gallery(h); const item = h.app.state.stickers.rows[0]; h.setHandler(async () => failure);
+    await h.app.mutateSticker('reindex', item); const operation = h.app.state.stickers.operation; assert.ok(operation); assert.equal(operation.sending, false);
+    assert.doesNotMatch(h.ids.get('sticker-message').textContent, /已提交|已完成/u);
+    const before = h.calls.length; await h.app.mutateSticker('delete', item); assert.equal(h.calls.length, before);
+    h.setHandler(async (path, options) => {
+      if (path === '/api/stickers/reindex') { const payload = JSON.parse(options.body); return { body: { request_id: payload.request_id, scope: payload.scope, action: 'reindex', affected: 1, receipt: 'queued' } }; }
+      return { body: path.startsWith('/api/stickers/groups') ? stickerGroups() : stickerPage() };
+    });
+    await h.app.retryStickerOperation(); const writes = h.calls.filter((call) => call.path === '/api/stickers/reindex');
+    assert.equal(writes.length, 2); assert.deepEqual(writes[0].body, writes[1].body); assert.equal(h.app.state.stickers.operation, null);
+    assert.match(h.ids.get('sticker-message').textContent, /已提交.*尚未完成/u);
+  }
+});
+
+test('sticker conflicts never report success and group reindex confirms API usage without item IDs', async () => {
+  const h = harness(); await gallery(h); let text; h.window.confirm = (message) => { text = message; return true; };
+  h.setHandler(async () => ({ status: 409, body: { error: 'changed' } })); await h.app.mutateSticker('reindex');
+  assert.match(text, /全部.*向量 API.*请求用量/u); const write = h.calls.at(-1);
+  assert.equal(write.body.id, undefined); assert.equal(write.body.revision, undefined); assert.equal(write.body.scope, '1:group:10');
+  assert.equal(h.app.state.stickers.operation, null); assert.match(h.ids.get('sticker-message').textContent, /已变化.*请刷新/u); assert.doesNotMatch(h.ids.get('sticker-message').textContent, /已提交|已完成/u);
+});
+
+test('sticker mutation completion cannot repaint a newly selected group or restore images after logout', async () => {
+  const h = harness(); await gallery(h, [stickerGroup(), stickerGroup(20)]); let complete;
+  h.setHandler((path) => path === '/api/stickers/reindex' ? new Promise((resolve) => { complete = resolve; }) : Promise.resolve({ body: stickerPage('1:group:20', [stickerItem(20)]) }));
+  const pending = h.app.mutateSticker('reindex', h.app.state.stickers.rows[0]); await Promise.resolve();
+  const payload = h.app.state.stickers.operation.payload; await h.app.selectStickerGroup('1:group:20');
+  complete({ body: { request_id: payload.request_id, scope: payload.scope, action: 'reindex', affected: 1, receipt: 'queued' } }); await pending;
+  assert.equal(h.app.state.stickers.scope, '1:group:20'); assert.equal(h.app.state.stickers.rows[0].id, 20); assert.doesNotMatch(h.ids.get('sticker-message').textContent, /已提交/u);
+  const image = h.document.querySelectorAll('.sticker-image')[0]; h.app.openStickerPreview(h.app.state.stickers.rows[0]); const lateLoad = h.ids.get('sticker-preview-image').onload;
+  h.app.clearSession(); lateLoad(); assert.equal(image.src, ''); assert.equal(h.ids.get('sticker-preview-image').src, ''); assert.equal(h.ids.get('sticker-preview-message').textContent, '');
+});
+
+test('sticker pagination returns to the last valid page after deletions', async () => {
+  const h = harness(); await gallery(h);
+  h.app.state.stickers.page = 2; h.app.state.stickers.totalPages = 2;
+  h.setHandler(async (path) => {
+    const page = Number(new URL(path, 'https://local.test').searchParams.get('page'));
+    return { body: stickerPage('1:group:10', page === 2 ? [] : [stickerItem(4)], page, 1) };
+  });
+  await h.app.loadStickerItems(2); assert.equal(h.app.state.stickers.page, 1); assert.equal(h.app.state.stickers.rows[0].id, 4);
+  assert.equal(h.ids.get('stickers-prev').disabled, true); assert.equal(h.app.state.stickers.loading, false);
+});
+
+test('sticker group requests and preview failure cannot repopulate a left or signed-out page', async () => {
+  const h = harness(); await gallery(h); let resolve;
+  h.app.openStickerPreview(h.app.state.stickers.rows[0]); h.ids.get('sticker-preview-image').onerror();
+  assert.equal(h.ids.get('sticker-preview-image').src, ''); assert.match(h.ids.get('sticker-preview-message').textContent, /无法读取/u);
+  h.setHandler(() => new Promise((done) => { resolve = done; })); const pending = h.app.loadStickerGroups(); await Promise.resolve();
+  h.app.showView('overview'); resolve({ body: stickerGroups([stickerGroup(99)]) }); await pending;
+  assert.equal(h.app.state.stickers.groups[0].group_id, 10); assert.equal(h.document.querySelectorAll('.sticker-image').length, 0);
+  h.app.state.view = 'stickers'; const loggedOut = h.app.loadStickerGroups(); await Promise.resolve(); h.app.clearSession();
+  resolve({ body: stickerGroups([stickerGroup(99)]) }); await loggedOut;
+  assert.equal(h.app.state.stickers.groups.length, 0); assert.equal(h.ids.get('sticker-group').value, '');
+});
+
+test('selected sticker group survives group-list pagination and refresh, including an emptied library', async () => {
+  const h = harness(); await gallery(h); h.app.state.stickers.totalGroupPages = 2;
+  const originalImage = h.document.querySelectorAll('.sticker-image')[0];
+  h.setHandler(async () => ({ body: stickerGroups([stickerGroup(20)], 2, 2) })); await h.app.changeStickerGroupPage(2);
+  assert.equal(h.app.state.stickers.scope, '1:group:10'); assert.equal(h.ids.get('sticker-group').value, '1:group:10'); assert.equal(h.app.state.stickers.rows[0].id, 1);
+  assert.equal(h.document.querySelectorAll('.sticker-image')[0], originalImage);
+  h.setHandler(async (path) => ({ body: path.startsWith('/api/stickers/groups') ? stickerGroups([stickerGroup(20)], 2, 2) : stickerPage('1:group:10', []) }));
+  await h.app.refreshStickers(); assert.equal(h.app.state.stickers.scope, '1:group:10'); assert.equal(h.ids.get('sticker-group').value, '1:group:10');
+  assert.match(h.ids.get('sticker-message').textContent, /本群暂无图片.*\/save/u); assert.equal(h.ids.get('reindex-sticker-group').disabled, true);
+});
+
+test('confirmed sticker mutation distinguishes a later listing refresh failure', async () => {
+  const h = harness(); await gallery(h);
+  h.setHandler(async (path, options) => {
+    if (path === '/api/stickers/reindex') { const payload = JSON.parse(options.body); return { body: { request_id: payload.request_id, scope: payload.scope, action: 'reindex', affected: 1, receipt: 'queued' } }; }
+    return { status: 503, body: { error: '列表暂不可用' } };
+  });
+  await h.app.mutateSticker('reindex', h.app.state.stickers.rows[0]);
+  assert.equal(h.app.state.stickers.operation, null); assert.match(h.ids.get('sticker-message').textContent, /已提交.*尚未完成.*列表刷新未完成/u);
 });

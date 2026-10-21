@@ -1869,6 +1869,42 @@ async fn sticker_search_shows_thumbnail_then_sends_one_selected_image_with_reply
 }
 
 #[tokio::test]
+async fn sticker_search_in_empty_group_never_borrows_another_groups_image() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        enable_sticker_search(config, &mock.url);
+    })
+    .await;
+    let incoming = message(1, "发个表情包");
+    let mut other_group = incoming.clone();
+    other_group.key.scope.peer_id = 987;
+    seed_sticker(&host, &other_group).await;
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    request.reply.send(model_tool_response(vec![model_tool_call(
+        "find-empty-group", "search_stickers", json!({"query":"开心"}),
+    )])).unwrap();
+    let followup = mock.model().await;
+    let messages = followup.body["messages"].as_array().unwrap();
+    let result = messages.iter().find(|message| message["tool_call_id"] == "find-empty-group").unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert!(result["candidates"].as_array().unwrap().is_empty());
+    assert!(messages.iter().filter_map(|message| message["content"].as_array()).flatten().all(|part| part["type"] != "image_url"));
+    assert!(mock.embeddings.try_recv().is_err(), "an empty group requires no vector request");
+    followup.reply.send(model_tool_response(vec![model_tool_call(
+        "explain-empty", "reply_message", json!({"text":"本群还没有可用表情，可引用图片发送 /save 入库。","reply_to":current["message_ref"]}),
+    )])).unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    assert!(sent["message"].as_array().unwrap().iter().all(|segment| segment["type"] != "image"));
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
 async fn sticker_reply_rejects_raw_image_arguments_without_sending_or_fetching() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_reply_with(&mock, |config| {

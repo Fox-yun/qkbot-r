@@ -15,6 +15,7 @@
     scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
     embedding: { version: 0, loading: false, message: "", kind: "" },
+    stickers: { version: 0, groupRequest: 0, itemRequest: 0, groupsLoading: false, loading: false, groups: [], groupPage: 1, totalGroupPages: 1, scope: "", rows: [], page: 1, totalPages: 1, total: 0, index: null, running: false, message: "", kind: "", operation: null, preview: null },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
   const inputs = new Map();
@@ -857,6 +858,7 @@
     $("group-persona-message").className = "hint group-persona-message" + (state.groupPersona.kind === "error" ? " inline-error" : "");
     for (const control of [inputs.get("plugins.ai.defaults.allowed_tools")?.control, settingInputs.get("allowed_tools")?.input]) if (control) updateToolPicker(control);
     updateContactControls();
+    updateStickerControls();
   }
 
   async function loadConfig() {
@@ -1193,6 +1195,190 @@
       if (contactsCurrent(version, session)) { c.saving = null; renderContacts(); }
     }
   }
+  const stickerScope = (value) => typeof value === "string" && /^[1-9]\d*:group:[1-9]\d*$/u.test(value);
+  const stickerInteger = (value, minimum = 0) => Number.isSafeInteger(value) && value >= minimum;
+  const stickerBytes = (value) => value >= 1048576 ? `${(value / 1048576).toFixed(1)} MB` : value >= 1024 ? `${(value / 1024).toFixed(1)} KB` : `${value} B`;
+  const stickerScopeLabel = (scope) => { const [bot, , group] = scope.split(":"); return `群 ${group} · 机器人 ${bot}`; };
+  function stickerCurrent(request) {
+    return state.authenticated && state.session === request.session && state.view === "stickers" && state.stickers.version === request.version
+      && (request.scope === undefined || state.stickers.scope === request.scope);
+  }
+  function stickerImageUrl(item, scope, variant) {
+    return `/api/stickers/items/${item.id}/image?` + new URLSearchParams({ scope, variant, revision: String(item.revision) });
+  }
+  function closeStickerPreview() {
+    state.stickers.preview = null; $("sticker-preview-image").removeAttribute("src"); $("sticker-preview-image").hidden = true;
+    $("sticker-preview-detail").textContent = ""; $("sticker-preview-message").textContent = "";
+    if ($("sticker-preview-dialog").open) $("sticker-preview-dialog").close();
+  }
+  function clearStickerCards() {
+    document.querySelectorAll(".sticker-image").forEach((image) => image.removeAttribute("src"));
+    $("sticker-grid").replaceChildren(); closeStickerPreview();
+  }
+  function invalidateStickers(reset = false) {
+    const s = state.stickers;
+    s.version++; s.groupRequest++; s.itemRequest++; s.groupsLoading = false; s.loading = false;
+    s.rows = []; s.index = null; s.message = ""; s.kind = ""; clearStickerCards();
+    if (reset) { s.groups = []; s.scope = ""; s.groupPage = 1; s.totalGroupPages = 1; s.page = 1; s.totalPages = 1; s.total = 0; s.operation = null; renderStickerGroups(); }
+    renderStickerStatus();
+  }
+  function updateStickerControls() {
+    const s = state.stickers, blocked = !state.authenticated || state.busy;
+    $("refresh-stickers").disabled = blocked || s.groupsLoading || s.loading;
+    $("sticker-group").disabled = blocked || s.groupsLoading;
+    $("reindex-sticker-group").disabled = blocked || s.loading || !s.scope || !s.total || Boolean(s.operation);
+    $("stickers-prev").disabled = blocked || s.loading || !s.scope || s.page <= 1;
+    $("stickers-next").disabled = blocked || s.loading || !s.scope || s.page >= s.totalPages;
+    $("sticker-groups-prev").disabled = blocked || s.groupsLoading || s.groupPage <= 1;
+    $("sticker-groups-next").disabled = blocked || s.groupsLoading || s.groupPage >= s.totalGroupPages;
+    document.querySelectorAll("[data-sticker-write]").forEach((node) => { node.disabled = blocked || s.loading || Boolean(s.operation); });
+    document.querySelectorAll("[data-sticker-preview]").forEach((node) => { node.disabled = blocked || s.loading; });
+    $("retry-sticker-operation").disabled = blocked || !s.operation || s.operation.sending;
+  }
+  function renderStickerGroups() {
+    const s = state.stickers, select = $("sticker-group"); select.replaceChildren();
+    const empty = element("option", "", s.groups.length ? "请选择群" : "当前没有已保存图片的群"); empty.value = ""; select.append(empty);
+    if (s.scope && !s.groups.some((group) => group.scope === s.scope)) { const selected = element("option", "", `当前选择：${stickerScopeLabel(s.scope)}`); selected.value = s.scope; select.append(selected); }
+    for (const group of s.groups) { const option = element("option", "", `${stickerScopeLabel(group.scope)} · ${group.count} 张`); option.value = group.scope; select.append(option); }
+    select.value = s.scope; $("sticker-group-pagination").hidden = s.totalGroupPages <= 1;
+    $("sticker-groups-page").textContent = `群列表第 ${s.groupPage} / ${s.totalGroupPages} 页`;
+  }
+  function renderStickerStatus() {
+    const s = state.stickers, group = s.groups.find((item) => item.scope === s.scope);
+    $("sticker-summary").textContent = group ? `${stickerScopeLabel(group.scope)} · ${group.count} 张 · ${stickerBytes(group.bytes)} · 待处理 ${group.pending} · 失败 ${group.failed}` : s.scope ? `${stickerScopeLabel(s.scope)} · ${s.total} 张` : "选择群后查看图片。";
+    $("sticker-index-info").textContent = s.index ? (s.index.enabled ? `向量模型：${s.index.model} · ${s.index.dimensions} 维。` : "向量服务未启用。")
+      + (s.running && s.index.enabled ? " 重建任务由后台逐张处理，刷新可查看进度。" : " 重建请求可排队，机器人和向量服务运行后处理。") : "";
+    $("sticker-message").textContent = s.message || (s.groupsLoading ? "正在读取群列表…" : s.loading ? "正在读取图片…" : (s.scope && !s.rows.length) || (!s.scope && !s.groups.length) ? "本群暂无图片；在群内发送 QQ 表情可自动收集，普通图片请引用并发送 /save。" : "点击图片查看原图；GIF 可在预览中播放。");
+    $("sticker-message").className = s.kind === "error" ? "inline-error" : "muted";
+    $("stickers-page").textContent = s.scope ? `图片第 ${s.page} / ${s.totalPages} 页 · 共 ${s.total} 张` : "尚未选择群";
+    const operation = s.operation; $("sticker-operation").hidden = !operation;
+    $("sticker-operation-text").textContent = operation ? `${stickerScopeLabel(operation.payload.scope)}：${operation.action === "delete" ? "删除图片" : "重建索引"}${operation.sending ? "正在提交…" : "结果尚未确认。点击核对会沿用原操作号，不会创建重复操作。"} 操作号：${operation.payload.request_id}` : "";
+    updateStickerControls();
+  }
+  async function loadStickerGroups(page = state.stickers.groupPage) {
+    if (!state.authenticated || state.view !== "stickers" || !stickerInteger(page, 1)) return false;
+    const s = state.stickers, request = { session: state.session, version: s.version, sequence: ++s.groupRequest };
+    s.groupsLoading = true; s.message = ""; s.kind = ""; renderStickerStatus();
+    try {
+      const result = await api("/api/stickers/groups?" + new URLSearchParams({ page: String(page) }));
+      if (!stickerCurrent(request) || request.sequence !== s.groupRequest) return false;
+      if (!Array.isArray(result.groups) || result.groups.length > 20 || result.page !== page || !stickerInteger(result.total) || !stickerInteger(result.total_pages)
+        || result.groups.some((group) => !stickerScope(group.scope) || group.scope !== `${group.bot_id}:group:${group.group_id}` || [group.count, group.bytes, group.pending, group.failed].some((value) => !stickerInteger(value)))
+        || new Set(result.groups.map((group) => group.scope)).size !== result.groups.length) throw new Error("图库群列表格式无效，请刷新核对。");
+      if (page > Math.max(1, result.total_pages)) return await loadStickerGroups(Math.max(1, result.total_pages));
+      s.groups = result.groups; s.groupPage = page; s.totalGroupPages = Math.max(1, result.total_pages);
+      renderStickerGroups(); return true;
+    } catch (error) {
+      if (!stickerCurrent(request) || request.sequence !== s.groupRequest) return false;
+      s.message = error.message; s.kind = "error"; if (["reauth_required", "csrf_invalid"].includes(error.code)) report(error); return false;
+    } finally { if (state.session === request.session && request.sequence === s.groupRequest) { s.groupsLoading = false; renderStickerStatus(); } }
+  }
+  async function selectStickerGroup(scope) {
+    if (!state.authenticated || state.view !== "stickers" || (scope && scope !== state.stickers.scope && !state.stickers.groups.some((group) => group.scope === scope))) return;
+    const s = state.stickers; s.version++; s.itemRequest++; s.loading = false; s.scope = scope; s.rows = []; s.page = 1; s.totalPages = 1; s.total = 0; s.index = null; s.message = ""; s.kind = "";
+    clearStickerCards(); $("sticker-group").value = scope; renderStickerStatus();
+    if (scope) await loadStickerItems(1);
+  }
+  async function changeStickerGroupPage(page) {
+    if (state.stickers.groupsLoading || page < 1 || page > state.stickers.totalGroupPages) return;
+    await loadStickerGroups(page);
+  }
+  async function refreshStickers() {
+    if (!state.authenticated || state.view !== "stickers") return;
+    const session = state.session;
+    if (await loadStickerGroups() && session === state.session && state.stickers.scope) await loadStickerItems(state.stickers.page);
+  }
+  async function loadStickerItems(page = state.stickers.page) {
+    const s = state.stickers;
+    if (!state.authenticated || state.view !== "stickers" || !stickerScope(s.scope) || !stickerInteger(page, 1)) return;
+    const request = { session: state.session, version: s.version, scope: s.scope, sequence: ++s.itemRequest };
+    s.loading = true; s.rows = []; s.message = ""; s.kind = ""; clearStickerCards(); renderStickerStatus();
+    try {
+      const result = await api("/api/stickers/items?" + new URLSearchParams({ scope: request.scope, page: String(page) }));
+      if (!stickerCurrent(request) || request.sequence !== s.itemRequest) return;
+      if (result.scope !== request.scope || !Array.isArray(result.items) || result.items.length > 20 || result.page !== page || !stickerInteger(result.total) || !stickerInteger(result.total_pages)
+        || typeof result.running !== "boolean" || typeof result.index?.enabled !== "boolean" || typeof result.index?.model !== "string" || !stickerInteger(result.index?.dimensions, 1)
+        || result.items.some((item) => !stickerInteger(item.id, 1) || !stickerInteger(item.revision, 1) || !stickerInteger(item.bytes) || !stickerInteger(item.created_at) || !stickerInteger(item.updated_at)
+          || !["image/jpeg", "image/png", "image/gif", "image/webp"].includes(item.mime) || !["ready", "pending", "failed"].includes(item.index_status) || (item.scope !== undefined && item.scope !== request.scope))
+        || new Set(result.items.map((item) => item.id)).size !== result.items.length) throw new Error("图片列表范围或格式无效，未显示图片，请刷新核对。");
+      if (page > Math.max(1, result.total_pages)) { await loadStickerItems(Math.max(1, result.total_pages)); return; }
+      s.rows = result.items; s.page = page; s.total = result.total; s.totalPages = Math.max(1, result.total_pages); s.index = result.index; s.running = result.running;
+      renderStickerCards(request);
+    } catch (error) {
+      if (!stickerCurrent(request) || request.sequence !== s.itemRequest) return;
+      s.message = error.message; s.kind = "error"; if (["reauth_required", "csrf_invalid"].includes(error.code)) report(error);
+    } finally { if (stickerCurrent(request) && request.sequence === s.itemRequest) { s.loading = false; renderStickerStatus(); } }
+  }
+  function renderStickerCards(request) {
+    const grid = $("sticker-grid"); grid.replaceChildren();
+    for (const item of state.stickers.rows) {
+      const card = element("article", "sticker-card"), preview = element("button", "sticker-thumbnail"), image = element("img", "sticker-image");
+      preview.type = "button"; preview.dataset.stickerPreview = String(item.id); preview.setAttribute("aria-label", `预览图片 ${item.id}`);
+      image.alt = `表情 ${item.id} 的缩略图`; image.loading = "lazy"; image.decoding = "async"; image.referrerPolicy = "no-referrer";
+      image.src = stickerImageUrl(item, request.scope, "thumbnail"); preview.append(image);
+      const unavailable = element("span", "hint", "缩略图无法读取，请刷新核对。"); unavailable.hidden = true; preview.append(unavailable);
+      image.addEventListener("error", () => { if (stickerCurrent(request) && request.sequence === state.stickers.itemRequest && image.isConnected) { image.hidden = true; unavailable.hidden = false; } });
+      preview.addEventListener("click", () => openStickerPreview(item));
+      const body = element("div", "sticker-card-body"), header = element("div", "card-top");
+      header.append(element("strong", "", `图片 #${item.id}`), element("span", `badge ${item.index_status === "ready" ? "good" : item.index_status === "failed" ? "bad" : "wait"}`, { ready: "索引就绪", pending: "等待索引", failed: "索引失败" }[item.index_status]));
+      body.append(header, element("p", "hint", `${item.mime.slice(6).toUpperCase()} · ${stickerBytes(item.bytes)}`), element("p", "hint", "入库 " + dateText(item.created_at)));
+      if (item.source_available === false) body.append(element("p", "hint danger-text", "来源已失效，不能用于回复；可删除清理。"));
+      const actions = element("div", "button-row");
+      for (const [action, label, style] of [["reindex", "重建索引", "accent"], ["delete", "删除图片", "danger-text"]]) {
+        const button = element("button", `text-button ${style}`, label); button.type = "button"; button.dataset.stickerWrite = action; button.dataset.stickerId = String(item.id);
+        button.addEventListener("click", () => { void mutateSticker(action, item); }); actions.append(button);
+      }
+      body.append(actions); card.append(preview, body); grid.append(card);
+    }
+    updateStickerControls();
+  }
+  function openStickerPreview(item) {
+    const s = state.stickers;
+    if (!state.authenticated || state.view !== "stickers" || s.loading || !s.rows.some((row) => row.id === item.id && row.revision === item.revision)) return;
+    closeStickerPreview();
+    const preview = { session: state.session, version: s.version, scope: s.scope, id: item.id, revision: item.revision }; s.preview = preview;
+    const image = $("sticker-preview-image"); image.hidden = false; image.referrerPolicy = "no-referrer"; image.alt = `群 ${s.scope.split(":")[2]} 的表情 ${item.id}`;
+    $("sticker-preview-title").textContent = `原图预览 · #${item.id}`;
+    $("sticker-preview-detail").textContent = `${stickerScopeLabel(s.scope)} · ${item.mime.slice(6).toUpperCase()} · ${stickerBytes(item.bytes)}`;
+    $("sticker-preview-message").textContent = "正在加载原图…";
+    image.onload = () => { if (s.preview === preview && stickerCurrent(preview)) $("sticker-preview-message").textContent = item.mime === "image/gif" ? "GIF 原图正在播放。" : ""; };
+    image.onerror = () => { if (s.preview === preview && stickerCurrent(preview)) { image.hidden = true; image.removeAttribute("src"); $("sticker-preview-message").textContent = "原图无法读取，可能已删除或版本变化，请关闭后刷新图库。"; } };
+    image.src = stickerImageUrl(item, s.scope, "original"); $("sticker-preview-dialog").showModal();
+  }
+  async function mutateSticker(action, item) {
+    const s = state.stickers;
+    if (!state.authenticated || state.view !== "stickers" || state.busy || s.operation || s.loading || !stickerScope(s.scope) || !["delete", "reindex"].includes(action)) return;
+    if (item && !s.rows.some((row) => row.id === item.id && row.revision === item.revision)) return;
+    if (action === "delete" && !item) return;
+    const label = stickerScopeLabel(s.scope);
+    const confirmation = action === "delete" ? `确定删除${label}中的图片 #${item.id}？图片与索引会从本群图库移除。` : item ? "重建这张图片的向量索引？后台会调用向量 API，产生请求用量。" : `重建${label}的全部 ${s.total} 张图片索引？后台会逐张调用向量 API，产生请求用量。`;
+    if (!window.confirm(confirmation)) return;
+    const payload = { request_id: requestId(), scope: s.scope }; if (item) Object.assign(payload, { id: item.id, revision: item.revision });
+    s.operation = { action, payload, session: state.session, sending: false }; await retryStickerOperation();
+  }
+  async function retryStickerOperation() {
+    const s = state.stickers, operation = s.operation;
+    if (!state.authenticated || !operation || operation.sending || operation.session !== state.session || state.busy) return;
+    const request = { session: state.session, version: s.version, scope: operation.payload.scope }; operation.sending = true; renderStickerStatus();
+    try {
+      const result = await api(`/api/stickers/${operation.action}`, "POST", operation.payload);
+      if (state.session !== operation.session || s.operation !== operation) return;
+      if (result.request_id !== operation.payload.request_id || result.scope !== operation.payload.scope || result.action !== operation.action || !stickerInteger(result.affected) || typeof result.receipt !== "string") throw new ApiError("操作响应格式无效，结果尚未确认。", 200, "invalid_response");
+      s.operation = null;
+      if (stickerCurrent(request)) {
+        const message = operation.action === "delete" ? `已删除 ${result.affected} 张图片。` : `已提交 ${result.affected} 张图片的索引重建，尚未完成；刷新查看处理进度。`;
+        await refreshStickers();
+        if (stickerCurrent(request)) { const refreshError = s.kind === "error" ? " 列表刷新未完成：" + s.message : ""; s.message = message + refreshError; s.kind = refreshError ? "error" : ""; }
+      }
+    } catch (error) {
+      if (state.session !== operation.session || s.operation !== operation) return;
+      if (uncertain(error)) { operation.sending = false; }
+      else { s.operation = null; }
+      if (stickerCurrent(request)) { s.message = error.status === 409 || error.status === 404 ? "图片或图库已变化，操作未完成，请刷新后再试。" : error.message; s.kind = "error"; }
+      if (["reauth_required", "csrf_invalid"].includes(error.code)) report(error);
+    } finally { if (state.session === operation.session) { if (s.operation === operation) operation.sending = false; renderStickerStatus(); } }
+  }
+
   async function runAction(action) {
     if (state.busy) return;
     const session = state.session; state.busy = true; updateControls();
@@ -1264,15 +1450,17 @@
     }
   }
   function showView(view) {
-    if (!["overview", "qq", "contacts", "config", "memory"].includes(view)) return;
+    if (!["overview", "qq", "contacts", "config", "memory", "stickers"].includes(view)) return;
     if (state.view === "contacts" && view !== "contacts") invalidateContacts();
+    if (state.view === "stickers" && view !== "stickers") invalidateStickers();
     state.view = view;
     document.querySelectorAll(".view").forEach((node) => { node.hidden = node.id !== "view-" + view; });
     document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
-    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "配置管理", memory: "记忆与上下文" }[view];
+    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "配置管理", memory: "记忆与上下文", stickers: "图库管理" }[view];
     if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
     if (view === "qq") scheduleQq(0);
     if (view === "contacts" && state.contacts.phase !== "ready") void loadContacts();
+    if (view === "stickers") void refreshStickers();
   }
   const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty;
   function authView(result) {
@@ -1292,6 +1480,7 @@
     state.groupPersona = { saving: false, message: "", kind: "" }; $("group-persona-select").replaceChildren(); $("group-persona-select").value = "";
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
+    invalidateStickers(true);
     $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
     invalidateModels(); invalidateEmbeddingTest();
@@ -1668,7 +1857,7 @@
     } finally { state.busy = false; $("login-button").disabled = false; updateControls(); }
   });
   $("logout").addEventListener("click", () => {
-    if ((hasEdits() || state.pendingOperation) && !window.confirm("有未保存编辑或待查询的操作。确定退出并清空本页内容？")) return;
+    if ((hasEdits() || state.pendingOperation || state.stickers.operation) && !window.confirm("有未保存编辑或待查询的操作。确定退出并清空本页内容？")) return;
     void runAction(async () => {
       try { await api("/api/auth/logout", "POST", {}); }
       catch (error) { if (error.code !== "auth_required") throw error; }
@@ -1702,6 +1891,7 @@
     if (id === "memory-editor") { state.memory.editorDirty = false; state.memory.editing = null; }
     if (id === "security-dialog") $("password-change-form").reset();
     if (id === "reauth-dialog") $("reauth-form").reset();
+    if (id === "sticker-preview-dialog") closeStickerPreview();
     $(id).close(); updateControls();
   }
   document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => closeDialog(button.dataset.close)));
@@ -1727,6 +1917,12 @@
   $("refresh-status").addEventListener("click", () => { void runAction(() => refreshStatus(true)); });
   $("refresh-qq").addEventListener("click", () => { void runAction(() => refreshQq(true)); });
   $("refresh-contacts").addEventListener("click", () => { void loadContacts(true); });
+  $("refresh-stickers").addEventListener("click", () => { void refreshStickers(); });
+  $("sticker-group").addEventListener("change", () => { void selectStickerGroup($("sticker-group").value); });
+  $("reindex-sticker-group").addEventListener("click", () => { void mutateSticker("reindex"); });
+  $("retry-sticker-operation").addEventListener("click", () => { void retryStickerOperation(); });
+  for (const [id, direction] of [["stickers-prev", -1], ["stickers-next", 1]]) $(id).addEventListener("click", () => { void loadStickerItems(state.stickers.page + direction); });
+  for (const [id, direction] of [["sticker-groups-prev", -1], ["sticker-groups-next", 1]]) $(id).addEventListener("click", () => { void changeStickerGroupPage(state.stickers.groupPage + direction); });
   $("refresh-scope-plugins").addEventListener("click", () => { void loadScopePlugins(); });
   for (const [id, scene] of [["contacts-groups", "group"], ["contacts-friends", "friend"]]) $(id).addEventListener("click", () => { state.contacts.scene = scene; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
   $("contacts-search").addEventListener("input", () => { state.contacts.query = $("contacts-search").value; state.contacts.page = 1; if (state.contacts.phase === "ready") state.contacts.message = ""; renderContacts(); });
@@ -1801,7 +1997,7 @@
     if (document.hidden) { stopTimers(); $("poll-state").textContent = "页面隐藏，已暂停轮询"; }
     else if (state.authenticated) { $("poll-state").textContent = "自动同步"; void refreshStatus(); void refreshQq(); }
   });
-  window.addEventListener("beforeunload", (event) => { if (hasEdits() || state.pendingOperation) { event.preventDefault(); event.returnValue = ""; } });
+  window.addEventListener("beforeunload", (event) => { if (hasEdits() || state.pendingOperation || state.stickers.operation) { event.preventDefault(); event.returnValue = ""; } });
   window.addEventListener("pagehide", stopTimers);
   window.addEventListener("pageshow", (event) => { if (event.persisted) { clearSession(); void bootstrap(); } });
   void bootstrap();

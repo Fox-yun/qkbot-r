@@ -23,6 +23,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+pub mod admin;
+
 const SOURCE_LIMIT: usize = 8 * 1024 * 1024;
 const THUMB_LIMIT: usize = 1024 * 1024;
 const MAX_MESSAGE_IMAGES: usize = 2;
@@ -38,6 +40,20 @@ CREATE TABLE ai_sticker_revoked(source_key TEXT PRIMARY KEY,revoked_at INTEGER N
 CREATE TABLE ai_sticker_admissions(at INTEGER NOT NULL);
 CREATE INDEX ai_sticker_admissions_time ON ai_sticker_admissions(at);
 "#;
+
+const ADMIN_MIGRATION: &str = r#"
+ALTER TABLE ai_stickers ADD COLUMN reindex_requested INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE ai_sticker_deletions(scope TEXT NOT NULL,hash TEXT NOT NULL,source_cutoff INTEGER NOT NULL,deleted_at INTEGER NOT NULL,PRIMARY KEY(scope,hash));
+CREATE TABLE ai_sticker_admin_receipts(admin_id TEXT NOT NULL,session_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result_json TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(admin_id,session_id,request_id));
+CREATE INDEX ai_sticker_admin_receipts_age ON ai_sticker_admin_receipts(created_at);
+"#;
+
+/// Shared administration initializes schema without starting a Host or changing
+/// persisted controls. Keep migration v1 byte-for-byte stable for live upgrades.
+pub async fn init_store(store: &Store) -> Result<()> {
+    store.migrate("ai_stickers", 1, MIGRATION).await?;
+    store.migrate("ai_stickers", 2, ADMIN_MIGRATION).await
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -335,10 +351,23 @@ pub(super) fn check_stored(
         enabled(db, scope)? && valid_hash(content_hash),
         "sticker candidate unavailable"
     );
-    // Normal raw-message retention does not erase a saved sticker. Durable
-    // provenance keeps its conversation epoch, so forgetting still invalidates it.
-    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM ai_stickers s WHERE s.id=?1 AND s.scope=?2 AND s.revision=?3 AND s.hash=?4 AND EXISTS(SELECT 1 FROM ai_sticker_sources p JOIN ai_conversations c ON c.id=p.conversation_id AND c.scope=p.scope LEFT JOIN messages m ON m.key=p.source_key WHERE p.sticker_id=s.id AND p.scope=s.scope AND ((m.key IS NULL AND c.epoch=p.epoch) OR (m.scope=p.scope AND m.conversation_id=p.conversation_id AND m.epoch=c.epoch AND m.revoked=0)) AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources r WHERE r.source_key=p.source_key) AND NOT EXISTS(SELECT 1 FROM ai_sticker_revoked r WHERE r.source_key=p.source_key)))",params![id,scope.key(),revision,content_hash],|r|r.get(0))?;
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM ai_stickers WHERE id=?1 AND scope=?2 AND revision=?3 AND hash=?4)",params![id,scope.key(),revision,content_hash],|r|r.get(0))?;
     ensure!(exists, "sticker candidate changed or revoked");
+    ensure!(
+        source_valid(db, &scope.key(), id)?,
+        "sticker source unavailable"
+    );
+    Ok(())
+}
+
+fn source_valid(db: &Connection, scope: &str, id: i64) -> Result<bool> {
+    // Ordinary raw retention is allowed; an epoch change needs a matching raw
+    // row carried forward by settings, never an inference after forgetting.
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM ai_sticker_sources p JOIN ai_conversations c ON c.id=p.conversation_id AND c.scope=p.scope LEFT JOIN messages m ON m.key=p.source_key WHERE p.sticker_id=?1 AND p.scope=?2 AND ((m.key IS NULL AND c.epoch=p.epoch) OR (m.scope=p.scope AND m.conversation_id=p.conversation_id AND m.epoch=c.epoch AND m.revoked=0)) AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources r WHERE r.source_key=p.source_key) AND NOT EXISTS(SELECT 1 FROM ai_sticker_revoked r WHERE r.source_key=p.source_key))",params![id,scope],|r|r.get(0))?)
+}
+
+fn check_not_deleted(db: &Connection, job: &Job, content_hash: &str) -> Result<()> {
+    ensure!(db.query_row("SELECT EXISTS(SELECT 1 FROM messages m WHERE m.key=?1 AND m.scope=?2 AND NOT EXISTS(SELECT 1 FROM ai_sticker_deletions d WHERE d.scope=m.scope AND d.hash=?3 AND m.id<=d.source_cutoff))",params![job.key.key(),job.key.scope.key(),content_hash],|r|r.get::<_,bool>(0))?,"sticker source predates library deletion");
     Ok(())
 }
 
@@ -393,7 +422,7 @@ impl StickerStore {
     }
 
     pub async fn init(&self) -> Result<()> {
-        self.store.migrate("ai_stickers", 1, MIGRATION).await?;
+        init_store(&self.store).await?;
         let active = self.config.enabled;
         let cooldown = i64::try_from(self.config.send_cooldown_secs)?;
         self.store.call(move|db| {
@@ -561,22 +590,11 @@ impl StickerStore {
             .context("sticker embedding disabled")?;
         let generation = host.milky.scope_generation(&job.key.scope)?;
         self.validate_job(job).await?;
-        // Refetch the top-level protocol classification; never trust a temp_url
-        // or promote a normal image because its filename looks like a sticker.
-        let raw = host.milky.get_message_raw(&job.key).await?;
-        ensure!(
-            raw["segments"]
-                .as_array()
-                .is_some_and(
-                    |segments| segments.iter().any(|segment| segment["type"] == "image"
-                        && segment["data"]["resource_id"].as_str() == Some(&job.resource)
-                        && (!job.automatic || segment["data"]["sub_type"] == "sticker"))
-                ),
-            "sticker resource classification changed"
-        );
+        // Verify the top-level image classification and resolve its URL in one
+        // bounded lookup. Each retry rechecks the same message and resource.
         let url = host
             .milky
-            .get_resource_temp_url(&job.key, &job.resource)
+            .get_image_resource_temp_url(&job.key, &job.resource, job.automatic)
             .await?;
         let original = super::vision::download(&url).await?;
         let mime = match image::guess_format(&original)? {
@@ -606,6 +624,7 @@ impl StickerStore {
         let prior_space = fingerprint.clone();
         let prior=self.store.call(move|db|{
             check_job(db,&prior_job)?;
+            check_not_deleted(db,&prior_job,&prior_hash)?;
             Ok(db.query_row("SELECT id FROM ai_stickers WHERE scope=?1 AND hash=?2 AND fingerprint=?3 AND dimensions=?4",params![prior_job.key.scope.key(),prior_hash,prior_space,dimensions],|r|r.get::<_,i64>(0)).optional()?)
         }).await?;
         if let Some(id) = prior {
@@ -615,7 +634,7 @@ impl StickerStore {
             let job = job.clone();
             let content_hash = content_hash.clone();
             return self.store.call(move|db|{
-                let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;check_job(&tx,&job)?;
+                let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;check_job(&tx,&job)?;check_not_deleted(&tx,&job,&content_hash)?;
                 ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM ai_stickers WHERE id=?1 AND scope=?2 AND hash=?3 AND fingerprint=?4 AND dimensions=?5)",params![id,job.key.scope.key(),content_hash,fingerprint,dimensions],|r|r.get::<_,bool>(0))?,"sticker duplicate changed");
                 attach_source(&tx,id,&job)?;tx.commit()?;Ok(())
             }).await;
@@ -627,6 +646,7 @@ impl StickerStore {
         self.store
             .call(move |db| {
                 check_job(db, &capacity_job)?;
+                check_not_deleted(db, &capacity_job, &capacity_hash)?;
                 check_new_capacity(
                     db,
                     &capacity_job.key.scope,
@@ -639,7 +659,7 @@ impl StickerStore {
         let response = embedding
             .embed_jpeg(&thumbnail, cancel, async {
                 host.milky.check_generation(generation)?;
-                self.admit_job(job).await
+                self.admit_job(job, &content_hash).await
             })
             .await?;
         self.usage(embedding.fingerprint(), response.input_tokens)
@@ -766,13 +786,15 @@ impl StickerStore {
         self.store.call(move |db| check_job(db, &job)).await
     }
 
-    async fn admit_job(&self, job: &Job) -> Result<()> {
+    async fn admit_job(&self, job: &Job, content_hash: &str) -> Result<()> {
         let job = job.clone();
+        let content_hash = content_hash.to_owned();
         let cap = self.config.requests_per_hour;
         self.store
             .call(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 check_job(&tx, &job)?;
+                check_not_deleted(&tx, &job, &content_hash)?;
                 admit(&tx, cap)?;
                 tx.commit()?;
                 Ok(())
@@ -1112,7 +1134,7 @@ fn next_reindex(
     dimensions: usize,
     epoch: i64,
 ) -> Result<Option<Reindex>> {
-    let row=db.query_row("SELECT id,scope,revision,hash,thumbnail_hash,thumbnail_bytes FROM ai_stickers s WHERE (fingerprint!=?1 OR dimensions!=?2) AND retry_after<=?3 AND NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=s.scope AND a.enabled=0) AND NOT EXISTS(SELECT 1 FROM scope_plugin_access a WHERE a.scope=s.scope AND a.plugin='ai' AND a.enabled=0) AND NOT EXISTS(SELECT 1 FROM ai_sticker_scopes a WHERE a.scope=s.scope AND a.enabled=0) ORDER BY retry_after,id LIMIT 1",params![fingerprint,dimensions,now()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,usize>(5)?))).optional()?;
+    let row=db.query_row("SELECT id,scope,revision,hash,thumbnail_hash,thumbnail_bytes FROM ai_stickers s WHERE (reindex_requested=1 OR fingerprint!=?1 OR dimensions!=?2) AND retry_after<=?3 AND NOT EXISTS(SELECT 1 FROM scope_access a WHERE a.scope=s.scope AND a.enabled=0) AND NOT EXISTS(SELECT 1 FROM scope_plugin_access a WHERE a.scope=s.scope AND a.plugin='ai' AND a.enabled=0) AND NOT EXISTS(SELECT 1 FROM ai_sticker_scopes a WHERE a.scope=s.scope AND a.enabled=0) ORDER BY retry_after,id LIMIT 1",params![fingerprint,dimensions,now()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,usize>(5)?))).optional()?;
     let Some((id, scope, revision, hash, thumbnail_hash, thumbnail_bytes)) = row else {
         return Ok(None);
     };
@@ -1163,7 +1185,7 @@ fn commit_reindex(
     decode_vector(vector, dimensions)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     check_reindex(&tx, candidate)?;
-    ensure!(tx.execute("UPDATE ai_stickers SET fingerprint=?4,dimensions=?5,vector=?6,revision=revision+1,updated_at=?7,retry_after=0 WHERE id=?1 AND revision=?2 AND hash=?3",params![candidate.id,candidate.revision,candidate.hash,fingerprint,dimensions,vector,now()])?==1,"sticker changed before reindex commit");
+    ensure!(tx.execute("UPDATE ai_stickers SET fingerprint=?4,dimensions=?5,vector=?6,revision=revision+1,updated_at=?7,retry_after=0,reindex_requested=0 WHERE id=?1 AND revision=?2 AND hash=?3",params![candidate.id,candidate.revision,candidate.hash,fingerprint,dimensions,vector,now()])?==1,"sticker changed before reindex commit");
     tx.commit()?;
     Ok(())
 }
@@ -1226,6 +1248,7 @@ fn commit_import(
     decode_vector(&image.vector, image.dimensions)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     check_job(&tx, job)?;
+    check_not_deleted(&tx, job, &image.hash)?;
     let scope = job.key.scope.key();
     check_new_capacity(
         &tx,

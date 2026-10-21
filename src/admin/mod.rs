@@ -9,6 +9,7 @@ pub mod qq;
 pub mod qq_service;
 pub mod runtime;
 pub mod settings;
+pub mod stickers;
 
 use self::{
     auth::{AuthError, AuthGrant, AuthService, TrustedSession},
@@ -96,6 +97,11 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(scope_plugins).post(toggle_scope_plugin),
         )
         .route("/api/budget", get(budget))
+        .route("/api/stickers/groups", get(stickers::groups))
+        .route("/api/stickers/items", get(stickers::items))
+        .route("/api/stickers/items/{id}/image", get(stickers::image))
+        .route("/api/stickers/delete", post(stickers::delete))
+        .route("/api/stickers/reindex", post(stickers::reindex))
         .route("/api/memory/conversations", get(conversations))
         .route("/api/memory/conversations/{id}", get(conversation))
         .route("/api/memory/records", get(memories))
