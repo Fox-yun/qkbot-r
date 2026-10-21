@@ -93,7 +93,7 @@ impl Tool for ReplyTool {
             name: "reply_message",
             plugin: "ai",
             version: 1,
-            description: "结束本轮，提交唯一回复。引用和表情仅接受宿主本轮标识。",
+            description: "提交唯一最终回复，仅用宿主本轮标识。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -108,7 +108,7 @@ impl Tool for ReplyTool {
                     },
                     "sticker_ref": {
                         "type": ["string", "null"],
-                        "description": "可选一张表情，须为本轮search_stickers中已看到预览的候选。"
+                        "description": "本轮已预览候选的引用，最多一张。"
                     },
                     "text": {"type": "string", "minLength": 1}
                 },

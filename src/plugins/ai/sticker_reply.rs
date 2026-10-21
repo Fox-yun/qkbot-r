@@ -1,6 +1,6 @@
 //! Ephemeral candidates: only thumbnails actually shown in this turn grant a send reference.
 use super::{
-    stickers::{self, Candidate},
+    stickers::{self, Candidate, SearchResult, SearchStatus},
     vision::{LoadedImage, Origin},
 };
 use crate::{host::Host, types::Scope};
@@ -38,15 +38,23 @@ impl StickerTurn {
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
-    pub(super) async fn replace(&mut self, candidates: Vec<Candidate>) -> Result<Value> {
+    pub(super) async fn replace(&mut self, search: SearchResult) -> Result<Value> {
         self.candidates.clear();
         self.sheet = None;
         self.visible = false;
-        let candidates: Vec<_> = candidates.into_iter().take(3).collect();
+        let candidates: Vec<_> = search.candidates.into_iter().take(3).collect();
         if candidates.is_empty() {
-            return Ok(
-                json!({"candidates":[],"note":"本群暂无可用候选或仍在冷却，请用文字回复。"}),
-            );
+            let note = match search.status {
+                SearchStatus::Empty => "本群图库为空，可提示引用图片 /save。",
+                SearchStatus::Cooldown => "本群有图片，但发送正在冷却；稍后再试，不是空库。",
+                SearchStatus::IndexPending => {
+                    "本群有图片，但当前模型的向量索引尚未就绪；不是空库。"
+                }
+                SearchStatus::Disabled => "当前会话的表情检索不可用，不能据此判断图库为空。",
+                _ => "本轮未能读取有效候选，不能据此判断图库为空。",
+            };
+            return Ok(json!({"status":search.status.label(),"candidate_count":0,
+                "preview_included":false,"candidates":[],"note":note}));
         }
         let thumbnails = candidates
             .iter()
@@ -64,7 +72,8 @@ impl StickerTurn {
             self.candidates.insert(reference, candidate);
         }
         Ok(
-            json!({"candidates":result,"note":"候选从左到右对应position；看图后可选一张，或只回文字。"}),
+            json!({"status":"ready","candidate_count":result.len(),"preview_included":true,
+            "candidates":result,"note":"预览从左到右对应position；用sticker_ref选图。"}),
         )
     }
 
@@ -83,6 +92,14 @@ impl StickerTurn {
                 .flatten()
                 .any(|p| p["type"] == "image_url" && p["image_url"]["url"].as_str() == Some(sheet));
         }
+    }
+
+    pub(super) fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub(super) fn preview_visible(&self) -> bool {
+        self.visible
     }
 
     pub(super) async fn check(&self, host: &Host, scope: &Scope) -> Result<()> {
@@ -229,7 +246,13 @@ mod tests {
             score: 1.0,
         };
         let mut turn = StickerTurn::default();
-        let result = turn.replace(vec![candidate]).await.unwrap();
+        let result = turn
+            .replace(SearchResult {
+                status: SearchStatus::Ready,
+                candidates: vec![candidate],
+            })
+            .await
+            .unwrap();
         let reference = result["candidates"][0]["sticker_ref"]
             .as_str()
             .unwrap()
@@ -246,7 +269,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        turn.replace(vec![]).await.unwrap();
+        turn.replace(SearchResult {
+            status: SearchStatus::Empty,
+            candidates: vec![],
+        })
+        .await
+        .unwrap();
         assert!(
             turn.take_reference(&mut json!({"sticker_ref":reference}))
                 .is_err()

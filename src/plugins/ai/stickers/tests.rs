@@ -103,6 +103,114 @@ fn incoming(segments: serde_json::Value) -> Incoming {
 }
 
 #[test]
+fn search_status_distinguishes_empty_groups_from_cooldown_and_other_scopes() {
+    let (mut db, job, image) = fixture();
+    assert_eq!(
+        search_availability(&db, &scope(), "space", 64, 1000).unwrap(),
+        SearchStatus::Empty
+    );
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    for other in [
+        Scope {
+            bot_id: 2,
+            ..scope()
+        },
+        Scope {
+            peer_id: 3,
+            ..scope()
+        },
+    ] {
+        db.execute(
+            "INSERT INTO ai_sticker_scopes(scope,last_sent_at) VALUES(?1,1000)",
+            [other.key()],
+        )
+        .unwrap();
+        assert_eq!(
+            search_availability(&db, &other, "space", 64, 1000).unwrap(),
+            SearchStatus::Empty,
+            "another account/group's image and an empty scope's cooldown cannot imply local images"
+        );
+    }
+    db.execute(
+        "INSERT INTO ai_sticker_scopes(scope,last_sent_at) VALUES(?1,1000)",
+        [scope().key()],
+    )
+    .unwrap();
+    assert_eq!(
+        search_availability(&db, &scope(), "space", 64, 1059).unwrap(),
+        SearchStatus::Cooldown
+    );
+    assert_eq!(
+        search_availability(&db, &scope(), "space", 64, 1060).unwrap(),
+        SearchStatus::Ready
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT last_sent_at FROM ai_sticker_scopes WHERE scope=?1",
+            [scope().key()],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1000,
+        "status checks must not consume or extend cooldown"
+    );
+}
+
+#[test]
+fn search_status_reports_pending_index_for_existing_images_with_another_space() {
+    let (mut db, job, image) = fixture();
+    commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+    for (fingerprint, dimensions, expected) in [
+        ("new-space", 64, SearchStatus::IndexPending),
+        ("space", 128, SearchStatus::IndexPending),
+        ("new-space", 128, SearchStatus::IndexPending),
+        ("space", 64, SearchStatus::Ready),
+    ] {
+        assert_eq!(
+            search_availability(&db, &scope(), fingerprint, dimensions, 1000).unwrap(),
+            expected
+        );
+    }
+    db.execute(
+        "INSERT INTO ai_sticker_scopes(scope,last_sent_at) VALUES(?1,1000)",
+        [scope().key()],
+    )
+    .unwrap();
+    assert_eq!(
+        search_availability(&db, &scope(), "new-space", 128, 1000).unwrap(),
+        SearchStatus::Cooldown,
+        "an existing library in cooldown is temporarily unavailable regardless of indexing"
+    );
+}
+
+#[test]
+fn search_finalization_preserves_source_guards_and_does_not_report_false_empty() {
+    for mutation in [
+        "UPDATE messages SET revoked=1",
+        "INSERT INTO ai_sticker_revoked VALUES('1:group:2:3',1)",
+        "UPDATE ai_conversations SET epoch=2",
+        "UPDATE ai_stickers SET revision=revision+1",
+        "UPDATE ai_sticker_control SET enabled=0",
+    ] {
+        let (mut db, job, image) = fixture();
+        commit_import(&mut db, &job, &image, &StickerConfig::default()).unwrap();
+        let candidate = candidate(&db);
+        let found = finish_search(&db, &scope(), vec![candidate.clone()]);
+        assert_eq!(found.status, SearchStatus::Ready);
+        assert_eq!(found.candidates.len(), 1);
+        assert_eq!(found.candidates[0].id, candidate.id);
+        db.execute(mutation, []).unwrap();
+        let unavailable = finish_search(&db, &scope(), vec![candidate]);
+        assert_eq!(unavailable.status, SearchStatus::Unavailable, "{mutation}");
+        assert!(unavailable.candidates.is_empty(), "{mutation}");
+    }
+    let (db, _, _) = fixture();
+    let unavailable = finish_search(&db, &scope(), vec![]);
+    assert_eq!(unavailable.status, SearchStatus::Unavailable);
+    assert!(unavailable.candidates.is_empty());
+}
+
+#[test]
 fn only_top_level_explicit_stickers_are_automatically_queued() {
     let message = incoming(json!([
         {"type":"image","data":{"resource_id":"normal","sub_type":"normal"}},

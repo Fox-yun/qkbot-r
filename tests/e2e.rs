@@ -1797,6 +1797,9 @@ async fn sticker_search_shows_thumbnail_then_sends_one_selected_image_with_reply
         .unwrap();
     let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
     let candidates = result["candidates"].as_array().unwrap();
+    assert_eq!(result["status"], "ready");
+    assert_eq!(result["candidate_count"], 1);
+    assert_eq!(result["preview_included"], true);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0]["position"], 1);
     let previews: Vec<_> = messages
@@ -1866,6 +1869,226 @@ async fn sticker_search_shows_thumbnail_then_sends_one_selected_image_with_reply
     assert!(mock.resources.try_recv().is_err());
     drop(host);
     mock.stop().await;
+}
+
+#[tokio::test]
+async fn sticker_search_budget_omits_unseen_references_without_claiming_empty_library() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.plugins.ai.defaults = qkbot::config::AiSettings::default();
+        enable_sticker_search(config, &mock.url);
+    })
+    .await;
+    assert_eq!(host.config.plugins.ai.defaults.input_budget, 6000);
+    let incoming = message(1, "发一个庆祝表情");
+    seed_sticker(&host, &incoming).await;
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    let mut response = model_tool_response(vec![model_tool_call(
+        "find-with-long-explanation",
+        "search_stickers",
+        json!({"query":"开心庆祝"}),
+    )]);
+    response["choices"][0]["message"]["content"] = json!("");
+    let reply_tools: Vec<_> = request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["function"]["name"] == "reply_message")
+        .cloned()
+        .collect();
+    assert_eq!(reply_tools.len(), 1);
+    let mut lower_bound_messages = request.body["messages"].as_array().unwrap().clone();
+    assert_eq!(
+        lower_bound_messages.len(),
+        2,
+        "the budget fixture must have no removable history"
+    );
+    assert_eq!(lower_bound_messages[0]["role"], "system");
+    assert_eq!(lower_bound_messages[1]["role"], "user");
+    lower_bound_messages.push(response["choices"][0]["message"].clone());
+    let estimate = qkbot::plugins::ai::memory::estimate_tokens;
+    let lower_bound = estimate(&serde_json::to_string(&lower_bound_messages).unwrap())
+        + estimate(&serde_json::to_string(&reply_tools).unwrap())
+        + 64;
+    // Preserve the default budget. The complete native assistant message alone
+    // leaves less than the 1280-image reserve, while retaining 1100 bytes for the
+    // actual tool result and the explicit unavailable-preview explanation.
+    let padding = 4900usize
+        .checked_sub(lower_bound)
+        .expect("the fixture must leave room for a bounded assistant explanation");
+    assert!(padding > 0);
+    response["choices"][0]["message"]["content"] = json!("a".repeat(padding));
+    let assistant = response["choices"][0]["message"].clone();
+    request.reply.send(response).unwrap();
+    let embedding = within(mock.embeddings.recv()).await.unwrap();
+    embedding.reply.send(json!({"object":"list","model":"Qwen/Qwen3-VL-Embedding-8B","data":[{"object":"embedding","index":0,"embedding":sticker_vector()}],"usage":{"prompt_tokens":3,"total_tokens":3}})).unwrap();
+    let followup = mock.model().await;
+    let messages = followup.body["messages"].as_array().unwrap();
+    let index = messages
+        .iter()
+        .position(|message| message == &assistant)
+        .unwrap();
+    assert_eq!(messages[index + 1]["role"], "tool");
+    assert_eq!(
+        messages[index + 1]["tool_call_id"],
+        "find-with-long-explanation"
+    );
+    let result: Value =
+        serde_json::from_str(messages[index + 1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "preview_unavailable");
+    assert!(result["candidate_count"].as_u64().unwrap() > 0);
+    assert_eq!(result["preview_included"], false);
+    assert!(result["candidates"].as_array().unwrap().is_empty());
+    let note = result["note"].as_str().unwrap();
+    assert!(note.contains("预算") && note.contains("预览"));
+    assert!(!result.to_string().contains("sticker_ref"));
+    assert!(
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .all(|part| part["type"] != "image_url")
+    );
+    assert!(mock.sends.try_recv().is_err());
+    followup.reply.send(model_tool_response(vec![model_tool_call(
+        "explain-unavailable-preview", "reply_message",
+        json!({"text":"图库有候选，但本轮预算不足以展示预览，先用文字庆祝！", "reply_to":current["message_ref"]}),
+    )])).unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    let expected = json!([
+        {"type":"reply","data":{"message_seq":1}},
+        {"type":"text","data":{"text":"图库有候选，但本轮预算不足以展示预览，先用文字庆祝！"}},
+    ]);
+    assert_eq!(sent["message"], expected);
+    wait_for_outbox(&host, "confirmed", 1).await;
+    let saved: String = host
+        .store
+        .call(|db| {
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM ai_stickers", [], |row| row
+                    .get::<_, i64>(0))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row
+                    .get::<_, i64>(0))?,
+                1
+            );
+            Ok(db.query_row(
+                "SELECT body FROM outbox WHERE state='confirmed'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved).unwrap()["segments"],
+        expected
+    );
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.embeddings.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn sticker_search_nonempty_library_reports_cooldown_and_index_pending_without_embedding() {
+    for status in ["cooldown", "index_pending"] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_reply_with(&mock, |config| {
+            config.plugins.ai.defaults = qkbot::config::AiSettings::default();
+            enable_sticker_search(config, &mock.url);
+        })
+        .await;
+        let incoming = message(1, "发一个庆祝表情");
+        seed_sticker(&host, &incoming).await;
+        host.store.call(move |db| {
+            match status {
+                "cooldown" => { db.execute("INSERT INTO ai_sticker_scopes(scope,last_sent_at) VALUES('123:group:456',?1)", [now()])?; }
+                "index_pending" => { db.execute("UPDATE ai_stickers SET fingerprint='synthetic-previous-space'", [])?; }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }).await.unwrap();
+        router.dispatch(incoming).await.unwrap();
+        let request = mock.model().await;
+        let current = current_message_payload(&request.body);
+        request
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                "find-unavailable-library",
+                "search_stickers",
+                json!({"query":"庆祝"}),
+            )]))
+            .unwrap();
+        let followup = mock.model().await;
+        let messages = followup.body["messages"].as_array().unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "find-unavailable-library")
+            .unwrap();
+        let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["status"], status);
+        assert_eq!(result["preview_included"], false);
+        assert!(result["candidates"].as_array().unwrap().is_empty());
+        assert!(
+            messages
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .all(|part| part["type"] != "image_url")
+        );
+        assert!(mock.embeddings.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        let text = if status == "cooldown" {
+            "图库有图，目前仍在冷却。"
+        } else {
+            "图库有图，正在等待索引。"
+        };
+        followup
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                "explain-library-status",
+                "reply_message",
+                json!({"text":text,"reply_to":current["message_ref"]}),
+            )]))
+            .unwrap();
+        let sent = within(mock.sends.recv()).await.unwrap();
+        assert_eq!(
+            sent["message"],
+            json!([
+                {"type":"reply","data":{"message_seq":1}},
+                {"type":"text","data":{"text":text}},
+            ])
+        );
+        wait_for_outbox(&host, "confirmed", 1).await;
+        host.store
+            .call(|db| {
+                assert_eq!(
+                    db.query_row("SELECT COUNT(*) FROM ai_stickers", [], |row| row
+                        .get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.sends.try_recv().is_err());
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.embeddings.try_recv().is_err());
+        assert!(mock.quotes.try_recv().is_err());
+        assert!(mock.resources.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -1957,6 +2180,9 @@ async fn sticker_search_in_empty_group_never_borrows_another_groups_image() {
         .find(|message| message["tool_call_id"] == "find-empty-group")
         .unwrap();
     let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "empty");
+    assert_eq!(result["candidate_count"], 0);
+    assert_eq!(result["preview_included"], false);
     assert!(result["candidates"].as_array().unwrap().is_empty());
     assert!(
         messages

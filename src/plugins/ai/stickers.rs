@@ -130,6 +130,44 @@ pub struct Candidate {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStatus {
+    Ready,
+    Empty,
+    Cooldown,
+    IndexPending,
+    Unavailable,
+    Disabled,
+}
+
+impl SearchStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Empty => "empty",
+            Self::Cooldown => "cooldown",
+            Self::IndexPending => "index_pending",
+            Self::Unavailable => "unavailable",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub candidates: Vec<Candidate>,
+    pub status: SearchStatus,
+}
+
+impl SearchResult {
+    fn without_candidates(status: SearchStatus) -> Self {
+        Self {
+            candidates: Vec::new(),
+            status,
+        }
+    }
+}
+
 pub struct StoredImage {
     pub bytes: Vec<u8>,
     pub mime: String,
@@ -364,6 +402,52 @@ fn source_valid(db: &Connection, scope: &str, id: i64) -> Result<bool> {
     // Ordinary raw retention is allowed; an epoch change needs a matching raw
     // row carried forward by settings, never an inference after forgetting.
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM ai_sticker_sources p JOIN ai_conversations c ON c.id=p.conversation_id AND c.scope=p.scope LEFT JOIN messages m ON m.key=p.source_key WHERE p.sticker_id=?1 AND p.scope=?2 AND ((m.key IS NULL AND c.epoch=p.epoch) OR (m.scope=p.scope AND m.conversation_id=p.conversation_id AND m.epoch=c.epoch AND m.revoked=0)) AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources r WHERE r.source_key=p.source_key) AND NOT EXISTS(SELECT 1 FROM ai_sticker_revoked r WHERE r.source_key=p.source_key))",params![id,scope],|r|r.get(0))?)
+}
+
+/// Read under one snapshot. A temporary search restriction does not mean that
+/// this group's library is empty; another group's records never affect it.
+fn search_availability(
+    db: &Connection,
+    scope: &Scope,
+    fingerprint: &str,
+    dimensions: usize,
+    at: i64,
+) -> Result<SearchStatus> {
+    let key = scope.key();
+    let (total, indexed): (i64, i64) = db.query_row(
+        "SELECT COUNT(*),COUNT(CASE WHEN fingerprint=?2 AND dimensions=?3 THEN 1 END) FROM ai_stickers WHERE scope=?1",
+        params![key, fingerprint, dimensions],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if total == 0 {
+        return Ok(SearchStatus::Empty);
+    }
+    let ready: bool = db.query_row(
+        "SELECT COALESCE((SELECT last_sent_at FROM ai_sticker_scopes WHERE scope=?1),0)+cooldown_secs<=?2 FROM ai_sticker_control WHERE id=1",
+        params![key, at],
+        |row| row.get(0),
+    )?;
+    Ok(if !ready {
+        SearchStatus::Cooldown
+    } else if indexed == 0 {
+        SearchStatus::IndexPending
+    } else {
+        SearchStatus::Ready
+    })
+}
+
+fn finish_search(db: &Connection, scope: &Scope, mut candidates: Vec<Candidate>) -> SearchResult {
+    candidates.retain(|candidate| {
+        check_candidate(db, scope, candidate.id, candidate.revision, &candidate.hash).is_ok()
+    });
+    SearchResult {
+        status: if candidates.is_empty() {
+            SearchStatus::Unavailable
+        } else {
+            SearchStatus::Ready
+        },
+        candidates,
+    }
 }
 
 fn check_not_deleted(db: &Connection, job: &Job, content_hash: &str) -> Result<()> {
@@ -816,7 +900,7 @@ impl StickerStore {
         source_key: &str,
         query: &str,
         cancel: &CancellationToken,
-    ) -> Result<Vec<Candidate>> {
+    ) -> Result<SearchResult> {
         if !self.config.enabled
             || !host.config.plugins.ai.enabled
             || host.embedding.is_none()
@@ -824,7 +908,7 @@ impl StickerStore {
             || query.trim().is_empty()
             || !self.enabled(scope).await?
         {
-            return Ok(vec![]);
+            return Ok(SearchResult::without_candidates(SearchStatus::Disabled));
         }
         ensure!(query.len() <= 8192, "sticker query too large");
         let embedding = host.embedding.as_ref().expect("checked embedding");
@@ -845,12 +929,17 @@ impl StickerStore {
         let dimensions = embedding.dimensions();
         let physical = scope.clone();
         let space = fingerprint.clone();
-        let available=self.store.call(move|db|{
-            let ready:bool=db.query_row("SELECT COALESCE((SELECT last_sent_at FROM ai_sticker_scopes WHERE scope=?1),0)+cooldown_secs<=?2 FROM ai_sticker_control WHERE id=1",params![physical.key(),now()],|r|r.get(0))?;
-            Ok(ready && db.query_row("SELECT EXISTS(SELECT 1 FROM ai_stickers WHERE scope=?1 AND fingerprint=?2 AND dimensions=?3)",params![physical.key(),space,dimensions],|r|r.get::<_,bool>(0))?)
-        }).await?;
-        if !available {
-            return Ok(vec![]);
+        let availability = self
+            .store
+            .call(move |db| {
+                let tx = db.unchecked_transaction()?;
+                let status = search_availability(&tx, &physical, &space, dimensions, now())?;
+                tx.commit()?;
+                Ok(status)
+            })
+            .await?;
+        if availability != SearchStatus::Ready {
+            return Ok(SearchResult::without_candidates(availability));
         }
         let response = embedding
             .embed_text(query, cancel, async {
@@ -924,18 +1013,9 @@ impl StickerStore {
             .call(move |db| {
                 let tx = db.unchecked_transaction()?;
                 check_turn(&tx, &physical, &expected, &context, &source)?;
-                candidates.retain(|candidate| {
-                    check_candidate(
-                        &tx,
-                        &physical,
-                        candidate.id,
-                        candidate.revision,
-                        &candidate.hash,
-                    )
-                    .is_ok()
-                });
+                let result = finish_search(&tx, &physical, candidates);
                 tx.commit()?;
-                Ok(candidates)
+                Ok(result)
             })
             .await
     }
