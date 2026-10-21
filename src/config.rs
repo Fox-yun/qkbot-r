@@ -461,7 +461,7 @@ impl Default for AiConfig {
             compact_after_messages: 40,
             compact_idle_secs: 600,
             memory_input_budget: 6000,
-            memory_output_budget: 1600,
+            memory_output_budget: 3200,
             max_memories_per_conversation: 256,
             memory_recall_limit: 5,
             memory_recall_budget: 1000,

@@ -975,3 +975,112 @@ async fn third_party_event_evidence_rejects_every_change_without_advancing_the_c
     host.store.stop().await.unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn sixteen_daily_events_commit_together_with_their_own_evidence_and_retention() {
+    const EVENTS: [&str; 16] = [
+        "2026-02-03 我早餐吃了豆浆油条",
+        "2026-02-03 我坐地铁去学校",
+        "2026-02-03 我在图书馆借了一本小说",
+        "2026-02-03 我午饭吃了番茄鸡蛋面",
+        "2026-02-03 我买了一袋橘子",
+        "2026-02-03 我给阳台的花浇了水",
+        "2026-02-03 我整理了书桌",
+        "2026-02-03 我把自行车轮胎打足了气",
+        "2026-02-03 我洗了运动服",
+        "2026-02-03 我在操场慢跑了三公里",
+        "2026-02-03 我听完了一期旅行播客",
+        "2026-02-03 我给朋友寄出了明信片",
+        "2026-02-03 我晚饭煮了小米粥",
+        "2026-02-03 我把周末照片整理好了",
+        "2026-02-03 我看完了一集纪录片",
+        "2026-02-03 我通过了毕业答辩",
+    ];
+    let (host, chat, model, server) = setup(
+        |config| {
+            config.plugins.ai.defaults.summary = false;
+            // Keep all sixteen separate source messages in this one frozen
+            // batch, so input trimming cannot conceal the change-count limit.
+            config.plugins.ai.memory_input_budget = 16_000;
+        },
+        |batch| {
+            assert_eq!(batch["memory_write"], true);
+            assert_eq!(batch["summary_enabled"], false);
+            assert_eq!(batch["through_position"], 16);
+            let sources = batch["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), EVENTS.len());
+            let changes: Vec<Value> = sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    assert_eq!(source["subject_id"], 7);
+                    assert_eq!(source["role"], "user");
+                    assert_eq!(source["memory_eligible"], true);
+                    assert_eq!(source["text"], EVENTS[index]);
+                    assert_eq!(source["received_at"], EVENT_SOURCE_TIME);
+                    json!({
+                        "op":"upsert", "id":null, "subject_id":7, "kind":"event",
+                        "text":source["text"],
+                        "evidence":[{"source_key":source["key"],"quote":source["text"]}],
+                        "ttl_days":if index == EVENTS.len()-1 { Value::Null } else { json!(30) }
+                    })
+                })
+                .collect();
+            fenced(json!({"summary":"","changes":changes}))
+        },
+    )
+    .await;
+    host.store
+        .call(|db| {
+            let received_at = chrono::DateTime::parse_from_rfc3339(EVENT_SOURCE_TIME)?.timestamp();
+            for (index, text) in EVENTS.iter().enumerate() {
+                let position = index as i64 + 1;
+                seed(db, "daily-events", 1, true, "{}", position)?;
+                db.execute(
+                    "UPDATE messages SET content=?1,received_at=?2 WHERE key=?3",
+                    params![text, received_at, format!("daily-events:{position}")],
+                )?;
+            }
+            db.execute(
+                "UPDATE ai_conversations SET summary='保留既有生活摘要' WHERE id='daily-events'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    host.store.call(|db| {
+        let state: (String,i64,i64) = db.query_row(
+            "SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='daily-events'",[],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        )?;
+        assert_eq!(state,("保留既有生活摘要".into(),0,16));
+        for table in ["ai_memories","ai_memory_provenance","ai_memory_search"] {
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|row|row.get::<_,i64>(0))?,16);
+        }
+        for (index, text) in EVENTS.iter().enumerate() {
+            let stored: (i64,String,String,String,i64,Option<i64>) = db.query_row(
+                "SELECT subject_id,kind,origin,evidence,created_at,expires_at FROM ai_memories WHERE conversation_id='daily-events' AND text=?1",
+                [text], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )?;
+            assert_eq!((stored.0,stored.1.as_str(),stored.2.as_str()),(7,"event","auto"));
+            let source_key = format!("daily-events:{}",index+1);
+            assert_eq!(serde_json::from_str::<Value>(&stored.3)?,json!([{"source_key":source_key,"quote":text}]));
+            let quote: String = db.query_row("SELECT quote FROM ai_memory_provenance WHERE source_key=?1",[source_key],|row|row.get(0))?;
+            assert_eq!(quote,*text);
+            assert_eq!(stored.5,if index == EVENTS.len()-1 { None } else { Some(stored.4 + 30*86_400) });
+        }
+        Ok(())
+    }).await.unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(
+        model.inputs.lock().unwrap().len(),
+        1,
+        "a committed batch must not be extracted again"
+    );
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}

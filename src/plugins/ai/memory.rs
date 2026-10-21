@@ -11,7 +11,7 @@ use crate::{
 };
 
 const MEMORY_PAGE_SIZE: usize = 20;
-const MAX_CHANGES: usize = 8;
+const MAX_CHANGES: usize = 16;
 const MAX_SOURCE_ROWS: usize = 48;
 const MAX_SOURCE_BYTES: usize = 24_000;
 const MAX_MEMORY_CHARS: usize = 180;
@@ -1800,6 +1800,42 @@ mod tests {
         db.execute("UPDATE messages SET inbound_position=id WHERE id=?1", [id])
             .unwrap();
         id
+    }
+
+    #[test]
+    fn overfull_daily_batch_leaves_memories_and_cursors_unchanged() {
+        let mut db = db();
+        let through = source(&db, "daily", 7, "今天散步了", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        let changes = (0..17)
+            .map(|_| MemoryChange::Upsert {
+                id: None,
+                subject_id: 7,
+                kind: MemoryKind::Event,
+                text: "今天散步了".into(),
+                evidence: evidence("daily", "今天散步了"),
+                ttl_days: Some(30),
+            })
+            .collect();
+        let error = commit_batch(
+            &mut db,
+            batch,
+            BatchUpdate {
+                summary: "日常活动".into(),
+                changes,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(memory_commit_failure_reason(&error), "change_count");
+        assert!(list_memories(&db, "group", None).unwrap().is_empty());
+        let state: (String, i64, i64) = db
+            .query_row(
+                "SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='group'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (String::new(), 0, 0));
     }
 
     #[test]
