@@ -98,6 +98,143 @@ impl std::fmt::Display for TruncatedToolResponse {
 
 impl std::error::Error for TruncatedToolResponse {}
 
+const MAX_TOOL_CALL_ID_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidCallIdReason {
+    Empty,
+    TooLong,
+    Control,
+    Missing,
+    NotString,
+}
+
+impl InvalidCallIdReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::TooLong => "too_long",
+            Self::Control => "control",
+            Self::Missing => "missing",
+            Self::NotString => "not_string",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InvalidToolCallId {
+    reason: InvalidCallIdReason,
+    id_bytes: Option<usize>,
+}
+
+impl std::fmt::Display for InvalidToolCallId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("模型返回的工具调用标识无效，本批工具调用未执行。")
+    }
+}
+
+impl std::error::Error for InvalidToolCallId {}
+
+fn validate_tool_call_id(id: &str) -> Result<()> {
+    let reason = if id.is_empty() {
+        InvalidCallIdReason::Empty
+    } else if id.len() > MAX_TOOL_CALL_ID_BYTES {
+        InvalidCallIdReason::TooLong
+    } else if id.chars().any(char::is_control) {
+        InvalidCallIdReason::Control
+    } else {
+        return Ok(());
+    };
+    Err(InvalidToolCallId {
+        reason,
+        id_bytes: Some(id.len()),
+    }
+    .into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    Timeout,
+    Connect,
+    Request,
+    Body,
+    Builder,
+    Decode,
+    Redirect,
+    Other,
+}
+
+impl TransportKind {
+    fn classify(error: &reqwest::Error) -> Self {
+        // A connect timeout is both kinds: its actionable classification is timeout.
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_request() {
+            Self::Request
+        } else if error.is_body() {
+            Self::Body
+        } else if error.is_builder() {
+            Self::Builder
+        } else if error.is_decode() {
+            Self::Decode
+        } else if error.is_redirect() {
+            Self::Redirect
+        } else {
+            Self::Other
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Body => "body",
+            Self::Builder => "builder",
+            Self::Decode => "decode",
+            Self::Redirect => "redirect",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ModelHttpFailure(TransportKind);
+
+impl std::fmt::Display for ModelHttpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.0 {
+            TransportKind::Timeout => "模型请求超时，当前请求尚未取得模型响应。",
+            TransportKind::Connect => "无法连接模型服务，当前请求尚未取得模型响应。",
+            _ => "模型请求传输失败，当前请求尚未取得模型响应。",
+        })
+    }
+}
+
+impl std::error::Error for ModelHttpFailure {}
+
+fn transport_io_kind(error: &reqwest::Error) -> Option<&'static str> {
+    let mut source = std::error::Error::source(error);
+    for _ in 0..8 {
+        let current = source?;
+        if let Some(error) = current.downcast_ref::<std::io::Error>() {
+            return Some(match error.kind() {
+                std::io::ErrorKind::ConnectionReset => "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                std::io::ErrorKind::ConnectionRefused => "connection_refused",
+                std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+                std::io::ErrorKind::TimedOut => "timed_out",
+                _ => "other",
+            });
+        }
+        source = current.source();
+    }
+    None
+}
+
 // Read only integer counters. No provider text, tool names or arguments are
 // retained here, including when those fields are malformed or adversarial.
 #[derive(Debug, PartialEq, Eq)]
@@ -362,6 +499,7 @@ impl Llm {
             allowed_tools.len() == tools.len(),
             "duplicate model tool names"
         );
+        let tool_count = tools.len();
         let mut body = json!({"model": self.config.model, "messages": messages,
             "max_tokens": max_output, "stream": false});
         if !tools.is_empty() {
@@ -398,10 +536,37 @@ impl Llm {
             if let Some((milky, generation)) = account {
                 milky.check_generation(generation)?;
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("model HTTP transport failed"))?;
+            let started = std::time::Instant::now();
+            let mut request_bytes = None;
+            let response = match request.build() {
+                Ok(request) => {
+                    // .json() already serialized this body; count the existing
+                    // bytes without logging, cloning or serializing it again.
+                    request_bytes = request
+                        .body()
+                        .and_then(reqwest::Body::as_bytes)
+                        .map(<[u8]>::len);
+                    self.http.execute(request).await
+                }
+                Err(error) => Err(error),
+            }
+            .map_err(|error| {
+                let kind = TransportKind::classify(&error);
+                tracing::warn!(
+                    phase = "headers",
+                    kind = kind.label(),
+                    io_kind = transport_io_kind(&error),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    timeout_secs = self.config.request_timeout_secs,
+                    image_count,
+                    max_output,
+                    tool_count,
+                    request_bytes,
+                    "model HTTP request failed"
+                );
+                // Do not retain reqwest's source chain: it can include the URL.
+                ModelHttpFailure(kind)
+            })?;
             ensure!(
                 response.status().is_success(),
                 "model HTTP status {}",
@@ -428,6 +593,18 @@ impl Llm {
                     reasoning_tokens = metadata.reasoning_tokens,
                     tool_call_count = metadata.tool_call_count,
                     "model tool response reached output limit"
+                );
+            }
+            if let Some(error) = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<InvalidToolCallId>())
+            {
+                tracing::warn!(
+                    reason = error.reason.label(),
+                    id_bytes = error.id_bytes,
+                    max_id_bytes = MAX_TOOL_CALL_ID_BYTES,
+                    "model tool response had invalid call id"
                 );
             }
             result
@@ -464,11 +641,15 @@ fn tool_calls(message: &Value) -> Result<Vec<(String, String)>> {
         .iter()
         .map(|call| {
             ensure!(call["type"] == "function", "unsupported tool call type");
-            let id = call["id"].as_str().context("tool call missing id")?;
-            ensure!(
-                !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control),
-                "invalid tool call id"
-            );
+            let value = call.get("id").ok_or(InvalidToolCallId {
+                reason: InvalidCallIdReason::Missing,
+                id_bytes: None,
+            })?;
+            let id = value.as_str().ok_or(InvalidToolCallId {
+                reason: InvalidCallIdReason::NotString,
+                id_bytes: None,
+            })?;
+            validate_tool_call_id(id)?;
             ensure!(ids.insert(id), "duplicate tool call id in response");
             let name = call["function"]["name"]
                 .as_str()
@@ -754,6 +935,62 @@ fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmRe
 mod tests {
     use super::*;
     use crate::milky::tests::server;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn diagnostic_log() -> (DiagnosticLog, impl tracing::Subscriber + Send + Sync) {
+        let log = DiagnosticLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        (log, subscriber)
+    }
+
+    impl DiagnosticLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    async fn read_synthetic_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            assert!(bytes.len() <= 128 * 1024);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse().ok())
+                    })
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
 
     fn response(message: Value) -> Value {
         json!({"model":"test", "choices":[{"message":message,"finish_reason":"stop"}], "usage":{"prompt_tokens":10,"completion_tokens":2}})
@@ -1219,6 +1456,151 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tool_ids_report_safe_reasons_and_preserve_valid_opaque_ids() {
+        let allowed = HashSet::from(["clock_now".to_owned()]);
+        for (id, reason) in [
+            (String::new(), InvalidCallIdReason::Empty),
+            ("x".repeat(129), InvalidCallIdReason::TooLong),
+            ("private-id\n".to_owned(), InvalidCallIdReason::Control),
+            (
+                "private-id\u{0085}".to_owned(),
+                InvalidCallIdReason::Control,
+            ),
+        ] {
+            let message = json!({"role":"assistant","content":null,"tool_calls":[call(&id)]});
+            let error = parse_response(response(message), &allowed).unwrap_err();
+            let typed = error.downcast_ref::<InvalidToolCallId>().unwrap();
+            assert_eq!(typed.reason, reason);
+            assert_eq!(typed.id_bytes, Some(id.len()));
+            assert_eq!(
+                error.to_string(),
+                "模型返回的工具调用标识无效，本批工具调用未执行。"
+            );
+            assert!(std::error::Error::source(typed).is_none());
+            assert!(!format!("{error:#?}").contains("private"));
+        }
+        for id in [
+            "x".repeat(128),
+            "界".repeat(42) + "ab",
+            "opaque /+= id".to_owned(),
+        ] {
+            assert!(validate_tool_call_id(&id).is_ok());
+            let message = json!({"role":"assistant","content":null,"tool_calls":[call(&id)]});
+            let parsed = parse_response(response(message.clone()), &allowed).unwrap();
+            assert_eq!(parsed.message, message);
+            assert!(
+                validate_messages(&[
+                    parsed.message,
+                    json!({"role":"tool","tool_call_id":id,"content":"result"})
+                ])
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_and_non_string_tool_ids_have_distinct_safe_diagnostics() {
+        let allowed = HashSet::from(["clock_now".to_owned()]);
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(json!(123)),
+            Some(json!({"private-id":true})),
+        ] {
+            let reason = if value.is_none() {
+                InvalidCallIdReason::Missing
+            } else {
+                InvalidCallIdReason::NotString
+            };
+            let mut entry = call("unused");
+            match value {
+                Some(value) => entry["id"] = value,
+                None => {
+                    entry.as_object_mut().unwrap().remove("id");
+                }
+            }
+            let message = json!({"role":"assistant","content":null,"tool_calls":[entry]});
+            let error = parse_response(response(message), &allowed).unwrap_err();
+            let typed = error.downcast_ref::<InvalidToolCallId>().unwrap();
+            assert_eq!(typed.reason, reason);
+            assert_eq!(typed.id_bytes, None);
+            assert!(!format!("{error:#?}").contains("private"));
+        }
+    }
+
+    #[test]
+    fn invalid_tool_id_rejects_whole_batch_after_provider_block_and_length_checks() {
+        let allowed = HashSet::from(["clock_now".to_owned()]);
+        for calls in [vec![call("valid"), call("")], vec![call(""), call("valid")]] {
+            let value =
+                response(json!({"role":"assistant","content":"private text","tool_calls":calls}));
+            assert!(
+                parse_response(value.clone(), &allowed)
+                    .unwrap_err()
+                    .is::<InvalidToolCallId>()
+            );
+            let mut truncated = value.clone();
+            truncated["choices"][0]["finish_reason"] = json!("length");
+            assert!(
+                parse_response(truncated.clone(), &allowed)
+                    .unwrap_err()
+                    .is::<TruncatedToolResponse>()
+            );
+            truncated["choices"][0]["message"]["refusal"] = json!("private refusal");
+            assert!(
+                parse_response(truncated, &allowed)
+                    .unwrap_err()
+                    .is::<ProviderBlocked>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_id_http_diagnostics_never_log_id_or_arguments() {
+        use tracing::instrument::WithSubscriber;
+        let message = json!({"role":"assistant","content":"private provider content",
+        "tool_calls":[{"id":"private-id\n","type":"function","function":{
+            "name":"clock_now","arguments":"{\"private-argument\":\"secret\"}"
+        }}]});
+        let body = response(message).to_string();
+        let (url, server) = server("200 OK", &body).await;
+        let client = Llm::new(
+            config(url),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let error = client.complete(
+            vec![json!({"role":"user","content":"private request"})],
+            vec![json!({"type":"function","function":{"name":"clock_now","parameters":{"type":"object"}}})],
+            128,
+            &CancellationToken::new(),
+        ).with_subscriber(subscriber).await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.is::<InvalidToolCallId>());
+        let logged = log.text();
+        for field in [
+            "model tool response had invalid call id",
+            "reason=\"control\"",
+            "id_bytes=11",
+            "max_id_bytes=128",
+        ] {
+            assert!(logged.contains(field), "missing diagnostic field {field}");
+        }
+        for private in [
+            "private",
+            "secret",
+            "clock_now",
+            "llm-only",
+            "http://",
+            "Bearer",
+        ] {
+            assert!(!logged.contains(private));
+            assert!(!format!("{error:#?}").contains(private));
+        }
+    }
+
+    #[test]
     fn truncated_tool_response_rejects_complete_and_partial_arguments() {
         let allowed = HashSet::from(["search_stickers".to_owned()]);
         let message = json!({"role":"assistant","content":"private provider content",
@@ -1457,6 +1839,195 @@ mod tests {
         assert!(request.contains("Bearer llm-only"));
         assert!(!request.contains("milky-only"));
         assert!(request.contains("\"max_tokens\":128"));
+    }
+
+    #[tokio::test]
+    async fn http_diagnostics_classify_header_timeout_without_logging_request_content() {
+        use tracing::instrument::WithSubscriber;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/private-endpoint", listener.local_addr().unwrap());
+        let release = CancellationToken::new();
+        let wait = release.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_synthetic_request(&mut stream).await;
+            wait.cancelled().await;
+        });
+        let mut cfg = config(url);
+        cfg.request_timeout_secs = 1;
+        let client = Llm::new(cfg, reqwest::Client::builder().no_proxy().build().unwrap()).unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let result = client.complete(
+            vec![json!({"role":"user","content":[
+                {"type":"text","text":"private-message"}, image_part()
+            ]})],
+            vec![json!({"type":"function","function":{"name":"private_tool","parameters":{"type":"object"}}})],
+            128, &CancellationToken::new(),
+        ).with_subscriber(subscriber).await;
+        release.cancel();
+        server.await.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ModelHttpFailure>().unwrap().0,
+            TransportKind::Timeout
+        );
+        assert!(error.to_string().contains("模型请求超时"));
+        let logged = log.text();
+        for field in [
+            "phase=\"headers\"",
+            "kind=\"timeout\"",
+            "elapsed_ms=",
+            "timeout_secs=1",
+            "image_count=1",
+            "max_output=128",
+            "tool_count=1",
+            "request_bytes=",
+        ] {
+            assert!(logged.contains(field), "missing diagnostic field {field}");
+        }
+        for secret in [
+            "private-endpoint",
+            "private-message",
+            "private_tool",
+            "llm-only",
+            "data:image",
+            "http://",
+            "Bearer",
+        ] {
+            assert!(!logged.contains(secret));
+            assert!(!format!("{error:#}").contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_diagnostics_distinguish_connection_refusal_from_timeout() {
+        use tracing::instrument::WithSubscriber;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/private-endpoint", listener.local_addr().unwrap());
+        drop(listener);
+        let client = Llm::new(
+            config(url),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let error = client
+            .complete(
+                vec![json!({"role":"user","content":"private-message"})],
+                vec![],
+                128,
+                &CancellationToken::new(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ModelHttpFailure>().unwrap().0,
+            TransportKind::Connect
+        );
+        assert!(error.to_string().contains("无法连接模型服务"));
+        let logged = log.text();
+        assert!(logged.contains("kind=\"connect\""));
+        assert!(logged.contains("image_count=0"));
+        assert!(logged.contains("tool_count=0"));
+        assert!(
+            !logged.contains("private")
+                && !logged.contains("llm-only")
+                && !logged.contains("http://")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_diagnostics_do_not_misclassify_a_truncated_response_body_as_headers() {
+        use tokio::io::AsyncWriteExt;
+        use tracing::instrument::WithSubscriber;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_synthetic_request(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"private-body\":").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let client = Llm::new(
+            config(url),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let error = client
+            .complete(
+                vec![json!({"role":"user","content":"private-message"})],
+                vec![],
+                128,
+                &CancellationToken::new(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(!error.is::<ModelHttpFailure>());
+        assert_eq!(error.to_string(), "HTTP response body could not be read");
+        assert!(!log.text().contains("phase=\"headers\""));
+        assert!(!format!("{error:#}").contains("private"));
+    }
+
+    #[tokio::test]
+    async fn http_diagnostics_classify_closed_connection_before_headers_as_request_failure() {
+        use tokio::io::AsyncWriteExt;
+        use tracing::instrument::WithSubscriber;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/private-endpoint", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_synthetic_request(&mut stream).await;
+            stream.shutdown().await.unwrap();
+        });
+        let client = Llm::new(
+            config(url),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let error = client
+            .complete(
+                vec![json!({"role":"user","content":"private-message"})],
+                vec![],
+                128,
+                &CancellationToken::new(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(
+            error.downcast_ref::<ModelHttpFailure>().unwrap().0,
+            TransportKind::Request
+        );
+        assert_eq!(
+            error.to_string(),
+            "模型请求传输失败，当前请求尚未取得模型响应。"
+        );
+        let logged = log.text();
+        assert!(logged.contains("phase=\"headers\"") && logged.contains("kind=\"request\""));
+        if let Some((_, suffix)) = logged.split_once("io_kind=\"") {
+            let kind = suffix.split('"').next().unwrap();
+            assert!(
+                [
+                    "connection_reset",
+                    "connection_aborted",
+                    "connection_refused",
+                    "broken_pipe",
+                    "unexpected_eof",
+                    "timed_out",
+                    "other"
+                ]
+                .contains(&kind)
+            );
+        }
+        for secret in ["private", "llm-only", "http://", "Bearer"] {
+            assert!(!logged.contains(secret) && !format!("{error:#}").contains(secret));
+        }
     }
 
     #[tokio::test]
