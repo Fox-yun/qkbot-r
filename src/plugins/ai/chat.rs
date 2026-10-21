@@ -945,11 +945,28 @@ impl Chat {
             current:serde_json::to_string(&batch).context("encode_memory_batch")?,
             history:vec![], memories:vec![], summary:String::new(), tool_schema:json!([]),tool_protocol:vec![],
         }, input_budget).context("build_memory_input")?;
+        tracing::info!(
+            conversation_id=%guard.conversation_id, epoch=guard.epoch,
+            previous_compacted_until=batch.previous_compacted_until,
+            previous_memory_processed_until=batch.previous_memory_processed_until,
+            through_position=batch.through_position,
+            source_count=batch.sources.len(),
+            eligible_count=batch.sources.iter().filter(|source| source.memory_eligible).count(),
+            summary_enabled=batch.summary_enabled, memory_write=batch.memory_write,
+            summary_budget=batch.summary_budget, estimated_input_tokens=input.estimated_tokens,
+            "conversation memory batch requested"
+        );
         let Some(response) = self
             .background_response(input.messages, &background, bot_id)
             .await
             .context("request_memory_model")?
         else {
+            tracing::info!(
+                conversation_id=%guard.conversation_id, epoch=guard.epoch,
+                through_position=batch.through_position,
+                reason="background_unavailable_or_cancelled",
+                "conversation memory batch deferred"
+            );
             return Ok(MaintenanceOutcome::Unavailable);
         };
         let update = parse_batch_update(
@@ -972,6 +989,13 @@ impl Chat {
                 .commit_batch(batch, update)
                 .await
                 .context("validate_and_commit_memory")?;
+        } else {
+            tracing::info!(
+                conversation_id=%guard.conversation_id, epoch=guard.epoch,
+                through_position=batch.through_position,
+                reason="background_guard_changed",
+                "conversation memory batch deferred"
+            );
         }
         Ok(MaintenanceOutcome::Progress)
     }

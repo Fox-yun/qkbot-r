@@ -1057,6 +1057,95 @@ fn commit_batch_with_limit(
     update: BatchUpdate,
     maximum: usize,
 ) -> Result<()> {
+    let changes_count = update.changes.len();
+    let summary_chars = update.summary.chars().count();
+    let summary_bytes = summary_cost(&update.summary).ok();
+    let eligible_count = batch.sources.iter().filter(|s| s.memory_eligible).count();
+    match commit_batch_inner(db, &batch, update, maximum) {
+        Ok(counts) => {
+            tracing::info!(
+                conversation_id=%batch.guard.conversation_id,
+                epoch=batch.guard.epoch,
+                previous_compacted_until=batch.previous_compacted_until,
+                previous_memory_processed_until=batch.previous_memory_processed_until,
+                through_position=batch.through_position,
+                source_count=batch.sources.len(), eligible_count, changes_count,
+                summary_chars, summary_bytes, summary_budget=batch.summary_budget,
+                summary_enabled=batch.summary_enabled, memory_write=batch.memory_write,
+                inserted=counts.inserted, updated=counts.updated, skipped_new=counts.skipped_new,
+                compacted_until=if batch.summary_enabled { batch.through_position } else { batch.previous_compacted_until },
+                memory_processed_until=if batch.memory_write { batch.through_position } else { batch.previous_memory_processed_until },
+                "conversation memory batch committed"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                conversation_id=%batch.guard.conversation_id,
+                epoch=batch.guard.epoch,
+                previous_compacted_until=batch.previous_compacted_until,
+                previous_memory_processed_until=batch.previous_memory_processed_until,
+                through_position=batch.through_position,
+                source_count=batch.sources.len(), eligible_count, changes_count,
+                summary_chars, summary_bytes, summary_budget=batch.summary_budget,
+                summary_enabled=batch.summary_enabled, memory_write=batch.memory_write,
+                reason=memory_commit_failure_reason(&error),
+                "conversation memory batch rejected"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Only exact, application-owned validation labels become observable reason codes.
+/// Never emit an arbitrary storage error, its chain, or source/model content.
+fn memory_commit_failure_reason(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "summary exceeds 1500 characters" => "summary_character_limit",
+        "summary exceeds next-input byte budget" => "summary_byte_budget",
+        "too many memory changes" => "change_count",
+        "automatic memory writes are disabled" => "memory_write_disabled",
+        "summary generation is disabled for this batch" => "summary_disabled",
+        "conversation changed; stale memory operation rejected" => "stale_conversation",
+        "conversation not found" => "conversation_missing",
+        "another summary already replaced this prefix" => "snapshot_changed",
+        "summary source was revoked or removed" => "source_unavailable",
+        "summary source changed" => "source_changed",
+        "memory text must have 1..=180 characters" => "memory_text_length",
+        "memory TTL must be 1..=365 days" => "memory_ttl",
+        "a memory change needs 1..=3 evidence quotes" => "evidence_count",
+        "invalid evidence quote length" => "evidence_quote_length",
+        "evidence source was not in this frozen prefix" => "evidence_source_not_in_batch",
+        "memory evidence must quote its human subject exactly" => {
+            "evidence_not_exact_or_ineligible"
+        }
+        "evidence source was revoked or removed" => "evidence_unavailable",
+        "evidence source changed" => "evidence_changed",
+        "duplicate memory mutation" => "duplicate_memory_mutation",
+        "memory ID was not allowed for this subject" => "memory_id_not_allowed",
+        "memory no longer exists" => "memory_missing",
+        "automatic changes cannot modify locked, manual, inactive, or foreign memories" => {
+            "memory_not_editable"
+        }
+        "memory changed while summarizing" => "memory_changed",
+        "memory ownership changed" => "memory_ownership_changed",
+        _ => "storage_or_unknown",
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MemoryCommitCounts {
+    inserted: usize,
+    updated: usize,
+    skipped_new: usize,
+}
+
+fn commit_batch_inner(
+    db: &mut Connection,
+    batch: &MemoryBatch,
+    update: BatchUpdate,
+    maximum: usize,
+) -> Result<MemoryCommitCounts> {
     validate_summary(&update.summary, batch.summary_budget)?;
     ensure!(
         update.changes.len() <= MAX_CHANGES,
@@ -1118,7 +1207,7 @@ fn commit_batch_with_limit(
                 (*id, *subject_id, evidence)
             }
         };
-        validate_evidence(&tx, &batch, subject, evidence)?;
+        validate_evidence(&tx, batch, subject, evidence)?;
         if let Some(id) = id {
             ensure!(touched.insert(id), "duplicate memory mutation");
             let allowed = batch
@@ -1149,7 +1238,7 @@ fn commit_batch_with_limit(
         |r| r.get(0),
     )?;
     let mut count = usize::try_from(count)?;
-    let mut skipped_new = 0;
+    let mut counts = MemoryCommitCounts::default();
     for change in update.changes {
         match change {
             MemoryChange::Upsert {
@@ -1161,7 +1250,7 @@ fn commit_batch_with_limit(
                 ttl_days,
             } => {
                 if id.is_none() && count >= maximum {
-                    skipped_new += 1;
+                    counts.skipped_new += 1;
                     continue;
                 }
                 write_memory(
@@ -1176,6 +1265,9 @@ fn commit_batch_with_limit(
                 )?;
                 if id.is_none() {
                     count += 1;
+                    counts.inserted += 1;
+                } else {
+                    counts.updated += 1;
                 }
             }
         }
@@ -1194,10 +1286,10 @@ fn commit_batch_with_limit(
         )?;
     }
     tx.commit()?;
-    if skipped_new > 0 {
-        tracing::warn!(conversation_id=%batch.guard.conversation_id, skipped_new, maximum, "memory capacity reached; skipped validated new facts while preserving summary and existing facts");
+    if counts.skipped_new > 0 {
+        tracing::warn!(conversation_id=%batch.guard.conversation_id, skipped_new=counts.skipped_new, maximum, "memory capacity reached; skipped validated new facts while preserving summary and existing facts");
     }
-    Ok(())
+    Ok(counts)
 }
 
 /// Conservative byte estimate, deliberately not presented as an exact model tokenizer.
@@ -1443,6 +1535,214 @@ mod tests {
             assert!(!error.contains(marker));
             assert!(!error.contains("sensitive"));
         }
+    }
+
+    #[test]
+    fn memory_commit_failure_reasons_use_only_exact_allowlisted_labels() {
+        for (label, reason) in [
+            ("summary exceeds 1500 characters", "summary_character_limit"),
+            (
+                "summary exceeds next-input byte budget",
+                "summary_byte_budget",
+            ),
+            (
+                "summary generation is disabled for this batch",
+                "summary_disabled",
+            ),
+            (
+                "another summary already replaced this prefix",
+                "snapshot_changed",
+            ),
+            (
+                "evidence source was not in this frozen prefix",
+                "evidence_source_not_in_batch",
+            ),
+            (
+                "memory evidence must quote its human subject exactly",
+                "evidence_not_exact_or_ineligible",
+            ),
+            (
+                "memory ID was not allowed for this subject",
+                "memory_id_not_allowed",
+            ),
+        ] {
+            assert_eq!(
+                memory_commit_failure_reason(&anyhow::anyhow!(label)),
+                reason
+            );
+            assert_eq!(
+                memory_commit_failure_reason(&anyhow::anyhow!("{label}: private-content")),
+                "storage_or_unknown"
+            );
+        }
+        // Do not search an arbitrary error chain or emit its content.
+        let error = anyhow::anyhow!("summary exceeds next-input byte budget")
+            .context("private-provider-or-storage-error");
+        assert_eq!(memory_commit_failure_reason(&error), "storage_or_unknown");
+    }
+
+    fn capture_memory_logs(action: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        action();
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn memory_commit_logs_safe_failure_metadata_and_preserves_atomicity() {
+        let logs = capture_memory_logs(|| {
+            let mut db = db();
+            let through = source(
+                &db,
+                "private-source-key",
+                7,
+                "private-source-content",
+                "user",
+            );
+            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+            let change = |subject| MemoryChange::Upsert {
+                id: None,
+                subject_id: subject,
+                kind: MemoryKind::Fact,
+                text: "private-memory-content".into(),
+                evidence: evidence("private-source-key", "private-source-content"),
+                ttl_days: None,
+            };
+            let error = commit_batch_with_limit(
+                &mut db,
+                batch.clone(),
+                BatchUpdate {
+                    summary: "private-summary-content".into(),
+                    changes: vec![change(7), change(8)],
+                },
+                256,
+            )
+            .unwrap_err();
+            assert_eq!(
+                memory_commit_failure_reason(&error),
+                "evidence_not_exact_or_ineligible"
+            );
+            assert!(list_memories(&db, "group", None).unwrap().is_empty());
+            // Fail after the first INSERT, exercising rollback rather than only prevalidation.
+            db.execute_batch("CREATE TRIGGER reject_second_memory BEFORE INSERT ON ai_memories WHEN (SELECT count(*) FROM ai_memories)>0 BEGIN SELECT RAISE(ABORT,'private-storage-error'); END;").unwrap();
+            let error = commit_batch_with_limit(
+                &mut db,
+                batch,
+                BatchUpdate {
+                    summary: "private-summary-content".into(),
+                    changes: vec![change(7), change(7)],
+                },
+                256,
+            )
+            .unwrap_err();
+            assert_eq!(memory_commit_failure_reason(&error), "storage_or_unknown");
+            assert!(list_memories(&db, "group", None).unwrap().is_empty());
+            let state: (String, i64, i64, i64) = db.query_row(
+                "SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='group'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(state, (String::new(), 0, 0, 0));
+            let derived_rows: i64 = db.query_row(
+                "SELECT (SELECT count(*) FROM ai_memory_search)+(SELECT count(*) FROM ai_memory_provenance)",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(derived_rows, 0);
+        });
+        assert!(logs.contains("conversation memory batch rejected"));
+        assert!(logs.contains("evidence_not_exact_or_ineligible"));
+        assert!(logs.contains("storage_or_unknown"));
+        for field in [
+            "conversation_id=group",
+            "epoch=1",
+            "source_count=1",
+            "eligible_count=1",
+            "changes_count=2",
+            "summary_chars=23",
+            "summary_bytes=29",
+            "summary_enabled=true",
+            "memory_write=true",
+        ] {
+            assert!(logs.contains(field), "missing diagnostic field: {field}");
+        }
+        assert!(!logs.contains("private-"));
+        assert!(!logs.contains("conversation memory batch committed"));
+    }
+
+    #[test]
+    fn memory_commit_success_logs_committed_counts_and_cursor_progress() {
+        let logs = capture_memory_logs(|| {
+            let mut db = db();
+            let ids = seed_memories(&db, "group", 7, 2);
+            let through = source(
+                &db,
+                "private-source-key",
+                7,
+                "private-source-content",
+                "user",
+            );
+            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+            let change = |id| MemoryChange::Upsert {
+                id,
+                subject_id: 7,
+                kind: MemoryKind::Fact,
+                text: "private-memory-content".into(),
+                evidence: evidence("private-source-key", "private-source-content"),
+                ttl_days: None,
+            };
+            commit_batch_with_limit(
+                &mut db,
+                batch,
+                BatchUpdate {
+                    summary: "private-summary-content".into(),
+                    changes: vec![change(Some(ids[0])), change(None), change(None)],
+                },
+                3,
+            )
+            .unwrap();
+            assert_eq!(list_memories(&db, "group", None).unwrap().len(), 3);
+            assert_eq!(
+                get_memory(&db, ids[0]).unwrap().unwrap().text,
+                "private-memory-content"
+            );
+            let cursors: (i64, i64) = db.query_row(
+                "SELECT compacted_until,memory_processed_until FROM ai_conversations WHERE id='group'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(cursors, (through, through));
+        });
+        assert!(logs.contains("conversation memory batch committed"));
+        for field in [
+            "inserted=1",
+            "updated=1",
+            "skipped_new=1",
+            "previous_compacted_until=0",
+            "previous_memory_processed_until=0",
+            "through_position=1",
+            "compacted_until=1",
+            "memory_processed_until=1",
+        ] {
+            assert!(logs.contains(field), "missing diagnostic field: {field}");
+        }
+        assert!(!logs.contains("private-"));
+        assert!(!logs.contains("conversation memory batch rejected"));
     }
 
     fn commit_batch(db: &mut Connection, batch: MemoryBatch, update: BatchUpdate) -> Result<()> {
