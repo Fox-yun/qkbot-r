@@ -20,6 +20,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const MAX_IMAGES: usize = 4;
+const MAX_DOWNLOAD_ADDRESSES: usize = 16;
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_JPEG_BYTES: usize = 1024 * 1024;
 const MAX_EDGE: u32 = 8192;
@@ -108,8 +109,24 @@ pub(crate) async fn load(
     let generation = host.milky.scope_generation(&key.scope)?;
     let loaded = collect(sources, cancel, |resource| async move {
         host.milky.check_generation(generation)?;
-        let url = host.milky.get_resource_temp_url(key, &resource).await?;
-        let bytes = download(&url).await?;
+        let url = host
+            .milky
+            .get_resource_temp_url(key, &resource)
+            .await
+            .inspect_err(|_| {
+                tracing::warn!(
+                    stage = "resource_lookup",
+                    reason = "failed",
+                    "AI image processing failed"
+                );
+            })?;
+        let bytes = download(&url).await.inspect_err(|_| {
+            tracing::warn!(
+                stage = "download",
+                reason = "failed",
+                "AI image processing failed"
+            );
+        })?;
         host.milky.check_generation(generation)?;
         Ok(bytes)
     })
@@ -136,11 +153,27 @@ where
         for resource in &sources.resources {
             let read_image = async {
                 let bytes = fetch(resource.clone()).await?;
-                decode(bytes, cancel).await
+                decode(bytes, cancel).await.inspect_err(|_| {
+                    if !cancel.is_cancelled() {
+                        tracing::warn!(
+                            stage = "decode",
+                            reason = "failed",
+                            "AI image processing failed"
+                        );
+                    }
+                })
             };
             match tokio::time::timeout(RESOURCE_TIMEOUT, read_image).await {
                 Ok(Ok(image)) => loaded.images.push(image),
-                _ => unreadable = true,
+                Ok(Err(_)) => unreadable = true,
+                Err(_) => {
+                    tracing::warn!(
+                        stage = "image",
+                        reason = "timeout",
+                        "AI image processing failed"
+                    );
+                    unreadable = true;
+                }
             }
         }
     };
@@ -149,6 +182,13 @@ where
         _ = cancel.cancelled() => bail!("图片处理已取消"),
         result = tokio::time::timeout(BATCH_TIMEOUT, work) => result.is_err(),
     };
+    if timed_out {
+        tracing::warn!(
+            stage = "batch",
+            reason = "timeout",
+            "AI image processing failed"
+        );
+    }
     unreadable |= timed_out;
     ensure!(!cancel.is_cancelled(), "图片处理已取消");
     if unreadable {
@@ -210,21 +250,29 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn validated_download_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>> {
+    let mut selected = Vec::with_capacity(MAX_DOWNLOAD_ADDRESSES);
+    for address in addresses {
+        // Validate every DNS answer, even after the connection candidate list
+        // is full. A private address in the tail must still reject the host.
+        ensure!(public_ip(address.ip()), "图片下载地址不可用");
+        if selected.len() < MAX_DOWNLOAD_ADDRESSES && !selected.contains(&address) {
+            selected.push(address);
+        }
+    }
+    ensure!(!selected.is_empty(), "图片下载地址不可用");
+    Ok(selected)
+}
+
 async fn download(value: &str) -> Result<Vec<u8>> {
     let url = image_url(value)?;
     let name = url.host_str().context("图片缺少下载地址")?.to_owned();
     let _slot = DOWNLOADS.acquire().await?;
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 443))
-        .await?
-        .take(17)
-        .collect();
-    ensure!(
-        !addresses.is_empty()
-            && addresses.len() <= 16
-            && addresses.iter().all(|address| public_ip(address.ip())),
-        "图片下载地址不可用"
-    );
-    // A fresh credential-free client pins every validated DNS answer. The URL's
+    let addresses =
+        validated_download_addresses(tokio::net::lookup_host((name.as_str(), 443)).await?)?;
+    // A fresh credential-free client pins the selected safe DNS answers. The URL's
     // hostname remains intact for Host/SNI and certificate verification.
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -466,6 +514,52 @@ mod tests {
         ] {
             assert!(public_ip(address.parse().unwrap()), "{address}");
         }
+    }
+
+    fn large_public_dns_answer() -> Vec<SocketAddr> {
+        (1..=16)
+            .map(|last| SocketAddr::new(Ipv4Addr::new(8, 8, 8, last).into(), 443))
+            .chain((1..=9).map(|last| format!("[2606:4700:4700::{last}]:443").parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn large_public_dns_answer_keeps_sixteen_candidates_instead_of_rejecting_the_image() {
+        let addresses = large_public_dns_answer();
+        assert_eq!(addresses.len(), 25);
+        let selected = validated_download_addresses(addresses.iter().copied()).unwrap();
+        assert_eq!(selected, addresses[..MAX_DOWNLOAD_ADDRESSES]);
+    }
+
+    #[test]
+    fn duplicate_dns_answers_do_not_consume_the_connection_candidate_limit() {
+        let addresses = large_public_dns_answer();
+        let duplicates = addresses
+            .iter()
+            .copied()
+            .flat_map(|address| [address, address]);
+        let selected = validated_download_addresses(duplicates).unwrap();
+        assert_eq!(selected, addresses[..MAX_DOWNLOAD_ADDRESSES]);
+        assert_eq!(
+            selected.iter().collect::<HashSet<_>>().len(),
+            MAX_DOWNLOAD_ADDRESSES
+        );
+    }
+
+    #[test]
+    fn private_dns_answer_after_the_candidate_limit_and_empty_answers_are_rejected() {
+        let addresses = large_public_dns_answer();
+        for private in ["127.0.0.1:443", "10.0.0.1:443", "[fc00::1]:443"] {
+            for index in [16, 24, 25] {
+                let mut mixed = addresses.clone();
+                mixed.insert(index, private.parse().unwrap());
+                assert!(
+                    validated_download_addresses(mixed).is_err(),
+                    "{private} at {index}"
+                );
+            }
+        }
+        assert!(validated_download_addresses(std::iter::empty()).is_err());
     }
 
     #[test]
