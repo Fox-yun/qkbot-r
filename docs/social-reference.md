@@ -10,7 +10,7 @@
 | 今日老婆 | [glamorgan9826/nonebot-plugin-today-waifu](https://github.com/glamorgan9826/nonebot-plugin-today-waifu/tree/84f5243c7e50b7444dee241ac242a5fe4d6488ad) | `__init__.py`、`record.py`、`config.py`、`utils.py` | MIT |
 | 表情包保存器 | [colasama/nonebot-plugin-sticker-saver](https://github.com/colasama/nonebot-plugin-sticker-saver/tree/5433f6d0240aedfbdf8aa2dff4f6aca3c77ec266) | `nonebot_plugin_sticker_saver/__init__.py` | MIT |
 | 戳一戳 | [Agnes4m/nonebot_plugin_poke](https://github.com/Agnes4m/nonebot_plugin_poke/tree/a20e9c4596d45a8a4bcb5de2cd5aa88fb2e3a6e5) | `__init__.py`、`matcher.py`、`utils.py`、`config.py` | MIT |
-| 模拟转发 | [Cvandia/nonebot-plugin-fakemsg](https://github.com/Cvandia/nonebot-plugin-fakemsg/tree/655e979c8d5e8b2029639c7df6cbf8141d6b3873) | `nonebot_plugin_fakemsg/__init__.py`、`config.py` | MIT |
+| 合并转发 | [Cvandia/nonebot-plugin-fakemsg](https://github.com/Cvandia/nonebot-plugin-fakemsg/tree/655e979c8d5e8b2029639c7df6cbf8141d6b3873) | `nonebot_plugin_fakemsg/__init__.py`、`config.py` | MIT |
 | 轮盘禁言 | [KarisAya/nonebot_plugin_russian_ban](https://github.com/KarisAya/nonebot_plugin_russian_ban/tree/de805231bd1ec1672989df33a210ff5fa65af762) | `nonebot_plugin_russian_ban/__init__.py`、`utils.py` | MIT |
 
 Milky 字段核对源：[官方 common.ts](https://github.com/SaltifyDev/milky/blob/main/protocol/src/ir/common.ts)、[消息 API](https://github.com/SaltifyDev/milky/blob/main/protocol/src/ir/api/message.ts)、[系统 API](https://github.com/SaltifyDev/milky/blob/main/protocol/src/ir/api/system.ts)、[群 API](https://github.com/SaltifyDev/milky/blob/main/protocol/src/ir/api/group.ts)、[好友 API](https://github.com/SaltifyDev/milky/blob/main/protocol/src/ir/api/friend.ts)。
@@ -47,13 +47,13 @@ Milky 字段核对源：[官方 common.ts](https://github.com/SaltifyDev/milky/b
 
 资源只能来自已验证的 QQ 消息或管理员配置目录。路径先规范化并检查目录边界，单个本地文件最多 20 MiB，拒绝 SVG 和未知文件签名；实际媒体服务仍执行自身容量上限。一次抓图最多八张，当前会话图库最多 128 张。
 
-## 模拟转发
+## 合并转发
 
 保留 `QQ号说内容|QQ号说内容`、真实 `@成员说内容`、每人消息分隔符、用户分隔符与受保护 QQ 名单。原代码的元数据描述与实现有差异，例如实际按空格拆分同一人的多条消息，未按描述把所有空格一律拒绝；此版本按实现解析并增加长度、条数限制。身份必须属于当前群，私聊只允许当前双方。
 
 与聊天图片插件的裸 `QQ说` 规则存在重叠，统一消歧：含 `|` 或首段真实 `@` 的形式作为合并转发；单条裸 `QQ说` 交给聊天图片。单条转发可显式使用 `/mock-forward QQ号说内容`。还支持 `/mock-forward 名字:内容 | 名字:内容`。
 
-始终在外层标题、第一条说明及每个模拟发送者名称中标注“模拟/非真实记录”，不会伪装成真实聊天证据。不解析 CQ 码，不根据昵称合并身份。最多 16 条用户内容，正文总输入最多 8192 字节。
+使用 QQ 合并转发卡片展示输入的消息，卡片预览取自消息正文，摘要显示消息条数；发送者使用联系人名称或明确输入的名称，不添加额外说明节点或名称前缀。不解析 CQ 码，不根据昵称合并身份。最多 16 条用户内容，正文总输入最多 8192 字节。
 
 ## 轮盘禁言
 

@@ -7,6 +7,7 @@ use crate::{host::Host, types::OutgoingMessage};
 use ab_glyph::{Font as _, FontArc, FontVec, point};
 use anyhow::{Context, Result, ensure};
 use chrono::Datelike;
+use image::ImageDecoder as _;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -521,18 +522,336 @@ pub async fn lines(host: &Host, title: &str, lines: &[String]) -> Result<Outgoin
 }
 
 #[derive(Clone)]
+pub enum ChatContent {
+    Text(String),
+    Image(Vec<u8>),
+}
+#[derive(Clone)]
 pub struct ChatBubble {
     pub name: String,
-    pub text: String,
     pub avatar: Option<Vec<u8>>,
-    pub images: Vec<Vec<u8>>,
-    pub is_bot: bool,
+    pub content: Vec<ChatContent>,
 }
-pub async fn chat(host: &Host, bubbles: Vec<ChatBubble>) -> Result<OutgoingMessage> {
+
+const CHAT_WIDTH: u32 = 900;
+const CHAT_TEXT_WIDTH: u32 = 650;
+const CHAT_FONT_SIZE: f32 = 30.;
+const CHAT_LINE_HEIGHT: u32 = 44;
+const CHAT_BACKGROUND: [u8; 3] = [242, 243, 245];
+
+struct ChatText {
+    lines: Vec<String>,
+    width: u32,
+}
+fn chat_text(font: &Font, text: &str, size: f32, max_width: u32) -> ChatText {
+    let mut lines = Vec::new();
+    let mut widest = 0_f32;
+    for paragraph in text.split('\n') {
+        let chars: Vec<char> = paragraph.chars().filter(|ch| !ch.is_control()).collect();
+        if chars.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = start;
+            let mut width = 0.;
+            while end < chars.len() {
+                let next = advance(font, chars[end], size);
+                if end > start && width + next > max_width as f32 {
+                    break;
+                }
+                width += next;
+                end += 1;
+            }
+            if end < chars.len() {
+                // Keep ordinary Latin words together when they fit on a line.
+                // An overlong URL/word still wraps at a glyph boundary.
+                let word = |ch: char| ch.is_ascii_alphanumeric() || "_-/.:?=&%#@".contains(ch);
+                if word(chars[end - 1]) && word(chars[end]) {
+                    let mut word_start = end;
+                    while word_start > start && word(chars[word_start - 1]) {
+                        word_start -= 1;
+                    }
+                    if word_start > start {
+                        end = word_start;
+                    }
+                }
+                // Avoid a closing punctuation mark at the next line's start,
+                // or an opening mark stranded at this line's end.
+                while end > start + 1
+                    && ("，。！？；：、）》】」』”’,.!?;:)]}".contains(chars[end])
+                        || "（《【「『“‘([{".contains(chars[end - 1]))
+                {
+                    end -= 1;
+                }
+            }
+            let line: String = chars[start..end].iter().collect();
+            let line = line.trim_end().to_owned();
+            widest = widest.max(line.chars().map(|ch| advance(font, ch, size)).sum());
+            lines.push(line);
+            start = end;
+            while start < chars.len() && chars[start].is_whitespace() {
+                start += 1;
+            }
+        }
+    }
+    ChatText {
+        lines,
+        width: widest.ceil() as u32,
+    }
+}
+
+fn chat_name(font: &Font, name: &str) -> String {
+    let mut result = String::new();
+    let mut width = 0.;
+    let ellipsis = advance(font, '…', 22.);
+    for ch in name.chars().filter(|ch| !ch.is_control()).take(256) {
+        let next = advance(font, ch, 22.);
+        if width + next + ellipsis > 670. {
+            result.push('…');
+            break;
+        }
+        result.push(ch);
+        width += next;
+    }
+    result
+}
+
+fn decode_chat_image(bytes: &[u8]) -> Result<image::DynamicImage> {
+    ensure!(bytes.len() <= 4 * 1024 * 1024, "聊天图片资源过大");
+    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    let orientation = decoder.orientation()?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder)?;
+    decoded.apply_orientation(orientation);
+    Ok(decoded)
+}
+
+enum ChatPart {
+    Text(ChatText),
+    Image(image::RgbaImage),
+}
+struct ChatLayout {
+    name: String,
+    avatar: Option<image::RgbaImage>,
+    parts: Vec<ChatPart>,
+    y: u32,
+    width: u32,
+    height: u32,
+    padding: u32,
+}
+fn chat_layout(bubbles: Vec<ChatBubble>, font: &Font) -> Result<(Vec<ChatLayout>, u32)> {
     ensure!(
         !bubbles.is_empty() && bubbles.len() <= 24,
-        "模拟聊天最多24条消息"
+        "聊天图片最多24条消息"
     );
+    let mut image_count = 0;
+    let mut y = 28;
+    let mut layouts = Vec::new();
+    for bubble in bubbles {
+        let mut parts = Vec::new();
+        let mut content_width = 0;
+        let mut content_height = 0;
+        let mut characters = 0;
+        let has_text = bubble
+            .content
+            .iter()
+            .any(|part| matches!(part, ChatContent::Text(text) if !text.trim().is_empty()));
+        let padding = if has_text { 18 } else { 0 };
+        for part in bubble.content {
+            let (part, width, height) = match part {
+                ChatContent::Text(text) => {
+                    characters += text.chars().count();
+                    ensure!(characters <= 10_000, "单条聊天文字过长");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let text = chat_text(font, &text, CHAT_FONT_SIZE, CHAT_TEXT_WIDTH);
+                    let width = text.width;
+                    let height = text.lines.len() as u32 * CHAT_LINE_HEIGHT;
+                    (ChatPart::Text(text), width, height)
+                }
+                ChatContent::Image(bytes) => {
+                    image_count += 1;
+                    ensure!(image_count <= 8, "聊天图片一次最多8张图片");
+                    let decoded = decode_chat_image(&bytes)?;
+                    let decoded = decoded
+                        .thumbnail(decoded.width().min(580), decoded.height().min(440))
+                        .to_rgba8();
+                    let width = decoded.width();
+                    let height = decoded.height();
+                    (ChatPart::Image(decoded), width, height)
+                }
+            };
+            if !parts.is_empty() {
+                content_height += 12;
+            }
+            content_width = content_width.max(width);
+            content_height += height;
+            parts.push(part);
+        }
+        ensure!(!parts.is_empty(), "聊天消息没有可绘制内容");
+        let width = (content_width + padding * 2).max(60);
+        let height = (content_height + if has_text { 24 } else { 0 }).max(44);
+        let end = (y + 34 + height).max(y + 72);
+        ensure!(end + 28 <= 8192, "聊天图片过长，无法完整绘制");
+        let avatar = bubble.avatar.and_then(|bytes| {
+            decode_chat_image(&bytes).ok().map(|decoded| {
+                decoded
+                    .resize_to_fill(72, 72, image::imageops::FilterType::Triangle)
+                    .to_rgba8()
+            })
+        });
+        layouts.push(ChatLayout {
+            name: chat_name(font, &bubble.name),
+            avatar,
+            parts,
+            y,
+            width,
+            height,
+            padding,
+        });
+        y = end + 28;
+    }
+    Ok((layouts, y))
+}
+
+fn rounded_coverage(x: u32, y: u32, width: u32, height: u32, radius: u32) -> f32 {
+    let radius = radius.min(width / 2).min(height / 2) as f32;
+    if radius == 0. {
+        return 1.;
+    }
+    let px = x as f32 + 0.5;
+    let py = y as f32 + 0.5;
+    let dx = (radius - px).max(px - (width as f32 - radius)).max(0.);
+    let dy = (radius - py).max(py - (height as f32 - radius)).max(0.);
+    (radius + 0.5 - dx.hypot(dy)).clamp(0., 1.)
+}
+fn chat_pixel(canvas: &mut Canvas, x: u32, y: u32, color: [u8; 3], alpha: f32) {
+    if x >= canvas.width || y >= canvas.height {
+        return;
+    }
+    let pixel = ((y * canvas.width + x) * 3) as usize;
+    for (channel, value) in color.into_iter().enumerate() {
+        let background = canvas.pixels[pixel + channel] as f32;
+        canvas.pixels[pixel + channel] =
+            (background * (1. - alpha) + value as f32 * alpha).round() as u8;
+    }
+}
+fn chat_round_rect(canvas: &mut Canvas, rect: [u32; 4], radius: u32, color: [u8; 3]) {
+    let [x, y, width, height] = rect;
+    for yy in 0..height {
+        for xx in 0..width {
+            chat_pixel(
+                canvas,
+                x + xx,
+                y + yy,
+                color,
+                rounded_coverage(xx, yy, width, height, radius),
+            );
+        }
+    }
+}
+fn chat_picture(canvas: &mut Canvas, picture: &image::RgbaImage, x: u32, y: u32, radius: u32) {
+    for (xx, yy, pixel) in picture.enumerate_pixels() {
+        let alpha = pixel[3] as f32 / 255.
+            * rounded_coverage(xx, yy, picture.width(), picture.height(), radius);
+        chat_pixel(
+            canvas,
+            x + xx,
+            y + yy,
+            [pixel[0], pixel[1], pixel[2]],
+            alpha,
+        );
+    }
+}
+fn chat_avatar(canvas: &mut Canvas, avatar: Option<&image::RgbaImage>, x: u32, y: u32) {
+    chat_round_rect(canvas, [x, y, 72, 72], 36, [214, 222, 233]);
+    if let Some(avatar) = avatar {
+        chat_picture(canvas, avatar, x, y, 36);
+        return;
+    }
+    // Apply the same circular mask to the entire fallback silhouette, including
+    // its shoulders at the bottom of the avatar.
+    for yy in 0..72 {
+        for xx in 0..72 {
+            let head = if (24..48).contains(&xx) && (13..37).contains(&yy) {
+                rounded_coverage(xx - 24, yy - 13, 24, 24, 12)
+            } else {
+                0.
+            };
+            let body = if (12..60).contains(&xx) && (40..72).contains(&yy) {
+                rounded_coverage(xx - 12, yy - 40, 48, 32, 16)
+            } else {
+                0.
+            };
+            let alpha = head.max(body) * rounded_coverage(xx, yy, 72, 72, 36);
+            chat_pixel(canvas, x + xx, y + yy, [249, 250, 252], alpha);
+        }
+    }
+}
+fn chat_png(bubbles: Vec<ChatBubble>, font: Arc<Font>) -> Result<Vec<u8>> {
+    let (layouts, height) = chat_layout(bubbles, &font)?;
+    let mut canvas = Canvas::new(CHAT_WIDTH, height, font)?;
+    canvas.rect(0, 0, CHAT_WIDTH, height, CHAT_BACKGROUND);
+    for layout in layouts {
+        chat_avatar(&mut canvas, layout.avatar.as_ref(), 28, layout.y);
+        canvas.text(&layout.name, 126, layout.y, 22., [124, 129, 138], 690);
+        let top = layout.y + 34;
+        chat_round_rect(
+            &mut canvas,
+            [126, top + 1, layout.width, layout.height],
+            14,
+            [230, 232, 235],
+        );
+        chat_round_rect(
+            &mut canvas,
+            [126, top, layout.width, layout.height],
+            14,
+            [255; 3],
+        );
+        if layout.padding > 0 {
+            for row in 0_u32..14 {
+                let width = 7 - row.abs_diff(6).min(7);
+                canvas.rect(126 - width, top + 14 + row, width + 1, 1, [255; 3]);
+            }
+        }
+        let mut y = top + if layout.padding > 0 { 12 } else { 0 };
+        for part in layout.parts {
+            match part {
+                ChatPart::Text(text) => {
+                    for line in text.lines {
+                        canvas.text(
+                            &line,
+                            126 + layout.padding,
+                            y,
+                            CHAT_FONT_SIZE,
+                            [32, 34, 38],
+                            CHAT_TEXT_WIDTH + 1,
+                        );
+                        y += CHAT_LINE_HEIGHT;
+                    }
+                }
+                ChatPart::Image(picture) => {
+                    chat_picture(&mut canvas, &picture, 126 + layout.padding, y, 12);
+                    y += picture.height();
+                }
+            }
+            y += 12;
+        }
+    }
+    canvas.png(height)
+}
+
+pub async fn chat(host: &Host, bubbles: Vec<ChatBubble>) -> Result<OutgoingMessage> {
     let path = host.config.plugins.native.image_font_path.clone();
     let permit = host
         .media
@@ -542,40 +861,7 @@ pub async fn chat(host: &Host, bubbles: Vec<ChatBubble>) -> Result<OutgoingMessa
         .context("绘图繁忙")?;
     let bytes = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut c = Canvas::new(900, 8192, font(&path)?)?;
-        c.rect(0, 0, 900, 65, [221, 232, 248]);
-        c.text("模拟对话 · 非真实聊天记录", 30, 15, 26., [55, 83, 125], 840);
-        let mut y = 90;
-        for bubble in bubbles {
-            ensure!(y < 7600, "模拟聊天图片过长");
-            c.rect(30, y, 70, 70, [218, 225, 232]);
-            if let Some(avatar) = bubble.avatar {
-                let _ = c.picture(&avatar, 30, y, 70, 70);
-            }
-            c.text(
-                &format!(
-                    "{}{}",
-                    if bubble.is_bot { "[BOT] " } else { "" },
-                    bubble.name
-                ),
-                125,
-                y,
-                22.,
-                [95, 107, 122],
-                730,
-            );
-            let estimate = (bubble.text.chars().count() / 30 + 2) as u32 * 36 + 20;
-            c.rect(120, y + 38, 730, estimate, [255, 255, 255]);
-            let mut end = c
-                .text(&bubble.text, 140, y + 52, 26., [30, 40, 52], 690)
-                .max(y + 90);
-            for image in bubble.images {
-                let height = c.picture(&image, 140, end + 12, 600, 400)?;
-                end += height + 20;
-            }
-            y = end + 40;
-        }
-        c.png(y + 20)
+        chat_png(bubbles, font(&path)?)
     })
     .await??;
     host.media.png(host, bytes).await
@@ -584,6 +870,20 @@ pub async fn chat(host: &Host, bubbles: Vec<ChatBubble>) -> Result<OutgoingMessa
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn chat_message(name: &str, text: &str) -> ChatBubble {
+        ChatBubble {
+            name: name.into(),
+            avatar: None,
+            content: vec![ChatContent::Text(text.into())],
+        }
+    }
+    fn rgba_png(picture: image::RgbaImage) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(picture)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
     fn available_font() -> Option<Arc<Font>> {
         let configured = std::env::var("QKBOT_TEST_FONT").unwrap_or_default();
         let start = std::time::Instant::now();
@@ -727,5 +1027,251 @@ mod tests {
             pages.len(),
             stress_start.elapsed()
         );
+    }
+
+    #[test]
+    fn chat_layout_wraps_complete_text_and_rejects_oversized_last_message() {
+        let Some(font) = available_font() else { return };
+        for text in ["中".repeat(240), "W".repeat(320), "甲\n\n乙\n丙".into()] {
+            let layout = chat_text(&font, &text, CHAT_FONT_SIZE, CHAT_TEXT_WIDTH);
+            assert!(layout.width <= CHAT_TEXT_WIDTH);
+            assert_eq!(layout.lines.join(""), text.replace('\n', ""));
+            let (rows, height) =
+                chat_layout(vec![chat_message("长文字测试", &text)], &font).unwrap();
+            assert_eq!(
+                rows[0].height,
+                layout.lines.len() as u32 * CHAT_LINE_HEIGHT + 24
+            );
+            assert_eq!(height, 28 + 34 + rows[0].height + 28);
+        }
+        let words = chat_text(&font, "alpha bravo charlie delta", CHAT_FONT_SIZE, 155);
+        assert_eq!(words.lines, ["alpha", "bravo", "charlie", "delta"]);
+        let paragraph = chat_text(
+            &font,
+            &"汉字，句号。括号（内容）".repeat(12),
+            CHAT_FONT_SIZE,
+            CHAT_TEXT_WIDTH,
+        );
+        assert!(
+            paragraph
+                .lines
+                .iter()
+                .skip(1)
+                .all(|line| !line.starts_with(['，', '。', '）']))
+        );
+        assert!(chat_layout(vec![chat_message("超长", &"字".repeat(10_001))], &font).is_err());
+        assert!(
+            chat_layout(
+                vec![
+                    chat_message("第一条", "可以正常绘制"),
+                    chat_message("最后一条", &"长行\n".repeat(190))
+                ],
+                &font
+            )
+            .is_err()
+        );
+        assert!(chat_layout(vec![chat_message("多人", "消息"); 25], &font).is_err());
+        assert!(
+            chat_layout(
+                vec![ChatBubble {
+                    name: "太多图片".into(),
+                    avatar: None,
+                    content: (0..9)
+                        .map(
+                            |_| ChatContent::Image(rgba_png(image::RgbaImage::from_pixel(
+                                2,
+                                2,
+                                image::Rgba([255; 4])
+                            )))
+                        )
+                        .collect(),
+                }],
+                &font
+            )
+            .is_err()
+        );
+        let wide = rgba_png(image::RgbaImage::from_pixel(8193, 1, image::Rgba([255; 4])));
+        assert!(decode_chat_image(&wide).is_err());
+    }
+
+    #[test]
+    fn chat_images_preserve_alpha_and_small_dimensions_and_bad_avatars_fall_back() {
+        let Some(font) = available_font() else { return };
+        let picture = image::RgbaImage::from_pixel(4, 3, image::Rgba([200, 50, 20, 128]));
+        let mut canvas = Canvas::new(20, 20, font.clone()).unwrap();
+        canvas.rect(0, 0, 20, 20, [100, 100, 100]);
+        chat_picture(&mut canvas, &picture, 2, 2, 0);
+        let pixel = ((2 * 20 + 2) * 3) as usize;
+        assert_eq!(&canvas.pixels[pixel..pixel + 3], &[150, 75, 60]);
+        let (rows, _) = chat_layout(
+            vec![ChatBubble {
+                name: "无头像".into(),
+                avatar: Some(vec![0, 1, 2]),
+                content: vec![ChatContent::Image(rgba_png(picture))],
+            }],
+            &font,
+        )
+        .unwrap();
+        assert!(rows[0].avatar.is_none());
+        let ChatPart::Image(picture) = &rows[0].parts[0] else {
+            panic!("expected image")
+        };
+        assert_eq!(picture.dimensions(), (4, 3));
+        assert!(
+            chat_layout(
+                vec![ChatBubble {
+                    name: "坏图片".into(),
+                    avatar: None,
+                    content: vec![ChatContent::Image(vec![0, 1, 2])],
+                }],
+                &font
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn chat_camera_photo_orientation_is_applied_before_layout() {
+        use image::ImageEncoder as _;
+        let exif = vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let source = image::RgbImage::from_fn(32, 16, |x, _| {
+            image::Rgb(if x < 16 { [240, 20, 20] } else { [20, 20, 240] })
+        });
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+        encoder.set_exif_metadata(exif).unwrap();
+        encoder
+            .encode(source.as_raw(), 32, 16, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let decoded = decode_chat_image(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (16, 32));
+        assert!(decoded.get_pixel(8, 4)[0] > 180);
+        assert!(decoded.get_pixel(8, 28)[2] > 180);
+    }
+
+    #[test]
+    fn chat_real_and_fallback_avatars_are_clipped_to_a_72_pixel_circle() {
+        let Some(font) = available_font() else { return };
+        let picture = image::RgbaImage::from_pixel(72, 72, image::Rgba([220, 40, 80, 255]));
+        for avatar in [Some(&picture), None] {
+            let mut canvas = Canvas::new(80, 80, font.clone()).unwrap();
+            canvas.rect(0, 0, 80, 80, CHAT_BACKGROUND);
+            chat_avatar(&mut canvas, avatar, 4, 4);
+            for y in 0..80 {
+                for x in 0..80 {
+                    let inside = (4..76).contains(&x) && (4..76).contains(&y);
+                    if !inside || rounded_coverage(x - 4, y - 4, 72, 72, 36) == 0. {
+                        let at = ((y * 80 + x) * 3) as usize;
+                        assert_eq!(
+                            &canvas.pixels[at..at + 3],
+                            &CHAT_BACKGROUND,
+                            "outside circle at {x},{y}"
+                        );
+                    }
+                }
+            }
+            let center = ((40 * 80 + 40) * 3) as usize;
+            assert_ne!(&canvas.pixels[center..center + 3], &CHAT_BACKGROUND);
+            assert_eq!(rounded_coverage(0, 0, 72, 72, 36), 0.);
+            assert!(rounded_coverage(35, 0, 72, 72, 36) > 0.9);
+        }
+    }
+
+    #[test]
+    fn chat_render_visual_samples_cover_multiplayer_wrapping_and_mixed_images() {
+        let Some(font) = available_font() else { return };
+        let output = PathBuf::from("target/chat-qa");
+        std::fs::create_dir_all(&output).unwrap();
+        let avatar = |letter: &str, color: [u8; 3]| {
+            let mut canvas = Canvas::new(72, 72, font.clone()).unwrap();
+            canvas.rect(0, 0, 72, 72, color);
+            canvas.text(letter, 19, 17, 34., [255; 3], 50);
+            canvas.png(72).unwrap()
+        };
+        let avatars = [
+            avatar("舟", [97, 151, 176]),
+            avatar("橙", [211, 156, 100]),
+            avatar("川", [119, 155, 128]),
+        ];
+        let mut multiplayer = vec![
+            chat_message("小舟", "周末去江边走走吗？"),
+            chat_message("阿橙", "好呀，下午应该不会太晒。"),
+            chat_message("晴川", "我也来！带相机。"),
+            chat_message("小舟", "那就在地铁站出口见，沿着江边慢慢走。"),
+            chat_message("阿橙", "好，我带点喝的。"),
+        ];
+        for (index, bubble) in multiplayer.iter_mut().enumerate() {
+            bubble.avatar = Some(avatars[index % 3].clone());
+        }
+        let mut long = vec![
+            chat_message(
+                &"晴川的很长很长的群昵称".repeat(5),
+                "这段文字用来检查聊天气泡的自动换行：中文标点应当和前面的文字连在一起，括号（例如这里的说明）也应该自然排版。内容变长时，气泡会向下延伸，下一条消息不会挡住结尾。\n\n这里保留一个空行，然后继续下一段。",
+            ),
+            chat_message(
+                "小舟",
+                "The updated layout keeps ordinary English words together and wraps long addresses when necessary.\nhttps://example.invalid/this-is-a-very-long-path-that-must-wrap-without-losing-any-characters",
+            ),
+            chat_message("阿橙", "收到，最后一条也能完整看到。"),
+        ];
+        for (index, bubble) in long.iter_mut().enumerate() {
+            bubble.avatar = Some(avatars[(index + 2) % 3].clone());
+        }
+        let mut card = Canvas::new(520, 280, font.clone()).unwrap();
+        card.rect(0, 0, 520, 280, [227, 239, 247]);
+        chat_round_rect(&mut card, [25, 25, 470, 230], 16, [255; 3]);
+        card.text("今天的进度", 49, 45, 30., [38, 69, 87], 400);
+        card.text("页面排版已经完成", 49, 101, 23., [94, 113, 123], 400);
+        for (i, width) in [380, 294, 340].into_iter().enumerate() {
+            chat_round_rect(
+                &mut card,
+                [49, 156 + i as u32 * 26, width, 12],
+                6,
+                [131, 181, 191],
+            );
+        }
+        let card = card.png(280).unwrap();
+        let transparent = rgba_png(image::RgbaImage::from_fn(180, 100, |x, y| {
+            let inside = (x as i32 - 90).pow(2) + (y as i32 - 50).pow(2) < 38 * 38;
+            image::Rgba(if inside {
+                [237, 172, 77, 220]
+            } else {
+                [0, 0, 0, 0]
+            })
+        }));
+        let mixed = vec![
+            ChatBubble {
+                name: "小舟".into(),
+                avatar: Some(avatars[0].clone()),
+                content: vec![
+                    ChatContent::Text("这张是刚整理好的进度图。".into()),
+                    ChatContent::Image(card.clone()),
+                    ChatContent::Text("透明底的小图也保留了原来的尺寸：".into()),
+                    ChatContent::Image(transparent),
+                    ChatContent::Text("图片后面的说明还在这里，顺序没有变。".into()),
+                ],
+            },
+            chat_message("阿橙", "看到了，排版很清楚。"),
+            ChatBubble {
+                name: "晴川".into(),
+                avatar: Some(avatars[2].clone()),
+                content: vec![ChatContent::Image(card)],
+            },
+        ];
+        for (name, bubbles) in [
+            ("multiplayer", multiplayer),
+            ("wrapping", long),
+            ("mixed-images", mixed),
+        ] {
+            let bytes = chat_png(bubbles, font.clone()).unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!(decoded.width(), CHAT_WIDTH);
+            assert!(decoded.height() <= 8192);
+            assert!(bytes.len() <= 8 * 1024 * 1024);
+            std::fs::write(output.join(format!("{name}.png")), bytes).unwrap();
+        }
     }
 }

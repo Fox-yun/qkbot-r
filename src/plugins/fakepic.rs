@@ -1,5 +1,5 @@
 //! Behavior reference: lm175/nonebot-plugin-fakepic @ 0ac846a9.
-use super::render::ChatBubble;
+use super::render::{ChatBubble, ChatContent};
 use crate::{
     host::Host,
     plugin::{Plugin, PluginSpec},
@@ -15,6 +15,34 @@ pub struct FakePicPlugin;
 fn pattern() -> &'static Regex {
     static PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     PATTERN.get_or_init(|| Regex::new(r"^(\d{5,10})(?:【([^】]{0,64})】)?说").unwrap())
+}
+fn content_parts(text: &str, images: &[(String, Vec<u8>)]) -> Vec<ChatContent> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let next = images
+            .iter()
+            .filter_map(|(marker, bytes)| remaining.find(marker).map(|at| (at, marker, bytes)))
+            .min_by_key(|(at, _, _)| *at);
+        let Some((at, marker, bytes)) = next else {
+            result.push(ChatContent::Text(remaining.to_owned()));
+            break;
+        };
+        if at > 0 {
+            result.push(ChatContent::Text(remaining[..at].to_owned()));
+        }
+        result.push(ChatContent::Image(bytes.clone()));
+        remaining = &remaining[at + marker.len()..];
+    }
+    result
+}
+fn display_name(override_name: Option<&str>, resolved: &str, id: i64) -> String {
+    let name = override_name.unwrap_or(resolved);
+    if name.trim().is_empty() {
+        format!("QQ用户 {id}")
+    } else {
+        name.to_owned()
+    }
 }
 #[async_trait]
 impl Plugin for FakePicPlugin {
@@ -38,6 +66,9 @@ impl Plugin for FakePicPlugin {
     async fn reply(&self, host: &Host, message: &Incoming) -> Result<OutgoingMessage> {
         let mut text = String::new();
         let mut images = Vec::new();
+        // Only placeholders inserted from actual image segments are interpreted.
+        // User-written strings such as [[qkimage0]] stay ordinary text.
+        let image_nonce = uuid::Uuid::new_v4();
         if let Some(segments) = message.raw_message["segments"].as_array() {
             for segment in segments {
                 match segment["type"].as_str() {
@@ -56,8 +87,9 @@ impl Plugin for FakePicPlugin {
                             .get_resource_temp_url(&message.key, resource)
                             .await?;
                         let bytes = fetch(&url).await?;
-                        text.push_str(&format!("[[qkimage{}]]", images.len()));
-                        images.push(bytes);
+                        let marker = format!("[[qkimage-{image_nonce}-{}]]", images.len());
+                        text.push_str(&marker);
+                        images.push((marker, bytes));
                     }
                     _ => {}
                 }
@@ -73,6 +105,7 @@ impl Plugin for FakePicPlugin {
         let mut cached: std::collections::HashMap<i64, (String, Option<Vec<u8>>)> =
             std::collections::HashMap::new();
         for part in text.split('+') {
+            let part = part.trim();
             let captures = pattern()
                 .captures(part)
                 .context("格式：QQ号【昵称】说内容+QQ号说内容")?;
@@ -108,24 +141,14 @@ impl Plugin for FakePicPlugin {
                 cached.insert(id, (name.clone(), avatar.clone()));
                 (name, avatar)
             };
+            let name = display_name(override_name, &name, id);
             let body = &part[captures.get(0).unwrap().end()..];
             for line in body.split(' ').filter(|s| !s.is_empty()) {
-                ensure!(bubbles.len() < 24, "一次最多24条模拟消息");
-                let mut rendered = line.to_owned();
-                let mut pictures = Vec::new();
-                for (i, image) in images.iter().enumerate() {
-                    let marker = format!("[[qkimage{i}]]");
-                    if rendered.contains(&marker) {
-                        rendered = rendered.replace(&marker, "");
-                        pictures.push(image.clone());
-                    }
-                }
+                ensure!(bubbles.len() < 24, "一次最多24条聊天消息");
                 bubbles.push(ChatBubble {
                     name: name.clone(),
-                    text: rendered,
                     avatar: avatar.clone(),
-                    images: pictures,
-                    is_bot: (3_889_000_000..3_890_000_000).contains(&id),
+                    content: content_parts(line, &images),
                 });
             }
         }
@@ -170,5 +193,48 @@ mod tests {
         assert!(pattern().is_match("123456说你好"));
         assert!(!pattern().is_match("他说123456说你好"));
         assert!(!pattern().is_match("123说你好"));
+    }
+    #[test]
+    fn mixed_content_keeps_order_repeats_and_literal_user_markers() {
+        let images = vec![
+            ("[[trusted-a]]".into(), vec![1]),
+            ("[[trusted-b]]".into(), vec![2]),
+        ];
+        let parts = content_parts(
+            "前[[trusted-b]]中[[trusted-a]]后[[qkimage0]][[trusted-a]]",
+            &images,
+        );
+        let actual: Vec<String> = parts
+            .into_iter()
+            .map(|part| match part {
+                ChatContent::Text(text) => format!("text:{text}"),
+                ChatContent::Image(bytes) => format!("image:{}", bytes[0]),
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "text:前",
+                "image:2",
+                "text:中",
+                "image:1",
+                "text:后[[qkimage0]]",
+                "image:1"
+            ]
+        );
+        let adjacent = content_parts("[[trusted-a]][[trusted-b]]", &images);
+        assert_eq!(adjacent.len(), 2);
+        assert!(
+            adjacent
+                .iter()
+                .all(|part| matches!(part, ChatContent::Image(_)))
+        );
+    }
+    #[test]
+    fn each_explicit_nickname_overrides_cached_name_and_empty_names_use_qq_id() {
+        assert_eq!(display_name(Some("新昵称"), "旧昵称", 123456), "新昵称");
+        assert_eq!(display_name(None, "群名片", 123456), "群名片");
+        assert_eq!(display_name(None, "", 123456), "QQ用户 123456");
+        assert_eq!(display_name(Some("  "), "", 123456), "QQ用户 123456");
     }
 }

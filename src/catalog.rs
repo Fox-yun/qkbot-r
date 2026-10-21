@@ -105,15 +105,15 @@ pub fn features(config: &Config) -> Vec<Feature> {
         ),
         (
             "mock_chat_image",
-            "模拟聊天图片",
-            "QQ号【昵称】说内容+QQ号说内容；支持真实图片；输出明确标记模拟",
+            "聊天图片",
+            "QQ号【昵称】说内容+QQ号说内容；支持头像、群名片和图片消息",
             &["/mock-image"],
             false,
         ),
         (
             "mock_forward",
-            "模拟转发",
-            "QQ号说内容|QQ号说内容；单条用 /mock-forward；输出明确标记模拟",
+            "合并转发",
+            "QQ号说内容|QQ号说内容；单条用 /mock-forward；按联系人名称展示",
             &["/mock-forward"],
             false,
         ),
@@ -246,7 +246,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 .any(char::is_control)
             && fake.protected_ids.len() <= 256
             && fake.protected_ids.iter().all(|id| *id > 0),
-        "模拟转发分隔符或保护名单无效"
+        "转发分隔符或保护名单无效"
     );
     ensure!(
         native.image_font_path.len() <= 1024 && (1..=3600).contains(&native.mute_max_secs),

@@ -150,7 +150,7 @@ fn forward_input(message: &Incoming) -> String {
 
 /// Explicit simulated lines are also used by the image renderer.
 pub fn parse_mock_lines(input: &str) -> Result<Vec<(String, String)>> {
-    ensure!(input.len() <= 8192, "模拟内容最多8192字节");
+    ensure!(input.len() <= 8192, "转发内容最多8192字节");
     let mut lines = vec![];
     for part in input.split('|') {
         let (name, text) = part
@@ -164,20 +164,20 @@ pub fn parse_mock_lines(input: &str) -> Result<Vec<(String, String)>> {
                 && !name.chars().any(char::is_control)
                 && !text.is_empty()
                 && text.chars().count() <= 1000,
-            "模拟姓名或文本为空/过长"
+            "发送者姓名或文本为空/过长"
         );
         lines.push((name.to_owned(), text.to_owned()));
-        ensure!(lines.len() <= 16, "最多16条模拟消息");
+        ensure!(lines.len() <= 16, "最多16条转发消息");
     }
-    ensure!(!lines.is_empty(), "模拟内容不能为空");
+    ensure!(!lines.is_empty(), "转发内容不能为空");
     Ok(lines)
 }
 
 fn parse_original_fake(input: &str, config: &FakeMsgConfig) -> Result<Vec<(i64, String)>> {
-    ensure!(input.len() <= 8192, "模拟内容最多8192字节");
+    ensure!(input.len() <= 8192, "转发内容最多8192字节");
     ensure!(
         !config.user_split.is_empty() && !config.message_split.is_empty(),
-        "模拟分隔符为空"
+        "转发分隔符为空"
     );
     let mut lines = vec![];
     for user in input
@@ -199,10 +199,10 @@ fn parse_original_fake(input: &str, config: &FakeMsgConfig) -> Result<Vec<(i64, 
                 "消息内容过长或包含不支持的CQ码"
             );
             lines.push((id, text.to_owned()));
-            ensure!(lines.len() <= 16, "最多16条模拟消息");
+            ensure!(lines.len() <= 16, "最多16条转发消息");
         }
     }
-    ensure!(!lines.is_empty(), "模拟内容不能为空");
+    ensure!(!lines.is_empty(), "转发内容不能为空");
     Ok(lines)
 }
 
@@ -217,13 +217,13 @@ async fn fake_reply(host: &Host, message: &Incoming) -> Result<OutgoingMessage> 
     if let Some(input) = explicit.filter(|_| !original_style) {
         if input.trim().is_empty() {
             return Ok(OutgoingMessage::text(
-                "/mock-forward 名字:内容 | 名字:内容\n原版语法：QQ号说内容|QQ号说内容；也支持真实@某人说内容。所有结果标注模拟。",
+                "/mock-forward 名字:内容 | 名字:内容\n原版语法：QQ号说内容|QQ号说内容；也支持真实@某人说内容。",
             ));
         }
         for (name, text) in parse_mock_lines(input.trim())? {
             nodes.push(OutgoingForwardedMessage {
                 user_id: message.key.scope.bot_id,
-                sender_name: format!("[模拟] {name}"),
+                sender_name: name,
                 time: None,
                 segments: vec![OutgoingSegment::Text { text }],
             });
@@ -240,7 +240,7 @@ async fn fake_reply(host: &Host, message: &Incoming) -> Result<OutgoingMessage> 
                         .native
                         .superusers
                         .contains(&message.sender_id),
-                "该用户已设置模拟保护，只有机器人管理员可使用"
+                "该用户已设置转发保护，只有机器人管理员可使用"
             );
         }
         let names: BTreeMap<i64, String> = match message.key.scope.scene {
@@ -297,35 +297,53 @@ async fn fake_reply(host: &Host, message: &Incoming) -> Result<OutgoingMessage> 
                 .context("只可使用当前群成员或当前私聊双方的身份")?;
             nodes.push(OutgoingForwardedMessage {
                 user_id: id,
-                sender_name: format!("[模拟] {}", name.chars().take(58).collect::<String>()),
+                sender_name: if name.is_empty() {
+                    id.to_string()
+                } else {
+                    name.chars().take(64).collect()
+                },
                 time: None,
                 segments: vec![OutgoingSegment::Text { text }],
             });
         }
     }
-    let mut messages = vec![OutgoingForwardedMessage {
-        user_id: message.key.scope.bot_id,
-        sender_name: "模拟说明".into(),
-        time: None,
-        segments: vec![OutgoingSegment::Text {
-            text: "以下内容由用户生成，仅供模拟展示，不是真实聊天记录。".into(),
+    Ok(forward_card(nodes, message.key.scope.scene))
+}
+
+fn forward_card(messages: Vec<OutgoingForwardedMessage>, scene: Scene) -> OutgoingMessage {
+    let preview = messages
+        .iter()
+        .take(4)
+        .map(|message| {
+            let text: String = message
+                .segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    OutgoingSegment::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{}: {text}", message.sender_name)
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(256)
+                .collect()
+        })
+        .collect();
+    let summary = format!("查看{}条转发消息", messages.len());
+    OutgoingMessage {
+        segments: vec![OutgoingSegment::Forward {
+            messages,
+            title: Some(match scene {
+                Scene::Group => "群聊的聊天记录".into(),
+                Scene::Friend => "聊天记录".into(),
+            }),
+            preview: Some(preview),
+            summary: Some(summary),
+            prompt: Some("[聊天记录]".into()),
         }],
-    }];
-    messages.extend(nodes);
-    Ok(OutgoingMessage {
-        segments: vec![
-            OutgoingSegment::Text {
-                text: "模拟转发 · 非真实聊天记录".into(),
-            },
-            OutgoingSegment::Forward {
-                messages,
-                title: Some("模拟聊天 · 非真实记录".into()),
-                preview: Some(vec!["用户生成的模拟内容".into()]),
-                summary: Some("模拟转发".into()),
-                prompt: Some("[模拟聊天]".into()),
-            },
-        ],
-    })
+    }
 }
 
 pub struct NudgePlugin;
@@ -713,6 +731,168 @@ fn random(len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn forward_message(text: &str, scene: Scene) -> Incoming {
+        Incoming {
+            key: MessageKey {
+                scope: crate::types::Scope {
+                    bot_id: 112233,
+                    scene,
+                    peer_id: 123456,
+                },
+                message_seq: 1,
+            },
+            sender_id: 654321,
+            sender_nickname: None,
+            sender_card: None,
+            text: text.into(),
+            mentions: vec![],
+            quote_seq: None,
+            received_at: 1,
+            raw_message: Value::Null,
+            notification: None,
+        }
+    }
+
+    fn forward_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.app.database = ":memory:".into();
+        config.plugins.ai.enabled = false;
+        config.plugins.native.enabled.clear();
+        config
+    }
+
+    #[tokio::test]
+    async fn explicit_forward_contains_only_requested_nodes_and_natural_metadata() {
+        let host = Host::create(forward_config()).await.unwrap();
+        for (scene, title) in [
+            (Scene::Group, "群聊的聊天记录"),
+            (Scene::Friend, "聊天记录"),
+        ] {
+            let incoming = forward_message("/mock-forward 小明:你好 | 小红:第二行\n继续", scene);
+            let outgoing = fake_reply(&host, &incoming).await.unwrap();
+            outgoing.validate(8192).unwrap();
+            assert!(outgoing.text_content().is_empty());
+            assert_eq!(outgoing.segments.len(), 1);
+            let value = serde_json::to_value(outgoing).unwrap();
+            let data = &value["segments"][0]["data"];
+            let nodes = data["messages"].as_array().unwrap();
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0]["user_id"], incoming.key.scope.bot_id);
+            assert_eq!(nodes[0]["sender_name"], "小明");
+            assert_eq!(nodes[0]["segments"][0]["data"]["text"], "你好");
+            assert_eq!(nodes[1]["sender_name"], "小红");
+            assert_eq!(nodes[1]["segments"][0]["data"]["text"], "第二行\n继续");
+            assert_eq!(data["title"], title);
+            assert_eq!(
+                data["preview"],
+                serde_json::json!(["小明: 你好", "小红: 第二行 继续"])
+            );
+            assert_eq!(data["summary"], "查看2条转发消息");
+            assert_eq!(data["prompt"], "[聊天记录]");
+        }
+        let mut lines = vec![format!("{}:{}", "名".repeat(48), "甲".repeat(1000))];
+        lines.extend((1..16).map(|index| format!("用户{index}:原文\n\t保留\0内容")));
+        let incoming = forward_message(&format!("/mock-forward {}", lines.join("|")), Scene::Group);
+        let outgoing = fake_reply(&host, &incoming).await.unwrap();
+        outgoing.validate(8192).unwrap();
+        let value = serde_json::to_value(outgoing).unwrap();
+        let data = &value["segments"][0]["data"];
+        assert_eq!(data["messages"].as_array().unwrap().len(), 16);
+        assert_eq!(data["summary"], "查看16条转发消息");
+        let preview = data["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 4);
+        assert_eq!(preview[0].as_str().unwrap().chars().count(), 256);
+        assert!(
+            preview
+                .iter()
+                .all(|line| !line.as_str().unwrap().chars().any(char::is_control))
+        );
+        assert_eq!(
+            data["messages"][1]["segments"][0]["data"]["text"],
+            "原文\n\t保留\0内容"
+        );
+        lines.push("多余:第17条".into());
+        assert!(parse_mock_lines(&lines.join("|")).is_err());
+        host.store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_forward_preserves_member_identity_and_protection() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new()
+            .route("/api/get_login_info", axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"status":"ok","retcode":0,"data":{"uin":112233,"nickname":"机器人"}}))
+            }))
+            .route("/api/get_group_member_list", axum::routing::post(move || {
+                let calls = observed.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"status":"ok","retcode":0,"data":{"members":[
+                        {"user_id":123456,"group_id":123456,"nickname":"原昵称","card":"群名片","role":"member"},
+                        {"user_id":654321,"group_id":123456,"nickname":"张".repeat(64),"card":"","role":"member"},
+                        {"user_id":777777,"group_id":123456,"nickname":"","card":"","role":"member"}
+                    ]}}))
+                }
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = forward_config();
+        config.milky.url = url;
+        config.plugins.native.fakemsg.protected_ids = vec![123456];
+        config.plugins.native.superusers = vec![999999];
+        let host = Host::create(config).await.unwrap();
+        host.milky.login().await.unwrap();
+        let mut incoming = forward_message("/mock-forward 123456说你好|654321说再见", Scene::Group);
+        assert!(
+            fake_reply(&host, &incoming)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("转发保护")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        incoming.sender_id = 999999;
+        // The real-mention syntax follows the same ID and name lookup path.
+        incoming.raw_message = serde_json::json!({"segments":[
+            {"type":"mention","data":{"user_id":123456}},
+            {"type":"text","data":{"text":"说你好|654321说再见|777777说收到"}}
+        ]});
+        let outgoing = fake_reply(&host, &incoming).await.unwrap();
+        outgoing.validate(8192).unwrap();
+        let value = serde_json::to_value(outgoing).unwrap();
+        let data = &value["segments"][0]["data"];
+        let nodes = data["messages"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0]["user_id"], 123456);
+        assert_eq!(nodes[0]["sender_name"], "群名片");
+        assert_eq!(nodes[1]["user_id"], 654321);
+        assert_eq!(nodes[1]["sender_name"], "张".repeat(64));
+        assert_eq!(nodes[2]["user_id"], 777777);
+        assert_eq!(nodes[2]["sender_name"], "777777");
+        assert_eq!(data["preview"][0], "群名片: 你好");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        incoming.raw_message = Value::Null;
+        incoming.text = "/mock-forward 111111说不在当前群".into();
+        assert!(
+            fake_reply(&host, &incoming)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("只可使用当前群成员")
+        );
+        server.abort();
+        host.store.stop().await.unwrap();
+    }
+
     #[test]
     fn original_forward_parser_preserves_speaker_and_per_speaker_message_split() {
         let lines = parse_original_fake(
