@@ -332,7 +332,6 @@ fn validate_jpeg(jpeg: &[u8]) -> Result<()> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireResponse {
     object: String,
     model: String,
@@ -341,7 +340,6 @@ struct WireResponse {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireEmbedding {
     object: String,
     index: usize,
@@ -349,10 +347,12 @@ struct WireEmbedding {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireUsage {
     prompt_tokens: u64,
     total_tokens: u64,
+    // SiliconFlow counts image input separately from prompt_tokens.
+    #[serde(default)]
+    image_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
 }
@@ -360,10 +360,17 @@ struct WireUsage {
 fn parse_response(bytes: &[u8], config: &EmbeddingConfig) -> Result<EmbeddingResponse> {
     let mut response: WireResponse =
         serde_json::from_slice(bytes).map_err(|_| EmbeddingError::Response)?;
+    // Ignore provider metadata extensions, but retain strict types/duplicates
+    // for every consumed field and validate the complete vector below.
+    let input_tokens = response
+        .usage
+        .prompt_tokens
+        .checked_add(response.usage.image_tokens)
+        .ok_or(EmbeddingError::Response)?;
     if response.object != "list"
         || response.model != config.model
         || response.data.len() != 1
-        || response.usage.total_tokens < response.usage.prompt_tokens
+        || response.usage.total_tokens < input_tokens
         || response.usage.completion_tokens != 0
     {
         return Err(EmbeddingError::Response.into());
@@ -379,7 +386,7 @@ fn parse_response(bytes: &[u8], config: &EmbeddingConfig) -> Result<EmbeddingRes
     normalize(&mut vector).map_err(|_| EmbeddingError::Response)?;
     Ok(EmbeddingResponse {
         vector,
-        input_tokens: response.usage.prompt_tokens,
+        input_tokens: response.usage.total_tokens,
     })
 }
 
@@ -580,7 +587,7 @@ mod tests {
                 8 => invalid["data"][0]["embedding"][0] = json!("1.0"),
                 9 => invalid["data"][0]["embedding"][0] = json!(1e100),
                 10 => invalid["usage"]["total_tokens"] = json!(6),
-                _ => invalid["data"][0]["extra"] = json!("unexpected"),
+                _ => invalid["usage"]["completion_tokens"] = json!(1),
             }
             assert!(
                 parse_response(&serde_json::to_vec(&invalid).unwrap(), &cfg).is_err(),
@@ -594,6 +601,68 @@ mod tests {
         assert!(
             parse_response(br#"{"error":{"message":"secret-provider-content"}}"#, &cfg).is_err()
         );
+    }
+
+    #[test]
+    fn siliconflow_text_and_image_usage_and_metadata_extensions_are_compatible() {
+        let cfg = config("http://127.0.0.1:1".into());
+        // Real synthetic responses on 2026-10-21: text includes image_tokens=0;
+        // image usage separates its four image tokens from 18 prompt tokens.
+        for (prompt, image, total) in [(21, 0, 21), (18, 4, 22)] {
+            let mut value = wire();
+            value["usage"] = json!({"prompt_tokens":prompt,"image_tokens":image,
+                "total_tokens":total,"completion_tokens":0});
+            let response = parse_response(&serde_json::to_vec(&value).unwrap(), &cfg).unwrap();
+            assert_eq!(response.input_tokens, total);
+            assert_eq!(response.vector.len(), cfg.dimensions);
+            value["request_id"] = json!("synthetic-request-id");
+            value["usage"]["billing_metadata"] = json!({"cached_tokens":0});
+            value["data"][0]["metadata"] = json!({"synthetic":true});
+            let extended = parse_response(&serde_json::to_vec(&value).unwrap(), &cfg).unwrap();
+            assert_eq!(extended.input_tokens, total);
+            assert_eq!(extended.vector, response.vector);
+        }
+        // Existing text-only compatible servers need not emit image_tokens.
+        assert_eq!(
+            parse_response(&serde_json::to_vec(&wire()).unwrap(), &cfg)
+                .unwrap()
+                .input_tokens,
+            7
+        );
+    }
+
+    #[test]
+    fn usage_extensions_do_not_relax_known_fields_or_allow_invalid_token_counts() {
+        let cfg = config("http://127.0.0.1:1".into());
+        for invalid_usage in [
+            json!({"prompt_tokens":18,"image_tokens":4,"total_tokens":21}),
+            json!({"prompt_tokens":u64::MAX,"image_tokens":1,"total_tokens":u64::MAX}),
+            json!({"prompt_tokens":18,"image_tokens":-1,"total_tokens":22}),
+            json!({"prompt_tokens":18,"image_tokens":"4","total_tokens":22}),
+            json!({"prompt_tokens":18,"image_tokens":null,"total_tokens":22}),
+            json!({"prompt_tokens":18,"total_tokens":22,"completion_tokens":1}),
+            json!({"prompt_tokens":18,"image_tokens":4}),
+            json!({"image_tokens":4,"total_tokens":22}),
+        ] {
+            let mut value = wire();
+            value["usage"] = invalid_usage;
+            assert!(parse_response(&serde_json::to_vec(&value).unwrap(), &cfg).is_err());
+        }
+        for field in ["model", "prompt_tokens", "total_tokens", "index"] {
+            let original = wire().to_string();
+            let value = match field {
+                "model" => json!(EmbeddingConfig::default().model).to_string(),
+                "index" => "0".into(),
+                _ => "7".into(),
+            };
+            let needle = format!("\"{field}\":{value}");
+            let duplicate = original.replacen(&needle, &format!("{needle},{needle}"), 1);
+            assert_ne!(duplicate, original);
+            assert!(
+                parse_response(duplicate.as_bytes(), &cfg).is_err(),
+                "duplicate {field}"
+            );
+        }
     }
 
     #[test]
