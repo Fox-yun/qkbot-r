@@ -1,6 +1,7 @@
 //! Embedded administration with server sessions and a shared database service.
 pub mod auth;
 pub mod contacts;
+pub mod embedding;
 pub mod memory;
 pub mod models;
 pub mod plugins;
@@ -41,6 +42,7 @@ pub struct AdminState {
     qq: QqService,
     contacts: ContactsService,
     models: ModelsService,
+    embedding: embedding::EmbeddingTestService,
     mutations: tokio_util::task::TaskTracker,
 }
 impl AdminState {
@@ -53,6 +55,7 @@ impl AdminState {
             qq: QqService::new(store.clone()),
             contacts: ContactsService::new(store.clone(), runtime.clone()),
             models: ModelsService::new(store.clone()),
+            embedding: embedding::EmbeddingTestService::new(store.clone()),
             store,
             runtime,
             auth,
@@ -81,6 +84,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/status", get(status))
         .route("/api/config", get(config).put(save))
         .route("/api/llm/models", post(model_list))
+        .route("/api/embedding/test", post(embedding_test))
         .route("/api/runtime/apply", post(apply))
         .route("/api/runtime/stop", post(stop))
         .route("/api/qq/status", get(qq_status))
@@ -573,6 +577,24 @@ async fn operation(
     Path(id): Path<String>,
 ) -> Response {
     result(async { s.memories().await?.operation(&actor(a), &id).await }.await)
+}
+
+async fn embedding_test(
+    State(s): State<Arc<AdminState>>,
+    request: std::result::Result<Json<embedding::EmbeddingTestRequest>, JsonRejection>,
+) -> Response {
+    let result = match request {
+        Ok(Json(request)) => s.embedding.test(request).await,
+        Err(_) => Err(embedding::EmbeddingTestError::Invalid),
+    };
+    match result {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => (
+            error.status(),
+            Json(json!({"error":error.to_string(),"code":error.code()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn model_list(

@@ -37,7 +37,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     plugins.register(PluginSpec {
         id: "ai",
         commands: &[],
-        tools: &["reply_message"],
+        tools: &["reply_message", "search_stickers"],
         dependencies: &["host"],
     })?;
     plugins.register_handler(std::sync::Arc::new(clock::ClockPlugin))?;

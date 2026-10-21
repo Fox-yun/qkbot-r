@@ -26,6 +26,7 @@ struct ModelRequest {
 struct MockServer {
     url: String,
     models: mpsc::Receiver<ModelRequest>,
+    embeddings: mpsc::Receiver<ModelRequest>,
     sends: mpsc::Receiver<Value>,
     quotes: mpsc::Receiver<Value>,
     quote_requests: mpsc::Receiver<ModelRequest>,
@@ -48,6 +49,7 @@ impl MockServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (model_tx, models) = mpsc::channel(32);
+        let (embedding_tx, embeddings) = mpsc::channel(32);
         let (send_tx, sends) = mpsc::channel(32);
         let (quote_tx, quotes) = mpsc::channel(32);
         let (quote_request_tx, quote_requests) = mpsc::channel(32);
@@ -72,6 +74,7 @@ impl MockServer {
                     break;
                 };
                 let model_tx = model_tx.clone();
+                let embedding_tx = embedding_tx.clone();
                 let send_tx = send_tx.clone();
                 let quote_tx = quote_tx.clone();
                 let quote_request_tx = quote_request_tx.clone();
@@ -129,6 +132,11 @@ impl MockServer {
                                 if model_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
                                 let Ok(response) = receive.await else { return; }; response
                             }
+                            "/v1/embeddings" => {
+                                let (reply, receive) = oneshot::channel();
+                                if embedding_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
+                                let Ok(response) = receive.await else { return; }; response
+                            }
                             _ => json!({"status":"failed","retcode":-404}),
                         }.to_string();
                         let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len());
@@ -146,6 +154,7 @@ impl MockServer {
         Self {
             url,
             models,
+            embeddings,
             sends,
             quotes,
             quote_requests,
@@ -1671,6 +1680,400 @@ fn model_tool_response(calls: Vec<Value>) -> Value {
     json!({"model":"mock","choices":[{"finish_reason":"tool_calls","message":{
         "role":"assistant","content":null,"tool_calls":calls
     }}]})
+}
+
+fn enable_sticker_search(config: &mut Config, mock_url: &str) {
+    if !config
+        .plugins
+        .ai
+        .defaults
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "search_stickers")
+    {
+        config
+            .plugins
+            .ai
+            .defaults
+            .allowed_tools
+            .push("search_stickers".into());
+    }
+    config.embedding = qkbot::embedding::EmbeddingConfig {
+        enabled: true,
+        embeddings_url: format!("{mock_url}/v1/embeddings"),
+        api_key: "synthetic".into(),
+        dimensions: 64,
+        ..Default::default()
+    };
+    config.stickers.auto_collect = false;
+}
+
+fn sticker_vector() -> Vec<f32> {
+    let mut vector = vec![0.0; 64];
+    vector[0] = 1.0;
+    vector
+}
+
+async fn seed_sticker(host: &Host, incoming: &Incoming) {
+    use sha2::{Digest, Sha256};
+    let conversation = qkbot::plugins::ai::conversation(host, incoming)
+        .await
+        .unwrap();
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(48, 32, |x, y| {
+        if x > 10 && x < 38 && y > 6 && y < 26 {
+            image::Rgb([240, 170, 40])
+        } else {
+            image::Rgb([30, 90, 150])
+        }
+    }));
+    let mut original = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut original, image::ImageFormat::Png)
+        .unwrap();
+    let original = original.into_inner();
+    let mut thumbnail = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut thumbnail, 80)
+        .encode_image(&image)
+        .unwrap();
+    let hash = format!("{:x}", Sha256::digest(&original));
+    let thumbnail_hash = format!("{:x}", Sha256::digest(&thumbnail));
+    let scope = incoming.key.scope.key();
+    let directory = std::path::Path::new(&host.config.app.database)
+        .parent()
+        .unwrap()
+        .join("stickers")
+        .join(format!("{:x}", Sha256::digest(scope.as_bytes())));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(format!("{hash}.original")), &original).unwrap();
+    std::fs::write(directory.join(format!("{hash}.jpg")), &thumbnail).unwrap();
+    let fingerprint = host.embedding.as_ref().unwrap().fingerprint().to_owned();
+    let vector = qkbot::embedding::encode_vector(&sticker_vector()).unwrap();
+    let source = format!("{scope}:990");
+    host.store.call(move |db| {
+        db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,learnable) VALUES(?1,?2,?3,?4,789,'control','[合成表情来源]',?5,0)", rusqlite::params![source,scope,conversation.guard.conversation_id,conversation.guard.epoch,now()])?;
+        db.execute("INSERT INTO ai_stickers(scope,hash,mime,original_bytes,thumbnail_bytes,thumbnail_hash,fingerprint,dimensions,vector,created_at,updated_at) VALUES(?1,?2,'image/png',?3,?4,?5,?6,64,?7,?8,?8)",rusqlite::params![scope,hash,original.len(),thumbnail.len(),thumbnail_hash,fingerprint,vector,now()])?;
+        let id = db.last_insert_rowid();
+        db.execute("INSERT INTO ai_sticker_sources(sticker_id,source_key,scope,conversation_id,epoch) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![id,source,scope,conversation.guard.conversation_id,conversation.guard.epoch])?;
+        Ok(())
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn sticker_search_shows_thumbnail_then_sends_one_selected_image_with_reply() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.plugins.ai.defaults = qkbot::config::AiSettings::default();
+        enable_sticker_search(config, &mock.url);
+    })
+    .await;
+    let incoming = message(1, "一起庆祝这次成功吧");
+    seed_sticker(&host, &incoming).await;
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    assert!(
+        request.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "search_stickers")
+    );
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "find-celebration",
+            "search_stickers",
+            json!({"query":"开心庆祝成功"}),
+        )]))
+        .unwrap();
+    let embedding = within(mock.embeddings.recv()).await.unwrap();
+    assert_eq!(embedding.body["input"]["text"], "开心庆祝成功");
+    embedding.reply.send(json!({"object":"list","model":"Qwen/Qwen3-VL-Embedding-8B","data":[{"object":"embedding","index":0,"embedding":sticker_vector()}],"usage":{"prompt_tokens":3,"total_tokens":3}})).unwrap();
+    let selected = mock.model().await;
+    let messages = selected.body["messages"].as_array().unwrap();
+    let result = messages
+        .iter()
+        .find(|message| message["tool_call_id"] == "find-celebration")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    let candidates = result["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["position"], 1);
+    let previews: Vec<_> = messages
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .collect();
+    assert_eq!(
+        previews.len(),
+        1,
+        "selection must see the actual candidate thumbnail"
+    );
+    let preview = previews[0]["image_url"]["url"].as_str().unwrap();
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(preview.strip_prefix("data:image/jpeg;base64,").unwrap())
+        .unwrap();
+    let decoded = image::load_from_memory(&decoded).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (320, 320));
+    assert!(!result.to_string().contains(".original"));
+    assert!(
+        mock.sends.try_recv().is_err(),
+        "search must not send a message"
+    );
+    selected
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "selected-sticker",
+            "reply_message",
+            json!({
+                "text":"一起庆祝！", "reply_to":current["message_ref"],
+                "sticker_ref":candidates[0]["sticker_ref"],
+            }),
+        )]))
+        .unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    let segments = sent["message"].as_array().unwrap();
+    assert_eq!(
+        segments.len(),
+        3,
+        "one terminal reply contains quote, text and one image"
+    );
+    assert_eq!(
+        segments.iter().find(|s| s["type"] == "reply").unwrap()["data"]["message_seq"],
+        1
+    );
+    assert_eq!(
+        segments.iter().find(|s| s["type"] == "text").unwrap()["data"]["text"],
+        "一起庆祝！"
+    );
+    let images: Vec<_> = segments.iter().filter(|s| s["type"] == "image").collect();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["data"]["sub_type"], "sticker");
+    assert!(
+        images[0]["data"]["uri"]
+            .as_str()
+            .unwrap()
+            .contains("/native-media/")
+    );
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.embeddings.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn sticker_reply_rejects_raw_image_arguments_without_sending_or_fetching() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        enable_sticker_search(config, &mock.url);
+        config.limits.max_model_calls = 4;
+    })
+    .await;
+    router.dispatch(message(1, "请正常回复")).await.unwrap();
+    let invalid = [
+        (
+            "forged-uri",
+            json!({"text":"不应发送", "sticker_ref":"https://example.invalid/arbitrary.png"}),
+        ),
+        (
+            "forged-object",
+            json!({"text":"不应发送", "sticker_ref":{"uri":"https://example.invalid/arbitrary.png"}}),
+        ),
+        (
+            "forged-image",
+            json!({"text":"不应发送", "image":{"uri":"https://example.invalid/arbitrary.png"}}),
+        ),
+    ];
+    let mut request = mock.model().await;
+    for (id, args) in invalid {
+        request
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                id,
+                "reply_message",
+                args,
+            )]))
+            .unwrap();
+        request = mock.model().await;
+        assert_failed_tool_results(&request.body, &[id]);
+        assert!(
+            mock.sends.try_recv().is_err(),
+            "invalid image arguments must have no send side effect"
+        );
+        assert!(mock.embeddings.try_recv().is_err());
+        assert!(mock.quotes.try_recv().is_err());
+        assert!(mock.resources.try_recv().is_err());
+    }
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "text-only",
+            "reply_message",
+            json!({"text":"正常文字回复"}),
+        )]))
+        .unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    assert_eq!(
+        sent["message"],
+        json!([{"type":"text","data":{"text":"正常文字回复"}}])
+    );
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.embeddings.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+async fn assert_sticker_loss_keeps_one_text_reply(loss: &'static str) {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.plugins.ai.defaults = qkbot::config::AiSettings::default();
+        enable_sticker_search(config, &mock.url);
+    })
+    .await;
+    let incoming = message(1, "一起庆祝这次成功吧");
+    seed_sticker(&host, &incoming).await;
+    router.dispatch(incoming).await.unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "search-before-loss",
+            "search_stickers",
+            json!({"query":"开心庆祝成功"}),
+        )]))
+        .unwrap();
+    let embedding = within(mock.embeddings.recv()).await.unwrap();
+    embedding.reply.send(json!({"object":"list","model":"Qwen/Qwen3-VL-Embedding-8B","data":[{"object":"embedding","index":0,"embedding":sticker_vector()}],"usage":{"prompt_tokens":3,"total_tokens":3}})).unwrap();
+    let selected = mock.model().await;
+    let messages = selected.body["messages"].as_array().unwrap();
+    let result = messages
+        .iter()
+        .find(|message| message["tool_call_id"] == "search-before-loss")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    let candidates = result["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        1,
+        "the candidate must become visible before it is invalidated"
+    );
+    match loss {
+        "cooldown" => host.store.call(|db| {
+            db.execute("INSERT INTO ai_sticker_scopes(scope,last_sent_at) VALUES('123:group:456',?1) ON CONFLICT(scope) DO UPDATE SET last_sent_at=excluded.last_sent_at",[now()])?;
+            Ok(())
+        }).await.unwrap(),
+        "revoked" => host.stickers.revoke("123:group:456:990").await.unwrap(),
+        "revoked_after_prepare" => host.store.call(|db| {
+            // The first authorization has succeeded and the outbox still contains
+            // an image. This trigger invalidates only its sticker provenance before
+            // the host's final submit transaction, without a timing-dependent sleep.
+            db.execute_batch("CREATE TABLE sticker_preparation_audit(images INTEGER NOT NULL);
+                CREATE TRIGGER revoke_sticker_after_prepare AFTER INSERT ON outbox
+                WHEN NEW.origin_plugin='ai' AND NEW.state='prepared'
+                BEGIN
+                    INSERT INTO sticker_preparation_audit(images) SELECT COUNT(*) FROM json_each(NEW.body,'$.segments') WHERE json_extract(value,'$.type')='image';
+                    INSERT INTO ai_sticker_revoked(source_key,revoked_at) VALUES('123:group:456:990',1);
+                END;")?;
+            Ok(())
+        }).await.unwrap(),
+        _ => panic!("unknown synthetic sticker loss"),
+    }
+    assert!(mock.sends.try_recv().is_err());
+    selected
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "reply-after-loss",
+            "reply_message",
+            json!({
+                "reply_to":current["message_ref"], "text":"一起庆祝！",
+                "sticker_ref":candidates[0]["sticker_ref"],
+            }),
+        )]))
+        .unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    let expected = json!([
+        {"type":"reply","data":{"message_seq":1}},
+        {"type":"text","data":{"text":"一起庆祝！"}},
+    ]);
+    assert_eq!(
+        sent["message"], expected,
+        "{loss}: invalidated optional image must not suppress the reply"
+    );
+    wait_for_outbox(&host, "confirmed", 1).await;
+    let (body, total, prepared_images): (String, i64, Option<i64>) = host
+        .store
+        .call(move |db| {
+            let body = db.query_row(
+                "SELECT body FROM outbox WHERE state='confirmed'",
+                [],
+                |row| row.get(0),
+            )?;
+            let total = db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?;
+            let prepared_images = if loss == "revoked_after_prepare" {
+                Some(
+                    db.query_row("SELECT images FROM sticker_preparation_audit", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            } else {
+                None
+            };
+            Ok((body, total, prepared_images))
+        })
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["segments"], expected,
+        "{loss}: the confirmed ledger must match the actual text-only submission"
+    );
+    assert_eq!(
+        total, 1,
+        "{loss}: fallback must not enqueue a second message"
+    );
+    if let Some(images) = prepared_images {
+        assert_eq!(
+            images, 1,
+            "the race must happen after a valid image was prepared"
+        );
+    }
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.embeddings.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn sticker_reply_cooldown_or_revocation_after_preview_preserves_text_and_quote() {
+    for loss in ["cooldown", "revoked"] {
+        assert_sticker_loss_keeps_one_text_reply(loss).await;
+    }
+}
+
+#[tokio::test]
+async fn sticker_reply_revocation_after_outbox_preparation_updates_the_submitted_body() {
+    assert_sticker_loss_keeps_one_text_reply("revoked_after_prepare").await;
 }
 
 fn current_message_payload(body: &Value) -> Value {

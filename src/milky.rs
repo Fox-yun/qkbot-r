@@ -1154,6 +1154,9 @@ fn normalize_event_value(bot_id: i64, value: &Value, received_at: i64) -> Result
         value["self_id"].as_i64() == Some(bot_id),
         "event self_id mismatch"
     );
+    if value["event_type"] == "message_recall" {
+        return normalize_recall(bot_id, value, received_at);
+    }
     if matches!(
         value["event_type"].as_str(),
         Some("group_nudge" | "friend_nudge")
@@ -1168,6 +1171,61 @@ fn normalize_event_value(bot_id: i64, value: &Value, received_at: i64) -> Result
         &value["data"],
         received_at,
     )?))
+}
+
+// Milky Event.message_recall identifies the original by account/scene/peer/seq.
+// Carry it as an internal notification; the router consumes it before plugins.
+fn normalize_recall(bot_id: i64, value: &Value, received_at: i64) -> Result<Option<Incoming>> {
+    let data = &value["data"];
+    let scene = match data["message_scene"].as_str() {
+        Some("group") => Scene::Group,
+        Some("friend") => Scene::Friend,
+        Some("temp") => return Ok(None),
+        _ => bail!("invalid recall scene"),
+    };
+    let positive = |field: &str| {
+        data[field]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .context("invalid recall identity")
+    };
+    let peer_id = positive("peer_id")?;
+    let sequence = data["message_seq"]
+        .as_i64()
+        .filter(|seq| *seq >= 0)
+        .context("invalid recall sequence")?;
+    let sender = positive("sender_id")?;
+    let operator = positive("operator_id")?;
+    ensure!(
+        value["time"].as_i64().is_some_and(|time| time >= 0),
+        "invalid recall time"
+    );
+    let hash = Sha256::digest(serde_json::to_vec(value)?);
+    let fingerprint = i64::from_be_bytes(hash[..8].try_into()?) & i64::MAX;
+    Ok(Some(Incoming {
+        key: MessageKey {
+            scope: Scope {
+                bot_id,
+                scene,
+                peer_id,
+            },
+            message_seq: -fingerprint.max(1),
+        },
+        sender_id: sender,
+        sender_nickname: None,
+        sender_card: None,
+        text: String::new(),
+        mentions: vec![],
+        quote_seq: Some(sequence),
+        received_at,
+        raw_message: Value::Null,
+        notification: Some(NudgeEvent {
+            event_type: "message_recall".into(),
+            initiator: operator,
+            target: sender,
+            raw_event: value.clone(),
+        }),
+    }))
 }
 
 fn normalize_nudge(bot_id: i64, value: &Value, received_at: i64) -> Result<Incoming> {
@@ -1340,6 +1398,29 @@ fn normalize_message(bot_id: i64, value: &Value, received_at: i64) -> Result<Inc
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn recall_events_keep_exact_account_and_scope_and_do_not_become_chat() {
+        let event = serde_json::json!({"self_id":123,"event_type":"message_recall","time":1,
+            "data":{"message_scene":"group","peer_id":456,"message_seq":7,"sender_id":8,"operator_id":9}});
+        let normalized = super::normalize_event_value(123, &event, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(normalized.key.scope.key(), "123:group:456");
+        assert!(normalized.key.message_seq < 0);
+        assert_eq!(normalized.quote_seq, Some(7));
+        assert!(normalized.text.is_empty());
+        assert_eq!(
+            normalized.notification.unwrap().event_type,
+            "message_recall"
+        );
+        assert!(super::normalize_event_value(124, &event, 2).is_err());
+        let mut bad = event.clone();
+        bad["data"]["peer_id"] = serde_json::json!("456");
+        assert!(super::normalize_event_value(123, &bad, 2).is_err());
+        let mut bad = event;
+        bad["data"]["message_seq"] = serde_json::json!(-1);
+        assert!(super::normalize_event_value(123, &bad, 2).is_err());
+    }
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

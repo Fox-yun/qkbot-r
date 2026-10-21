@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -95,7 +95,7 @@ function harness() {
     }
     result.plugins.ai.defaults = { ...result.plugins.ai.defaults, persona: "默认", paused: false, once: false, recent_messages: 24, input_budget: 6000, output_budget: 800 };
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
-    result.llm.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
+    result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
     result.app.database = "data/test.db"; return result;
   }
   const sample = config();
@@ -637,6 +637,85 @@ test("secret inputs infer keep/set, allow reversible explicit clear, and preserv
 });
 
 const modelsResponse = (models = ["model-b", "model-a"]) => ({ models, chat_completions_url: "https://models.example/v1/chat/completions", key_source: "temporary", environment_overrides_saved_key: false });
+const embeddingResponse = () => ({ dimensions: 1024, text_ok: true, image_ok: true, key_source: "temporary", environment_overrides_saved_key: false });
+async function prepareEmbedding(h) {
+  await h.login();
+  h.app.inputs.get("embedding.embeddings_url").control.value = "https://vectors.example/v1/embeddings";
+  h.app.inputs.get("embedding.model").control.value = "Qwen/Qwen3-VL-Embedding-8B";
+  h.app.inputs.get("embedding.dimensions").control.value = "1024";
+  h.app.inputs.get("embedding.request_timeout_secs").control.value = "15";
+  h.app.secretInputs.get("embedding_api_key").value.value = "temporary-vector-key";
+}
+
+test("embedding has independent controls and a synthetic-only preview that does not save", async () => {
+  const h = harness(); await prepareEmbedding(h);
+  h.app.secretInputs.get("llm_api_key").value.value = "unrelated-chat-key";
+  const before = h.calls.length;
+  h.setHandler(async () => ({ body: embeddingResponse() }));
+  await h.app.testEmbedding();
+  assert.equal(h.calls.length, before + 1);
+  const request = h.calls.at(-1);
+  assert.equal(request.path, "/api/embedding/test");
+  assert.equal(request.options.headers["X-CSRF-Token"], "csrf-test");
+  assert.deepEqual(request.body, {
+    revision: "r1", url: "https://vectors.example/v1/embeddings", model: "Qwen/Qwen3-VL-Embedding-8B",
+    dimensions: 1024, request_timeout_secs: 15, api_key: { action: "set", value: "temporary-vector-key" },
+  });
+  assert.doesNotMatch(JSON.stringify(request.body), /unrelated-chat-key|messages|conversation/u);
+  assert.match(h.ids.get("embedding-test-message").textContent, /1024.*配置尚未/u);
+  assert.equal(h.app.readForm().embedding.api_key, "");
+  h.app.inputs.get("stickers.enabled").control.checked = true;
+  h.app.inputs.get("stickers.auto_collect").control.checked = false;
+  h.app.inputs.get("stickers.send_cooldown_secs").control.value = "90";
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.readForm().stickers)), { enabled: true, auto_collect: false, send_cooldown_secs: 90 });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.secretChanges().embedding_api_key)), { action: "set", value: "temporary-vector-key" });
+  const draft = structuredClone(h.sample); draft.embedding.api_key = "must-not-go-in-json";
+  h.ids.get("config-json").value = JSON.stringify(draft);
+  assert.throws(() => h.app.adoptJson(), /embedding.api_key/u);
+});
+
+test("embedding preview suppresses duplicate requests and results from changed drafts", async () => {
+  for (const change of [
+    async (h) => { const field = h.app.inputs.get("embedding.dimensions").control; field.value = "512"; await field.emit("input"); },
+    async (h) => { const field = h.app.secretInputs.get("embedding_api_key").value; field.value = "replacement"; await field.emit("input"); },
+    async (h) => { h.app.clearSession(); },
+  ]) {
+    const h = harness(); await prepareEmbedding(h);
+    let resolve;
+    h.setHandler(() => new Promise((done) => { resolve = done; }));
+    const before = h.calls.length, pending = h.app.testEmbedding();
+    await h.app.testEmbedding();
+    assert.equal(h.calls.length, before + 1);
+    assert.equal(h.ids.get("embedding-test").disabled, true);
+    await change(h);
+    resolve({ body: embeddingResponse() }); await pending;
+    assert.equal(h.app.state.embedding.message, "");
+    assert.equal(h.app.state.embedding.loading, false);
+  }
+});
+
+test("embedding key actions and invalid provider capabilities remain visible without saving", async () => {
+  const h = harness(); await prepareEmbedding(h);
+  const key = h.app.secretInputs.get("embedding_api_key");
+  key.value.value = "";
+  h.setHandler(async () => ({ status: 400, body: { code: "embedding_test_key_required", error: "新地址需要新密钥。" } }));
+  await h.app.testEmbedding();
+  assert.deepEqual(h.calls.at(-1).body.api_key, { action: "keep" });
+  assert.match(h.ids.get("embedding-test-message").textContent, /新密钥/u);
+  await key.clearButton.emit("click");
+  await h.app.testEmbedding();
+  assert.deepEqual(h.calls.at(-1).body.api_key, { action: "clear" });
+  key.value.value = "new-key"; await key.value.emit("input");
+  h.setHandler(async () => ({ body: { ...embeddingResponse(), dimensions: 512 } }));
+  await h.app.testEmbedding();
+  assert.equal(h.app.state.embedding.kind, "error");
+  assert.match(h.ids.get("embedding-test-message").textContent, /维度/u);
+  assert.equal(h.app.inputs.get("embedding.dimensions").control.value, "1024");
+  const calls = h.calls.length;
+  h.app.inputs.get("embedding.dimensions").control.value = "63";
+  await h.app.testEmbedding();
+  assert.equal(h.calls.length, calls);
+});
 async function prepareModels(h) {
   await h.login(); h.app.inputs.get("llm.chat_completions_url").control.value = "https://models.example/v1";
   h.app.inputs.get("llm.model").control.value = "previous-model";
@@ -859,6 +938,17 @@ test("final reply tools display their own effect and retain global and conversat
   const enabled = h.app.inputs.get("plugins.ai.enabled").control; enabled.checked = false; await enabled.emit("input");
   assert.match(globalTools(h).textContent, /所属插件已关闭/u);
   assert.equal(toolCheckbox(globalTools(h), "reply_message").checked, true);
+});
+
+test("asynchronous sticker search remains read-only and keeps explicit tool selection", async () => {
+  const h = harness(); await h.login(); const saved = h.snapshot();
+  saved.tool_catalog.push({ name: "search_stickers", description: "搜索当前群的表情", plugin_id: "ai", effect: "async_read" });
+  h.setHandler(async () => ({ body: saved })); await h.app.loadConfig();
+  assert.match(globalTools(h).textContent, /异步只读 · ai/u);
+  const search = toolCheckbox(globalTools(h), "search_stickers");
+  assert.equal(search.checked, false); assert.equal(search.disabled, false);
+  search.checked = true; await search.emit("change");
+  assert.deepEqual([...h.app.readForm().plugins.ai.defaults.allowed_tools], ["search_stickers"]);
 });
 
 function pluginSnapshot(h) {

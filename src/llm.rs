@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::milky::read_bounded;
 
-pub(crate) const MAX_INPUT_IMAGES: usize = 4;
+pub(crate) const MAX_INPUT_IMAGES: usize = 5;
 pub(crate) const MAX_IMAGE_URL_BYTES: usize = 1_400_000;
 
 type SourceValidation<'a> =
@@ -823,7 +823,11 @@ mod tests {
         assert!(validate_messages(&[json!({"role":"user","content":five})]).is_err());
         let two = vec![image_part(); 2];
         let first = json!({"role":"user","content":two});
-        let mut messages = vec![first.clone(), first];
+        let mut messages = vec![
+            first.clone(),
+            first,
+            json!({"role":"user","content":[image_part()]}),
+        ];
         assert_eq!(validate_messages(&messages).unwrap(), MAX_INPUT_IMAGES);
         messages.push(json!({"role":"user","content":[image_part()]}));
         assert!(validate_messages(&messages).is_err());

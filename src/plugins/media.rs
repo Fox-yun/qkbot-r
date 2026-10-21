@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -58,12 +58,43 @@ async fn sticker_reply(host: &Host, message: &Incoming) -> Result<OutgoingMessag
         return Ok(OutgoingMessage::text("未在回复内容中检测到表情或图片。"));
     };
     let uri = host.milky.get_resource_temp_url(&key, &resource).await?;
+    let library_note = if host.embedding.is_some() && host.stickers.enabled(&key.scope).await? {
+        let source_key = key.key();
+        let physical = key.scope.key();
+        let source = host
+            .store
+            .call(move |db| {
+                Ok(db.query_row(
+            "SELECT sender_id,received_at FROM messages WHERE key=?1 AND scope=?2 AND revoked=0",
+            params![source_key,physical], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))
+        ).optional()?)
+            })
+            .await?;
+        if let Some((sender_id, received_at)) = source {
+            let mut source = message.clone();
+            source.key = key.clone();
+            source.sender_id = sender_id;
+            source.received_at = received_at;
+            source.raw_message = raw;
+            source.quote_seq = None;
+            source.text.clear();
+            source.mentions.clear();
+            match host.stickers.save(host, &source).await {
+                Ok(count) if count > 0 => "已排队加入本群表情库。\n",
+                _ => "未加入表情库：来源不可用、已在队列中或队列已满。\n",
+            }
+        } else {
+            "未加入表情库：原消息已不在保留范围内。\n"
+        }
+    } else {
+        ""
+    };
     // The upstream short-link service is not required; expose the verified QQ
     // temporary URL directly instead of sending chat resources to a third party.
     Ok(OutgoingMessage {
         segments: vec![
             OutgoingSegment::Text {
-                text: "表情：".into(),
+                text: format!("{library_note}表情："),
             },
             OutgoingSegment::Image {
                 uri: uri.clone(),

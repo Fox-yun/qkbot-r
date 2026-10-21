@@ -677,7 +677,7 @@ fn fts_query(text: &str) -> String {
         .join(" OR ")
 }
 
-fn retrieve(
+pub(crate) fn retrieve(
     db: &Connection,
     guard: &ContextGuard,
     subject_id: i64,

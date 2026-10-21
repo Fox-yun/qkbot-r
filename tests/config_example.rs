@@ -28,7 +28,7 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     assert!(config.plugins.ai.defaults.reply_to_bot);
     assert_eq!(
         config.plugins.ai.defaults.allowed_tools,
-        ["clock_now", "reply_message"]
+        ["clock_now", "reply_message", "search_stickers"]
     );
 }
 

@@ -14,11 +14,13 @@
     groupPersona: { saving: false, message: "", kind: "" },
     scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
+    embedding: { version: 0, loading: false, message: "", kind: "" },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
   const inputs = new Map();
   const secretInputs = new Map();
   let pluginControls = null;
+  let embeddingControls = null;
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const get = (object, path) => path.split(".").reduce((value, key) => value?.[key], object);
   const put = (object, path, value) => {
@@ -51,6 +53,19 @@
       field("llm.request_timeout_secs", "单次请求超时（秒）", "number", "", { min: 1 }),
       field("llm.tool_calling", "启用原生工具调用", "check", "模型需支持工具调用；工具仍由宿主检查权限和执行结果。"),
       field("llm.vision", "启用图片识别", "check", "识别当前触发消息及其引用中的图片，合计最多 4 张；模型需支持视觉输入。关闭后按文字处理。"),
+    ] },
+    { title: "向量接口（Embedding）", description: "独立于聊天模型，用于文字记忆检索和表情图片检索。测试使用两条合成输入，不读取聊天历史。", embedding: true, fields: [
+      field("embedding.enabled", "启用向量服务", "check", "保存并应用后启用。关闭时继续使用原有文字记忆检索。", { full: true }),
+      field("embedding.embeddings_url", "向量 API 地址", "text", "填写完整 embeddings 接口地址；更换地址时需填写该服务的密钥。", { full: true, placeholder: "https://api.siliconflow.cn/v1/embeddings" }),
+      { secret: "embedding_api_key", label: "向量 API 密钥" },
+      field("embedding.model", "向量模型", "text", "文字和图片需使用同一个支持多模态向量的模型。", { placeholder: "Qwen/Qwen3-VL-Embedding-8B" }),
+      field("embedding.dimensions", "向量维度", "number", "建议 1024；模型需支持所选维度。更改后会重新建立对应索引。", { min: 64, max: 4096 }),
+      field("embedding.request_timeout_secs", "向量请求超时（秒）", "number", "包括排队时间；请求串行处理。连接测试每次最多等待 12 秒。", { min: 1, max: 30 }),
+    ] },
+    { title: "表情回复", description: "由模型按需选择当前群内的表情图片，需同时启用聊天和向量服务。", fields: [
+      field("stickers.enabled", "启用表情库", "check", "控制自动收集和表情回复，仍受群内 Bot 开关和权限限制。"),
+      field("stickers.auto_collect", "自动保存群内表情图片", "check", "从允许的群消息中收集表情，供该群后续回复使用。"),
+      field("stickers.send_cooldown_secs", "表情回复间隔（秒）", "number", "限制同一群内表情回复的频率。", { min: 1, max: 86400 }),
     ] },
     { title: "Milky 消息接口", description: "负责收发 QQ 消息。LLBot 常用端口 3010，请以实际配置为准。", fields: [
       field("milky.url", "Milky 地址", "text", "例如 http://127.0.0.1:3010，不填写 /api 后缀。", { placeholder: "http://127.0.0.1:3010" }),
@@ -215,7 +230,7 @@
       status.textContent = describeSecret(definition.secret) + (controls.clear ? " 已标记清除文件中的密钥，保存后生效。" : " 留空保持原密钥，输入后随配置保存。");
     };
     wrapper.append(input, clearButton, status); secretInputs.set(definition.secret, controls); refresh();
-    const changed = () => { if (definition.secret === "llm_api_key") invalidateModels(); refresh(); markDirty(); };
+    const changed = () => { if (definition.secret === "llm_api_key") invalidateModels(); if (definition.secret === "embedding_api_key") invalidateEmbeddingTest(); refresh(); markDirty(); };
     clearButton.addEventListener("click", () => {
       if (controls.clear) { controls.clear = false; input.value = controls.undoValue; controls.undoValue = ""; }
       else { controls.clear = true; controls.undoValue = input.value; input.value = ""; }
@@ -291,12 +306,63 @@
     }
   }
 
+  function invalidateEmbeddingTest() {
+    state.embedding.version++; state.embedding.message = ""; state.embedding.kind = "";
+    renderEmbeddingTest();
+  }
+  function renderEmbeddingTest() {
+    if (!embeddingControls) return;
+    embeddingControls.button.textContent = state.embedding.loading ? "正在测试…" : "测试文字和图片向量";
+    embeddingControls.message.textContent = state.embedding.message || (state.embedding.loading ? "正在发送合成文字和图片，请稍候…" : "点击会发出两次向量请求，可能产生少量费用；测试成功后仍需保存并应用配置。");
+    embeddingControls.message.className = "hint" + (state.embedding.kind === "error" ? " error-text" : "");
+    updateControls();
+  }
+  function embeddingDraft() {
+    const url = inputs.get("embedding.embeddings_url").control.value.trim();
+    const model = inputs.get("embedding.model").control.value.trim();
+    const number = (path, min, max) => {
+      const control = inputs.get(path).control, value = Number(control.value);
+      if (!control.value.trim() || !Number.isSafeInteger(value) || value < min || value > max || !control.validity.valid) throw new Error("请填写有效的向量维度和超时。");
+      return value;
+    };
+    if (!url || !model) throw new Error("请先填写向量 API 地址和模型名称。");
+    return { url, model, dimensions: number("embedding.dimensions", 64, 4096), request_timeout_secs: number("embedding.request_timeout_secs", 1, 30), api_key: secretChange(secretInputs.get("embedding_api_key")) };
+  }
+  function embeddingCurrent(request) {
+    try {
+      return state.authenticated && state.session === request.session && state.embedding.version === request.version && state.revision === request.revision
+        && !state.jsonDirty && canonical(embeddingDraft()) === request.draft;
+    } catch { return false; }
+  }
+  async function testEmbedding() {
+    if (!state.authenticated || !state.config || state.embedding.loading || state.busy || state.jsonDirty || state.pendingOperation || state.stale) return;
+    let request;
+    try {
+      const draft = embeddingDraft();
+      request = { session: state.session, version: state.embedding.version, revision: state.revision, draft: canonical(draft) };
+      state.embedding.loading = true; state.embedding.message = ""; state.embedding.kind = ""; renderEmbeddingTest();
+      const result = await api("/api/embedding/test", "POST", { revision: request.revision, ...draft });
+      if (!embeddingCurrent(request)) return;
+      if (result.text_ok !== true || result.image_ok !== true || result.dimensions !== draft.dimensions) throw new Error("向量测试返回的维度或能力结果无效。");
+      const source = { temporary: "本次使用新填写的密钥。", environment: "本次使用环境变量中的密钥。", file: "本次使用已保存密钥。", none: "" }[result.key_source] || "";
+      state.embedding.message = `测试通过：文字和图片均返回有效的 ${result.dimensions} 维向量。${source}配置尚未由此次测试保存。`
+        + (result.environment_overrides_saved_key ? " 保存后，环境变量仍优先于文件密钥。" : "");
+    } catch (error) {
+      if (request && !embeddingCurrent(request)) return;
+      if (error.status === -1 || error.code === "auth_required") return;
+      state.embedding.message = error.message || "向量连接测试未通过。"; state.embedding.kind = "error";
+      if (error.code === "csrf_invalid") report(error);
+    } finally {
+      state.embedding.loading = false; renderEmbeddingTest();
+    }
+  }
+
   function validatePersonaMap(value, requireText = true) {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.entries(value).some(([name, text]) => !name.trim() || typeof text !== "string" || (requireText && !text.trim()))) throw new Error("自定义人设需要有效名称和非空正文。");
   }
 
   function validateToolCatalog(value) {
-    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "local_write", "reply"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
+    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "async_read", "local_write", "reply"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
   }
   function toolUnavailable(tool, mode) {
     if (!tool) return "未注册的旧工具，可取消选择";
@@ -333,7 +399,7 @@
       checkbox.setAttribute("aria-label", name + (unavailable ? "，" + unavailable : ""));
       const copy = element("span", "tool-copy"); copy.append(element("strong", "tool-name", name));
       if (tool) {
-        const effectLabel = { read: "只读", local_write: "本地写入", reply: "本轮回复" }[tool.effect];
+        const effectLabel = { read: "只读", async_read: "异步只读", local_write: "本地写入", reply: "本轮回复" }[tool.effect];
         copy.append(element("span", "tool-meta", `${effectLabel} · ${tool.plugin_id}`));
         copy.append(element("span", "tool-description", tool.description));
       }
@@ -463,6 +529,7 @@
     control.addEventListener("input", () => {
       if (definition.path === "llm.chat_completions_url") invalidateModels();
       if (definition.path === "llm.model") renderModels();
+      if (definition.path.startsWith("embedding.")) invalidateEmbeddingTest();
       if (definition.path.startsWith("plugins.") && definition.path.endsWith(".enabled")) refreshToolPickers();
       markDirty();
     });
@@ -583,6 +650,7 @@
   function renderFields(pending = {}) {
     const personaManager = $("persona-manager"), modelPicker = $("model-picker");
     state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
+    state.embedding.version++; state.embedding.message = ""; state.embedding.kind = ""; embeddingControls = null;
     inputs.clear(); secretInputs.clear();
     $("config-groups").replaceChildren();
     groups.forEach((group, index) => {
@@ -595,12 +663,19 @@
         grid.append(definition.secret ? secretField(definition, pending[definition.secret]) : configField(definition));
         if (group.models && definition.path === "llm.model") grid.append(modelPicker);
       }
-      card.append(heading, grid); if (group.personas) card.append(personaManager); $("config-groups").append(card);
+      card.append(heading, grid);
+      if (group.embedding) {
+        const row = element("div", "field full"), button = element("button", "secondary", "测试文字和图片向量"), message = element("p", "hint");
+        button.type = "button"; button.id = "embedding-test"; message.id = "embedding-test-message";
+        button.addEventListener("click", () => { void testEmbedding(); });
+        row.append(button, message); card.append(row); embeddingControls = { button, message };
+      }
+      if (group.personas) card.append(personaManager); $("config-groups").append(card);
     });
     renderPluginConfig(pending);
     const web = state.config.web || {};
     $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
-    renderPersonaLibrary(); renderModels(); refreshToolPickers(); updateControls();
+    renderPersonaLibrary(); renderModels(); renderEmbeddingTest(); refreshToolPickers(); updateControls();
   }
 
   function readForm() {
@@ -639,7 +714,7 @@
   function validateImmutable(config) {
     if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("配置必须是 JSON 对象。");
     if (canonical(config.web) !== canonical(state.config.web)) throw new Error("web 分组不能在线修改，请恢复此分组，或通过本机配置文件修改后重启管理服务。");
-    for (const path of ["llm.api_key", "milky.access_token", "qq_login.token", "nonebot.token"]) {
+    for (const path of ["llm.api_key", "embedding.api_key", "milky.access_token", "qq_login.token", "nonebot.token"]) {
       const value = get(config, path);
       if (value != null && value !== "") throw new Error(`请勿在 JSON 的 ${path} 中填入密钥；使用对应的密钥控件设置。`);
     }
@@ -742,6 +817,7 @@
     const modelsBlocked = unavailable || state.jsonDirty || pending || state.stale;
     $("fetch-models").disabled = modelsBlocked || state.models.loading;
     $("model-list").disabled = modelsBlocked; $("manual-model").disabled = modelsBlocked;
+    if (embeddingControls) embeddingControls.button.disabled = modelsBlocked || state.embedding.loading;
     for (const id of ["connect-runtime", "apply-runtime", "stop-runtime"]) $(id).disabled = unavailable || pending || ["starting", "stopping"].includes(state.status?.phase);
     $("stop-runtime").disabled ||= state.status?.phase === "stopped";
     $("get-qr").disabled = unavailable || !canPollQq() || Boolean(state.qq?.online);
@@ -1218,7 +1294,7 @@
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
-    invalidateModels();
+    invalidateModels(); invalidateEmbeddingTest();
     clearMemorySelection(); state.memory.list = []; $("conversation-list").replaceChildren(); $("budget-usage").replaceChildren();
     document.querySelectorAll("dialog").forEach((dialog) => { if (dialog.open) dialog.close(); });
     document.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
@@ -1677,7 +1753,7 @@
   $("save-apply").addEventListener("click", () => { void runAction(() => saveConfig(true)); });
   $("get-qr").addEventListener("click", () => { void runAction(getQr); });
   $("advanced").addEventListener("toggle", () => { if ($("advanced").open && !state.jsonDirty && state.config) syncJson(); });
-  $("config-json").addEventListener("input", () => { state.jsonDirty = true; state.dirty = true; invalidateModels(); $("json-state").textContent = "JSON 有未采用修改，分组表单已暂时锁定。"; updateControls(); });
+  $("config-json").addEventListener("input", () => { state.jsonDirty = true; state.dirty = true; invalidateModels(); invalidateEmbeddingTest(); $("json-state").textContent = "JSON 有未采用修改，分组表单已暂时锁定。"; updateControls(); });
   $("adopt-json").addEventListener("click", () => { try { adoptJson(); notice("JSON 已采用到分组表单，尚未保存。"); } catch (error) { report(error); } });
   $("discard-json").addEventListener("click", () => {
     if (state.jsonDirty && !window.confirm("放弃完整 JSON 中尚未采用的编辑？")) return;

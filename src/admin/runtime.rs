@@ -411,6 +411,28 @@ impl Runtime {
                 }
             })
         };
+        let embeddings = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = host.cancel.cancelled() => break,
+                        _ = tick.tick() => {
+                            if host.embedding.is_some() {
+                                if host.stickers.tick(&host, &host.cancel).await.is_err() {
+                                    tracing::debug!("sticker indexing deferred");
+                                }
+                                if crate::plugins::ai::semantic::index_next(&host, &host.cancel).await.is_err() {
+                                    tracing::debug!("memory semantic indexing deferred");
+                                }
+                            }
+                        },
+                    }
+                }
+            })
+        };
         let reminders = {
             let router = router.clone();
             tokio::spawn(async move {
@@ -442,8 +464,13 @@ impl Runtime {
         let event_result = events.await;
         let maintenance_result = maintenance.await;
         let reminder_result = reminders.await;
+        let embedding_result = embeddings.await;
         router.shutdown().await?;
-        if event_result.is_err() || maintenance_result.is_err() || reminder_result.is_err() {
+        if event_result.is_err()
+            || maintenance_result.is_err()
+            || reminder_result.is_err()
+            || embedding_result.is_err()
+        {
             bail!("机器人后台任务异常结束");
         }
         Ok(())

@@ -94,6 +94,7 @@ impl Images {
 pub(crate) enum Origin {
     Current,
     Quote,
+    StickerSheet,
 }
 
 impl Origin {
@@ -101,16 +102,18 @@ impl Origin {
         match self {
             Self::Current => 0,
             Self::Quote => 1,
+            Self::StickerSheet => unreachable!("sticker sheets are not incoming images"),
         }
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LoadedImage {
     pub url: String,
     pub origin: Origin,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Loaded {
     pub images: Vec<LoadedImage>,
     pub note: String,
@@ -366,7 +369,7 @@ fn validated_download_addresses(
     Ok(selected)
 }
 
-async fn download(value: &str) -> Result<Vec<u8>> {
+pub(super) async fn download(value: &str) -> Result<Vec<u8>> {
     let url = image_url(value)?;
     let name = url.host_str().context("图片缺少下载地址")?.to_owned();
     let _slot = DOWNLOADS.acquire().await?;
@@ -386,7 +389,7 @@ async fn download(value: &str) -> Result<Vec<u8>> {
     crate::milky::read_bounded(response, MAX_SOURCE_BYTES).await
 }
 
-async fn decode(bytes: Vec<u8>, cancel: &CancellationToken) -> Result<String> {
+pub(super) async fn decode(bytes: Vec<u8>, cancel: &CancellationToken) -> Result<String> {
     blocking(DECODERS.clone(), cancel, move || encode_image(bytes)).await
 }
 

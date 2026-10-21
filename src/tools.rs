@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
+    /// Network-backed bounded reads, handled outside the SQLite gateway.
+    AsyncRead,
     LocalWrite,
     /// Ends the current AI turn; handled by chat, never by the transaction gateway.
     Reply,
@@ -91,21 +93,24 @@ impl Tool for ReplyTool {
             name: "reply_message",
             plugin: "ai",
             version: 1,
-            description: "提交本轮唯一的最终回复并结束本轮，可引用消息及 @ 最多三人。reply_to 和 mention_users 只接受本轮宿主提供的消息/用户引用，不接受任意消息序号或用户 ID；无引用或 @ 需求时省略对应参数。调用后不要再输出另一份回答。",
+            description: "结束本轮，提交唯一回复。引用和表情仅接受宿主本轮标识。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "reply_to": {
                         "type": ["string", "null"],
-                        "description": "本轮宿主提供的消息引用；省略或 null 表示不引用。"
+                        "description": "message_ref"
                     },
                     "mention_users": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
-                        "maxItems": 3,
-                        "description": "本轮宿主提供的用户引用，最多三人。"
+                        "maxItems": 3
                     },
-                    "text": {"type": "string", "minLength": 1, "description": "最终回复的非空正文。"}
+                    "sticker_ref": {
+                        "type": ["string", "null"],
+                        "description": "可选一张表情，须为本轮search_stickers中已看到预览的候选。"
+                    },
+                    "text": {"type": "string", "minLength": 1}
                 },
                 "required": ["text"],
                 "additionalProperties": false
@@ -143,14 +148,69 @@ impl Tool for ReplyTool {
     }
 }
 
+/// A model-visible contract only. Chat performs the asynchronous search and
+/// binds its candidate references to the current turn.
+struct SearchStickersTool;
+
+impl Tool for SearchStickersTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "search_stickers",
+            plugin: "ai",
+            version: 1,
+            description: "按回复意图搜索本群表情。看预览后可选一张交给reply_message并结束本轮，也可只回文字。",
+            parameters: json!({
+                "type":"object",
+                "properties":{"query":{"type":"string","minLength":1,"maxLength":256}},
+                "required":["query"],
+                "additionalProperties":false,
+            }),
+            effect: Effect::AsyncRead,
+            max_output_bytes: 4096,
+        }
+    }
+
+    fn permits(&self, scope: &Scope, _actor: i64) -> bool {
+        scope.scene == crate::types::Scene::Group
+    }
+
+    fn prepare(
+        &self,
+        _args: Value,
+        _scope: &Scope,
+        _actor: i64,
+        _received_at: i64,
+        _timezone: Tz,
+    ) -> Result<Value> {
+        bail!("asynchronous reads must be handled by the chat dispatcher")
+    }
+
+    fn preview(&self, _args: &Value, _timezone: Tz) -> Result<String> {
+        bail!("asynchronous reads cannot request transaction confirmation")
+    }
+
+    fn apply(
+        &self,
+        _tx: &Transaction<'_>,
+        _args: &Value,
+        _scope: &Scope,
+        _actor: i64,
+        _operation_id: &str,
+        _now: i64,
+    ) -> Result<ToolResult> {
+        bail!("asynchronous reads cannot execute inside a tool transaction")
+    }
+}
+
 pub fn register_reply(registry: &mut ToolRegistry) -> Result<()> {
-    registry.register(Arc::new(ReplyTool))
+    registry.register(Arc::new(ReplyTool))?;
+    registry.register(Arc::new(SearchStickersTool))
 }
 
 fn require_transaction_tool(spec: &ToolSpec) -> Result<()> {
     ensure!(
-        spec.effect != Effect::Reply,
-        "final replies must be handled by the chat dispatcher"
+        matches!(spec.effect, Effect::Read | Effect::LocalWrite),
+        "asynchronous reads and final replies must be handled by the chat dispatcher"
     );
     Ok(())
 }
@@ -813,6 +873,10 @@ mod tests {
             reply["function"]["parameters"]["properties"]["mention_users"]["maxItems"],
             3
         );
+        assert_eq!(
+            reply["function"]["parameters"]["properties"]["sticker_ref"]["type"],
+            json!(["string", "null"])
+        );
         let args = json!({"reply_to":null,"mention_users":[],"text":"reply"});
         let error = gateway
             .execute(&ctx, "reply_message", args.clone())
@@ -882,6 +946,89 @@ mod tests {
         );
         ctx.cancel.cancel();
         assert!(gateway.definitions(&ctx).await.unwrap().is_empty());
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn asynchronous_sticker_search_is_advertised_but_rejected_by_every_transaction_entry() {
+        let (store, gateway, ctx) = setup().await;
+        let definitions = gateway.definitions(&ctx).await.unwrap();
+        let search = definitions
+            .iter()
+            .find(|d| d["function"]["name"] == "search_stickers")
+            .unwrap();
+        assert_eq!(
+            search["function"]["parameters"]["properties"]["query"]["maxLength"],
+            256
+        );
+        assert_eq!(
+            search["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(SearchStickersTool.spec().effect, Effect::AsyncRead);
+        let args = json!({"query":"开心庆祝"});
+        assert!(
+            gateway
+                .execute(&ctx, "search_stickers", args.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("chat dispatcher")
+        );
+        assert!(
+            gateway
+                .direct(
+                    ctx.scope.clone(),
+                    ctx.actor_id,
+                    "search_stickers",
+                    args.clone(),
+                    now()
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("chat dispatcher")
+        );
+        let bound = BoundContext {
+            scope: ctx.scope.clone(),
+            actor_id: ctx.actor_id,
+            guard: Some(ctx.guard.clone()),
+            ai_epoch: Some(ctx.ai_epoch),
+            provider_epoch: ctx.provider_epochs["ai"],
+            access_revision: ctx.access_revision,
+        };
+        assert!(
+            gateway
+                .run(
+                    Arc::new(SearchStickersTool),
+                    args,
+                    bound.clone(),
+                    "async-must-not-exist".into(),
+                    true,
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("chat dispatcher")
+        );
+        let context = serde_json::to_string(&bound).unwrap();
+        store.call(move |db| {
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM tool_runs",[],|r|r.get::<_,i64>(0))?,0);
+            db.execute("INSERT INTO tool_runs(operation_id,tool_name,tool_version,plugin_id,context_json,args_json,scope_key,actor_id,args_hash,schema_hash,status,token,expires_at,result_json,receipt,created_at) VALUES('legacy-async','search_stickers',1,'ai',?1,'{}',?2,?3,'unused','unused','succeeded','async-token',?4,'{}','unused',?5)",params![context,bound.scope.key(),bound.actor_id,now()+300,now()])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            gateway
+                .confirm(&ctx.scope, ctx.actor_id, "async-token")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("chat dispatcher")
+        );
+        let mut private = ctx.scope.clone();
+        private.scene = Scene::Friend;
+        assert!(!SearchStickersTool.permits(&private, ctx.actor_id));
         store.stop().await.unwrap();
     }
 

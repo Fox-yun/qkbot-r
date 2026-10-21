@@ -482,28 +482,30 @@ impl Chat {
             None
         };
         let memories = if settings.memory_read {
-            host.memory
-                .retrieve(
-                    &job.guard,
-                    job.actor,
-                    &current,
-                    host.config.plugins.ai.memory_recall_limit,
-                    host.config.plugins.ai.memory_recall_budget,
+            super::semantic::retrieve(
+                host,
+                &job.guard,
+                job.actor,
+                &job.key.key(),
+                &current,
+                host.config.plugins.ai.memory_recall_limit,
+                host.config.plugins.ai.memory_recall_budget,
+                cancel,
+            )
+            .await?
+            .into_iter()
+            .map(|m| {
+                let origin = match m.origin.as_str() {
+                    "manual" => "管理员补充（不代表本人自述）",
+                    "auto" => "原始消息提取",
+                    _ => "历史记录",
+                };
+                format!(
+                    "关于用户 {} / {:?} / 来源：{}：{}",
+                    m.subject_id, m.kind, origin, m.text
                 )
-                .await?
-                .into_iter()
-                .map(|m| {
-                    let origin = match m.origin.as_str() {
-                        "manual" => "管理员补充（不代表本人自述）",
-                        "auto" => "原始消息提取",
-                        _ => "历史记录",
-                    };
-                    format!(
-                        "关于用户 {} / {:?} / 来源：{}：{}",
-                        m.subject_id, m.kind, origin, m.text
-                    )
-                })
-                .collect()
+            })
+            .collect()
         } else {
             vec![]
         };
@@ -530,10 +532,22 @@ impl Chat {
                 .as_str()
                 .is_some_and(|n| settings.allowed_tools.iter().any(|x| x == n))
         });
+        let stickers_enabled = host.embedding.is_some()
+            && host.config.llm.vision
+            && job.key.scope.scene == crate::types::Scene::Group
+            && host.stickers.enabled(&job.key.scope).await?;
+        if !stickers_enabled {
+            definitions.retain(|d| d["function"]["name"] != "search_stickers");
+        }
+        let mut sticker_turn = super::sticker_reply::StickerTurn::default();
+        let mut sticker_searched = false;
+        let mut sticker_unavailable = false;
         // Fetch only after trigger, queue admission and conversation checks.
         // Keep pixels ephemeral and reuse them for this turn's tool rounds.
         let visual_generation = if host.config.llm.vision
-            && (!job.images.is_empty() || quote.as_ref().is_some_and(|q| q.sender.is_some()))
+            && (stickers_enabled
+                || !job.images.is_empty()
+                || quote.as_ref().is_some_and(|q| q.sender.is_some()))
         {
             Some(host.milky.scope_generation(&job.key.scope)?)
         } else {
@@ -597,6 +611,9 @@ impl Chat {
                 "任务已取消"
             );
             let mut current = current.clone();
+            if sticker_unavailable {
+                current.push_str("\n[表情候选已失效，请直接文字回复。]");
+            }
             let mut visible_quote = None;
             if let Some(quote) = &quote {
                 let content = quote.content(host).await?;
@@ -623,16 +640,31 @@ impl Chat {
                     current.push_str(&format!("\n{content}"));
                 }
             }
-            let tools = if round < host.config.limits.max_tool_calls && round + 1 < effective_rounds
-            {
-                definitions.clone()
-            } else {
-                definitions
-                    .iter()
-                    .filter(|definition| definition["function"]["name"] == "reply_message")
-                    .cloned()
-                    .collect()
-            };
+            let mut tools =
+                if round < host.config.limits.max_tool_calls && round + 1 < effective_rounds {
+                    definitions.clone()
+                } else {
+                    definitions
+                        .iter()
+                        .filter(|definition| definition["function"]["name"] == "reply_message")
+                        .cloned()
+                        .collect()
+                };
+            if sticker_searched {
+                // Search is the last preparatory step: reserve the next request
+                // for seeing candidates and submitting one final response.
+                tools.retain(|definition| definition["function"]["name"] == "reply_message");
+            }
+            let mut turn_visual = visual.clone();
+            if let Some(sheet) = sticker_turn.image() {
+                if sticker_turn.check(host, &job.key.scope).await.is_ok() {
+                    turn_visual.images.insert(0, sheet);
+                } else {
+                    sticker_turn.clear();
+                    sticker_unavailable = true;
+                    current.push_str("\n[表情候选已失效，请直接文字回复。]");
+                }
+            }
             let input = build_visual_context(
                 ContextInput {
                     system: system.clone(),
@@ -644,9 +676,10 @@ impl Chat {
                     tool_protocol: protocol.clone(),
                 },
                 settings.input_budget,
-                &visual,
+                &turn_visual,
             )?;
             references.observe(&input.messages, visible_quote);
+            sticker_turn.observe(&input.messages);
             tracing::debug!(
                 estimated_input_tokens = input.estimated_tokens,
                 "built bounded model context"
@@ -676,9 +709,15 @@ impl Chat {
                     cancel,
                     admission,
                     (&host.milky, generation),
-                    check_visual_source(host, job, quoted_visual_key),
+                    async {
+                        check_visual_source(host, job, quoted_visual_key).await?;
+                        sticker_turn
+                            .check(host, &job.key.scope)
+                            .await
+                            .map_err(|_| super::sticker_reply::StalePreview.into())
+                    },
                 )
-                .await?
+                .await
             } else {
                 llm.complete_admitted(
                     input.messages,
@@ -687,7 +726,20 @@ impl Chat {
                     cancel,
                     admission,
                 )
-                .await?
+                .await
+            };
+            let response = match response {
+                Err(error)
+                    if error.is::<super::sticker_reply::StalePreview>()
+                        && round + 1 < effective_rounds =>
+                {
+                    // No HTTP request was submitted: the source check runs after
+                    // acquiring the model slot and before sending any pixels.
+                    sticker_turn.clear();
+                    sticker_unavailable = true;
+                    continue;
+                }
+                result => result?,
             };
             host.usage("chat", &response).await?;
             if has_visual_source {
@@ -752,6 +804,27 @@ impl Chat {
                     round < host.config.limits.max_tool_calls && round + 1 < effective_rounds,
                     "工具次数已达上限"
                 );
+                if name == "search_stickers" {
+                    sticker_searched = true;
+                    let query = super::sticker_reply::query(args)?;
+                    let candidates = host
+                        .stickers
+                        .search(
+                            host,
+                            &job.key.scope,
+                            &job.guard,
+                            &job.key.key(),
+                            &query,
+                            cancel,
+                        )
+                        .await?;
+                    let result = sticker_turn.replace(candidates).await?;
+                    return Ok(Some(ToolOutcome::Completed {
+                        operation_id: call_id.clone(),
+                        result,
+                        receipt: "已检索本群可用表情".into(),
+                    }));
+                }
                 match tokio::time::timeout(
                     Duration::from_secs(host.config.limits.tool_timeout_secs),
                     host.gateway.execute(&ctx, name, args),
@@ -768,16 +841,22 @@ impl Chat {
             .await;
             let content = match execution {
                 Ok(None) => {
-                    let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap())?;
+                    let mut args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap())?;
                     let references = references.clone();
                     let guard = job.guard.clone();
                     let scope = job.key.scope.clone();
                     let access_revision = ctx.access_revision;
                     let max_bytes = host.config.limits.max_message_bytes;
-                    let prepared = host.store.call(move |db| {
-                        crate::access::check_revision(db, &scope.key(), access_revision)?;
-                        references.resolve(db, &guard, args, max_bytes)
-                    }).await;
+                    let prepared = async {
+                        let sticker = sticker_turn.prepare(host, &scope, &mut args).await?;
+                        host.store.call(move |db| {
+                            crate::access::check_revision(db, &scope.key(), access_revision)?;
+                            let reply = references.resolve(db, &guard, args, max_bytes)?;
+                            if let Some((candidate,uri)) = sticker {
+                                reply.with_sticker(db, &scope, &guard, candidate, uri, max_bytes)
+                            } else { Ok(reply) }
+                        }).await
+                    }.await;
                     match prepared {
                         Ok(reply) => return Ok(Reply { plugin: "ai", message: reply.message,
                             authorization: Some(reply.authorization) }),
@@ -785,6 +864,7 @@ impl Chat {
                     }
                 }
                 Ok(Some(ToolOutcome::Pending { preview, .. })) => return Ok(Reply::text("host", preview)),
+                Ok(Some(ToolOutcome::Completed { result, .. })) if call["function"]["name"] == "search_stickers" => result.to_string(),
                 Ok(Some(ToolOutcome::Completed { operation_id, result, receipt })) =>
                     json!({"operation_id":operation_id,"status":"succeeded","result":result,"receipt":receipt}).to_string(),
                 Err(error) => json!({"status":"failed","error":error.to_string()}).to_string(),
@@ -1522,6 +1602,7 @@ fn build_visual_context(
                 let source = match image.origin {
                     vision::Origin::Current => "当前消息",
                     vision::Origin::Quote => "引用消息（作者见引用文字）",
+                    vision::Origin::StickerSheet => "表情候选预览（从左到右对应position）",
                 };
                 candidate
                     .current

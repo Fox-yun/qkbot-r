@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod budget;
 pub mod catalog;
 pub mod config;
+pub mod embedding;
 pub mod host;
 pub mod llm;
 pub mod media;

@@ -64,12 +64,49 @@ impl Source {
 #[derive(Clone)]
 pub(crate) struct Authorization {
     sources: Vec<Source>,
+    sticker: Option<(i64, i64, String)>,
 }
 impl Authorization {
-    pub(crate) fn check(&self, db: &Connection, scope: &Scope, guard: &ContextGuard) -> Result<()> {
+    pub(crate) fn check_sources(
+        &self,
+        db: &Connection,
+        scope: &Scope,
+        guard: &ContextGuard,
+    ) -> Result<()> {
         crate::host::check_guard(db, guard)?;
         for source in &self.sources {
             source.check(db, scope, guard)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn check(&self, db: &Connection, scope: &Scope, guard: &ContextGuard) -> Result<()> {
+        self.check_sources(db, scope, guard)?;
+        if let Some((id, revision, hash)) = &self.sticker {
+            super::stickers::check_candidate(db, scope, *id, *revision, hash)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_submission(
+        &mut self,
+        db: &Connection,
+        scope: &Scope,
+        guard: &ContextGuard,
+        message: &mut OutgoingMessage,
+    ) -> Result<()> {
+        self.check_sources(db, scope, guard)?;
+        if let Some((id, revision, hash)) = &self.sticker
+            && super::stickers::check_candidate(db, scope, *id, *revision, hash).is_err()
+        {
+            self.sticker = None;
+            message
+                .segments
+                .retain(|segment| !matches!(segment, OutgoingSegment::Image { .. }));
+        }
+        Ok(())
+    }
+    pub(crate) fn submitted(&self, db: &Connection, scope: &Scope) -> Result<()> {
+        if let Some((id, revision, hash)) = &self.sticker {
+            super::stickers::mark_sent(db, scope, *id, *revision, hash)?;
         }
         Ok(())
     }
@@ -78,6 +115,39 @@ impl Authorization {
 pub(crate) struct PreparedReply {
     pub(crate) message: OutgoingMessage,
     pub(crate) authorization: Authorization,
+}
+
+impl PreparedReply {
+    pub(super) fn with_sticker(
+        mut self,
+        db: &Connection,
+        scope: &Scope,
+        guard: &ContextGuard,
+        candidate: super::stickers::Candidate,
+        uri: String,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        self.authorization.check_sources(db, scope, guard)?;
+        if super::stickers::check_candidate(
+            db,
+            scope,
+            candidate.id,
+            candidate.revision,
+            &candidate.hash,
+        )
+        .is_err()
+        {
+            return Ok(self);
+        }
+        self.authorization.sticker = Some((candidate.id, candidate.revision, candidate.hash));
+        self.message.segments.push(OutgoingSegment::Image {
+            uri,
+            sub_type: crate::types::ImageType::Sticker,
+            summary: Some("表情".into()),
+        });
+        self.message.validate(max_bytes)?;
+        Ok(self)
+    }
 }
 
 #[derive(Clone)]
@@ -295,7 +365,10 @@ impl References {
         segments.push(OutgoingSegment::Text { text: args.text });
         let message = OutgoingMessage { segments };
         message.validate(max_bytes)?;
-        let authorization = Authorization { sources };
+        let authorization = Authorization {
+            sources,
+            sticker: None,
+        };
         authorization.check(db, &self.scope, guard)?;
         Ok(PreparedReply {
             message,
@@ -374,6 +447,61 @@ mod tests {
 
     fn envelope(content: &Value) -> Value {
         json!({"role":"user","content":content.to_string()})
+    }
+
+    #[test]
+    fn final_sticker_failure_preserves_text_but_never_bypasses_message_sources() {
+        let (db, scope, guard) = fixture();
+        db.execute_batch("ALTER TABLE scope_access ADD COLUMN revision INTEGER DEFAULT 0;
+            CREATE TABLE scope_plugin_access(scope TEXT,plugin TEXT,enabled INTEGER,revision INTEGER);
+            CREATE TABLE plugin_states(id TEXT,enabled INTEGER);
+            INSERT INTO plugin_states VALUES('ai',1);
+            CREATE TABLE ai_sticker_control(id INTEGER,enabled INTEGER,cooldown_secs INTEGER);
+            INSERT INTO ai_sticker_control VALUES(1,1,60);
+            CREATE TABLE ai_sticker_scopes(scope TEXT,enabled INTEGER,last_sent_at INTEGER);
+            INSERT INTO ai_sticker_scopes VALUES('1:group:2',1,0);
+            CREATE TABLE ai_stickers(id INTEGER,scope TEXT,revision INTEGER,hash TEXT);
+            CREATE TABLE ai_sticker_sources(sticker_id INTEGER,source_key TEXT,scope TEXT,conversation_id TEXT,epoch INTEGER);
+            INSERT INTO ai_sticker_sources VALUES(1,'1:group:2:10','1:group:2','conversation',1);
+            CREATE TABLE ai_sticker_revoked(source_key TEXT);").unwrap();
+        let hash = "a".repeat(64);
+        db.execute(
+            "INSERT INTO ai_stickers VALUES(1,'1:group:2',1,?1)",
+            [&hash],
+        )
+        .unwrap();
+        let mut refs = References::new(scope.clone());
+        let current = local(&mut refs, 20, "test", &[]);
+        refs.observe(&[envelope(&current)], None);
+        let mut prepared = refs
+            .resolve(&db, &guard, json!({"text":"正文"}), 4096)
+            .unwrap();
+        prepared.authorization.sticker = Some((1, 1, hash));
+        prepared.message.segments.push(OutgoingSegment::Image {
+            uri: "https://example.invalid/sticker".into(),
+            sub_type: crate::types::ImageType::Sticker,
+            summary: None,
+        });
+        prepared.authorization.check(&db, &scope, &guard).unwrap();
+        db.execute(
+            "UPDATE ai_sticker_scopes SET last_sent_at=?1",
+            [crate::types::now()],
+        )
+        .unwrap();
+        prepared
+            .authorization
+            .prepare_submission(&db, &scope, &guard, &mut prepared.message)
+            .unwrap();
+        assert_eq!(prepared.message, OutgoingMessage::text("正文"));
+        assert!(prepared.authorization.sticker.is_none());
+        db.execute("UPDATE messages SET revoked=1 WHERE key='1:group:2:20'", [])
+            .unwrap();
+        assert!(
+            prepared
+                .authorization
+                .prepare_submission(&db, &scope, &guard, &mut prepared.message)
+                .is_err()
+        );
     }
 
     #[test]

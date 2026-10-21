@@ -9,6 +9,8 @@ pub struct Config {
     pub app: AppConfig,
     pub milky: MilkyConfig,
     pub llm: LlmConfig,
+    pub embedding: crate::embedding::EmbeddingConfig,
+    pub stickers: crate::plugins::ai::stickers::StickerConfig,
     #[serde(
         rename = "access",
         skip_serializing,
@@ -428,7 +430,11 @@ impl Default for AiSettings {
             summary: true,
             paused: false,
             once: false,
-            allowed_tools: vec!["clock_now".into(), "reply_message".into()],
+            allowed_tools: vec![
+                "clock_now".into(),
+                "reply_message".into(),
+                "search_stickers".into(),
+            ],
         }
     }
 }
@@ -504,6 +510,9 @@ impl Config {
         })
     }
     pub fn apply_environment(&mut self) {
+        if let Ok(key) = std::env::var("QKBOT_EMBEDDING_API_KEY") {
+            self.embedding.api_key = key;
+        }
         if let Ok(key) = std::env::var("QKBOT_API_KEY") {
             self.llm.api_key = key;
         }
@@ -529,6 +538,10 @@ impl Config {
     /// Readiness checks for saved settings, without constructing transport clients.
     pub fn validate_activation(&self) -> Result<()> {
         ensure!(
+            !self.embedding.enabled || !self.embedding.api_key.trim().is_empty(),
+            "已启用Embedding，请配置独立API密钥或QKBOT_EMBEDDING_API_KEY环境变量。"
+        );
+        ensure!(
             !self.nonebot.enabled || self.nonebot.token.len() >= 32,
             "NoneBot尚未配置有效连接令牌（至少32字节），配置无法应用。只使用Rust原生插件时，请关闭“启用NoneBot兼容服务”；需要外部插件时请先设置独立连接令牌。"
         );
@@ -537,6 +550,9 @@ impl Config {
     /// Validate the same local constructors used at startup, without network or database I/O.
     pub fn validate_runtime(&self) -> Result<()> {
         self.validate_activation()?;
+        if self.embedding.enabled {
+            crate::embedding::Embedding::new(self.embedding.clone())?;
+        }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -553,6 +569,8 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.embedding.validate()?;
+        self.stickers.validate()?;
         crate::catalog::validate_config(self)?;
         ensure!(
             [

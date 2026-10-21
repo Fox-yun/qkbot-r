@@ -2,6 +2,7 @@
 # 群与好友默认开启 Bot，可在管理页分别关闭；开关按登录账号保存到数据库。
 # 密钥可放 QKBOT_API_KEY / QKBOT_MILKY_TOKEN / QKBOT_ADMIN_TOKEN / QKBOT_LLBOT_TOKEN 环境变量。
 # 网页保存配置不会把环境变量中的密钥写回文件。
+# 独立向量密钥可使用 QKBOT_EMBEDDING_API_KEY，不复用聊天模型密钥。
 
 [app]
 database = "qkbot.sqlite3"
@@ -36,6 +37,26 @@ max_concurrent_requests = 2
 request_timeout_secs = 60
 max_response_bytes = 262144
 
+[embedding]
+enabled = false               # 开启后为已有有效记忆建立索引；故障时继续使用FTS检索
+embeddings_url = "https://api.siliconflow.cn/v1/embeddings"
+api_key = ""
+model = "Qwen/Qwen3-VL-Embedding-8B"
+dimensions = 1024
+request_timeout_secs = 15
+max_response_bytes = 262144
+
+[stickers]
+enabled = true                # 需要启用Embedding；按机器人账号和群隔离
+auto_collect = true           # 所有允许服务的群：只自动保存协议明确标为表情的图片
+max_per_group = 256
+max_group_bytes = 134217728
+max_total_bytes = 536870912
+max_total_items = 4096
+queue_capacity = 32
+requests_per_hour = 120
+send_cooldown_secs = 60        # 每群间隔；每次最终回复最多发送一张表情
+
 [plugins.ai]
 enabled = true
 keywords = ["小鱼"]            # 群内真实 @ 或关键词触发；好友私聊直接触发
@@ -61,7 +82,7 @@ memory_write = true
 summary = true
 paused = false
 once = false
-allowed_tools = ["clock_now", "reply_message"]  # 本轮回复可引用消息和 @；提醒工具需开启提醒插件
+allowed_tools = ["clock_now", "reply_message", "search_stickers"]  # 搜索本群表情并由模型选择；需支持视觉和工具调用
 
 [plugins.ai.personas]
 # 内置：雄小鬼、清朗青年、温柔学长、理性搭档、沉稳前辈，无须在这里重复填写。

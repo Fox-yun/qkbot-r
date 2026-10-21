@@ -19,6 +19,8 @@ pub struct Host {
     pub access: AccessStore,
     pub milky: Milky,
     pub llm: Option<Llm>,
+    pub embedding: Option<crate::embedding::Embedding>,
+    pub stickers: crate::plugins::ai::stickers::StickerStore,
     pub memory: MemoryStore,
     pub gateway: Gateway,
     pub cancel: CancellationToken,
@@ -74,6 +76,22 @@ impl Host {
             config.plugins.ai.max_memories_per_conversation,
         );
         memory.init().await?;
+        crate::plugins::ai::semantic::init(&store).await?;
+        let embedding = if config.embedding.enabled && config.plugins.ai.enabled {
+            Some(crate::embedding::Embedding::new(config.embedding.clone())?)
+        } else {
+            None
+        };
+        let directory = std::path::Path::new(&config.app.database)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("stickers");
+        let stickers = crate::plugins::ai::stickers::StickerStore::new(
+            store.clone(),
+            config.stickers.clone(),
+            directory,
+        )?;
+        stickers.init().await?;
         let allowed = if config.plugins.ai.enabled {
             config.plugins.ai.defaults.allowed_tools.clone()
         } else {
@@ -89,6 +107,8 @@ impl Host {
             store,
             milky,
             llm,
+            embedding,
+            stickers,
             memory,
             gateway,
             cancel: CancellationToken::new(),
@@ -313,7 +333,7 @@ impl Host {
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g { check_guard(&tx,g)?; }
             if let Some(authorization)=&authorization {
-                authorization.check(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?)?;
+                authorization.check_sources(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?)?;
             }
             let count:i64=tx.query_row("SELECT COUNT(*) FROM outbox WHERE scope=?1 AND created_at>?2 AND state IN('prepared','submitted','confirmed','unknown')",params![scope_key,now()-3600],|r|r.get(0))?;
             ensure!(count<hourly,"发送额度已用完，请稍后重试");
@@ -338,23 +358,29 @@ impl Host {
         let destination = scope.clone();
         let _delivery = self.access.delivery_guard(scope).await?;
         let submit=self.store.call(move|c|{
+            let mut message=message;
+            let mut authorization=authorization;
             let tx=c.transaction()?;
             crate::access::check_revision(&tx,&scope_key,access_revision)?;
             crate::catalog::check_revision(&tx,&scope_key,&origin,plugin_revision)?;
             check_source_policy(&tx,&scope_key,&origin,inbound_position)?;
             check_plugin(&tx,&origin,plugin_epoch)?;
             if let Some(g)=&g {check_guard(&tx,g)?;}
-            if let Some(authorization)=&authorization {
-                authorization.check(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?)?;
+            if let Some(authorization)=&mut authorization {
+                authorization.prepare_submission(&tx,&destination,g.as_ref().ok_or_else(||anyhow::anyhow!("回复缺少会话边界"))?, &mut message)?;
             }
-            ensure!(tx.execute("UPDATE outbox SET state='submitted',updated_at=?2 WHERE id=?1 AND state='prepared'",params![id1,now()])?==1,"发送已取消");
-            tx.commit()?;Ok(())
+            ensure!(tx.execute("UPDATE outbox SET state='submitted',updated_at=?2,body=?3 WHERE id=?1 AND state='prepared'",params![id1,now(),serde_json::to_string(&message)?])?==1,"发送已取消");
+            if let Some(authorization)=&authorization { authorization.submitted(&tx,&destination)?; }
+            tx.commit()?;Ok(message)
         }).await;
-        if let Err(e) = submit {
-            let why = format!("not submitted: {e}");
-            self.store.call(move|c|{c.execute("UPDATE outbox SET state='failed',detail=?2,updated_at=?3 WHERE id=?1 AND state='prepared'",params![id,why,now()])?;Ok(())}).await?;
-            return Err(e);
-        }
+        let message = match submit {
+            Ok(message) => message,
+            Err(e) => {
+                let why = format!("not submitted: {e}");
+                self.store.call(move|c|{c.execute("UPDATE outbox SET state='failed',detail=?2,updated_at=?3 WHERE id=?1 AND state='prepared'",params![id,why,now()])?;Ok(())}).await?;
+                return Err(e);
+            }
+        };
         // Deliberately finish the ledger after submission, even if a reset cancels AI.
         let outcome = self.milky.send_message(scope, &message, &self.cancel).await;
         let (state, seq, detail) = match &outcome {
@@ -447,6 +473,21 @@ impl Router {
     pub async fn dispatch(&self, msg: crate::types::Incoming) -> Result<()> {
         use crate::plugins::ai;
         let host = &self.host;
+        if msg
+            .notification
+            .as_ref()
+            .is_some_and(|event| event.event_type == "message_recall")
+        {
+            host.milky.scope_generation(&msg.key.scope)?;
+            if let Some(sequence) = msg.quote_seq.filter(|seq| *seq >= 0) {
+                let key = crate::types::MessageKey {
+                    scope: msg.key.scope.clone(),
+                    message_seq: sequence,
+                };
+                host.stickers.revoke(&key.key()).await?;
+            }
+            return Ok(());
+        }
         if msg.text.len() > host.config.limits.max_message_bytes
             || removed_management_command(&msg.text)
         {
@@ -520,6 +561,9 @@ impl Router {
         };
         if msg.is_self() {
             return Ok(());
+        }
+        if let Err(_error) = host.stickers.observe(host, &msg).await {
+            tracing::debug!("sticker collection deferred");
         }
         // Activity observers see real commands as well as ordinary messages;
         // command ownership still prevents AI context and memory ingestion.
@@ -668,6 +712,7 @@ impl Router {
     pub async fn maintenance(&self) -> Result<()> {
         crate::bridge::cleanup(&self.host).await;
         self.host.media.cleanup(&self.host).await;
+        self.host.stickers.cleanup().await?;
         let seconds = (self.host.config.limits.retention_days * 86400).min(i64::MAX as u64) as i64;
         let cutoff = now() - seconds;
         self.host

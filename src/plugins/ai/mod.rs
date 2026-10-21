@@ -2,6 +2,9 @@ pub mod chat;
 pub mod memory;
 pub mod memory_rebuild;
 pub(crate) mod reply;
+pub mod semantic;
+mod sticker_reply;
+pub mod stickers;
 pub(crate) mod trigger;
 pub(crate) mod vision;
 

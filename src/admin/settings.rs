@@ -40,6 +40,7 @@ impl fmt::Debug for SecretChange {
 #[serde(default, deny_unknown_fields)]
 pub struct SecretUpdates {
     pub llm_api_key: SecretChange,
+    pub embedding_api_key: SecretChange,
     pub milky_access_token: SecretChange,
     pub llbot_token: SecretChange,
     pub nonebot_token: SecretChange,
@@ -108,6 +109,7 @@ impl std::error::Error for RevisionConflict {}
 #[derive(Clone, Default)]
 struct Environment {
     llm_api_key: Option<String>,
+    embedding_api_key: Option<String>,
     milky_access_token: Option<String>,
     admin_token: Option<String>,
     llbot_token: Option<String>,
@@ -117,6 +119,7 @@ impl Environment {
     fn read() -> Self {
         Self {
             llm_api_key: std::env::var("QKBOT_API_KEY").ok(),
+            embedding_api_key: std::env::var("QKBOT_EMBEDDING_API_KEY").ok(),
             milky_access_token: std::env::var("QKBOT_MILKY_TOKEN").ok(),
             admin_token: std::env::var("QKBOT_ADMIN_TOKEN").ok(),
             llbot_token: std::env::var("QKBOT_LLBOT_TOKEN").ok(),
@@ -124,6 +127,9 @@ impl Environment {
         }
     }
     fn apply(&self, config: &mut Config) {
+        if let Some(value) = &self.embedding_api_key {
+            config.embedding.api_key = value.clone();
+        }
         if let Some(value) = &self.llm_api_key {
             config.llm.api_key = value.clone();
         }
@@ -421,11 +427,13 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
         .map(|error| error.to_string());
     let secrets = json!({
         "llm_api_key": secret_status(&config.llm.api_key, &environment.llm_api_key),
+        "embedding_api_key": secret_status(&config.embedding.api_key, &environment.embedding_api_key),
         "milky_access_token": secret_status(config.milky.access_token.as_deref().unwrap_or(""), &environment.milky_access_token),
         "llbot_token": secret_status(&config.qq_login.token, &environment.llbot_token),
         "nonebot_token": secret_status(&config.nonebot.token, &environment.nonebot_token),
     });
     config.llm.api_key.clear();
+    config.embedding.api_key.clear();
     config.milky.access_token = None;
     config.web.token.clear();
     config.qq_login.token.clear();
@@ -477,6 +485,7 @@ fn save_file_cached(
     );
     ensure!(
         config.llm.api_key.is_empty()
+            && config.embedding.api_key.is_empty()
             && config
                 .milky
                 .access_token
@@ -487,7 +496,25 @@ fn save_file_cached(
             && config.nonebot.token.is_empty(),
         "配置正文中的凭据必须为空，请使用secrets的keep/set/clear操作"
     );
+    if config.embedding.embeddings_url != previous.embedding.embeddings_url {
+        ensure!(
+            environment
+                .embedding_api_key
+                .as_deref()
+                .is_none_or(str::is_empty),
+            "Embedding密钥由环境变量提供，修改接口地址前请先在服务器调整环境配置。"
+        );
+        ensure!(
+            previous.embedding.api_key.is_empty()
+                || !matches!(request.secrets.embedding_api_key, SecretChange::Keep),
+            "Embedding接口地址已改变，请设置新地址的密钥或明确清除旧密钥。"
+        );
+    }
     config.llm.api_key = change_secret(&previous.llm.api_key, &request.secrets.llm_api_key)?;
+    config.embedding.api_key = change_secret(
+        &previous.embedding.api_key,
+        &request.secrets.embedding_api_key,
+    )?;
     config.qq_login.token = change_secret(&previous.qq_login.token, &request.secrets.llbot_token)?;
     config.nonebot.token = change_secret(&previous.nonebot.token, &request.secrets.nonebot_token)?;
     config.web.token = previous.web.token;
@@ -567,7 +594,11 @@ fn validate_readable(config: &Config) -> Result<()> {
 fn validate_stored(config: &Config) -> Result<()> {
     config.validate()?;
     crate::plugins::assemble(config)?;
-    for value in [&config.llm.chat_completions_url, &config.milky.url] {
+    for value in [
+        &config.llm.chat_completions_url,
+        &config.milky.url,
+        &config.embedding.embeddings_url,
+    ] {
         if value.trim().is_empty() {
             continue;
         }
@@ -728,7 +759,7 @@ mod tests {
         let view = snapshot(&before, &environment).unwrap();
         let catalog = crate::plugins::tool_catalog(&config).unwrap();
         assert_eq!(view["tool_catalog"], json!(catalog));
-        assert_eq!(catalog.len(), 5);
+        assert_eq!(catalog.len(), 6);
         let reply = catalog
             .iter()
             .find(|entry| entry.name == "reply_message")
@@ -757,7 +788,7 @@ mod tests {
             let value = serde_json::to_value(entry).unwrap();
             assert!(matches!(
                 value["effect"].as_str(),
-                Some("read" | "local_write" | "reply")
+                Some("read" | "local_write" | "reply" | "async_read")
             ));
             assert_eq!(value.as_object().unwrap().len(), 4);
         }
@@ -976,6 +1007,7 @@ mod tests {
         let (_directory, path, _) = fixture();
         let environment = Environment {
             llm_api_key: Some("env-model-fixture".into()),
+            embedding_api_key: Some("env-embedding-fixture".into()),
             milky_access_token: Some("env-milky-fixture".into()),
             admin_token: Some("env-admin-fixture-at-least-32-bytes".into()),
             llbot_token: Some("env-login-fixture".into()),
@@ -984,7 +1016,12 @@ mod tests {
         let mut update = request(&path, &environment);
         update.secrets.llbot_token = SecretChange::Clear;
         let view = save_file(&path, update, &environment).unwrap();
-        for name in ["llm_api_key", "milky_access_token", "llbot_token"] {
+        for name in [
+            "llm_api_key",
+            "embedding_api_key",
+            "milky_access_token",
+            "llbot_token",
+        ] {
             assert_eq!(view["secrets"][name]["env_set"], true);
             assert_eq!(view["secrets"][name]["effective_set"], true);
             assert_eq!(view["secrets"][name]["source"], "environment");
@@ -996,6 +1033,7 @@ mod tests {
         assert!(!String::from_utf8(bytes.clone()).unwrap().contains("env-"));
         let active = effective(&path, &bytes, &environment).unwrap();
         assert_eq!(active.llm.api_key, "env-model-fixture");
+        assert_eq!(active.embedding.api_key, "env-embedding-fixture");
         assert_eq!(
             active.milky.access_token.as_deref(),
             Some("env-milky-fixture")
@@ -1009,6 +1047,41 @@ mod tests {
         assert_eq!(
             Config::load_raw(&path).unwrap().app.database,
             "qkbot.sqlite3"
+        );
+    }
+
+    #[test]
+    fn embedding_secret_is_independent_and_keep_set_clear_are_redacted() {
+        let (_directory, path, environment) = fixture();
+        let mut update = request(&path, &environment);
+        update.secrets.embedding_api_key = SecretChange::Set {
+            value: "embedding-fixture-secret".into(),
+        };
+        let view = save_file(&path, update, &environment).unwrap();
+        assert!(!view.to_string().contains("embedding-fixture-secret"));
+        assert_eq!(view["config"]["embedding"]["api_key"], "");
+        assert_eq!(view["secrets"]["embedding_api_key"]["file_set"], true);
+        let update = request(&path, &environment);
+        save_file(&path, update, &environment).unwrap();
+        let stored = Config::load_raw(&path).unwrap();
+        assert_eq!(stored.embedding.api_key, "embedding-fixture-secret");
+        assert_eq!(stored.llm.api_key, "file-model-fixture");
+        let mut moved = request(&path, &environment);
+        moved.config.embedding.embeddings_url =
+            "https://other.example.invalid/v1/embeddings".into();
+        assert!(save_file(&path, moved, &environment).is_err());
+        let mut update = request(&path, &environment);
+        update.config.embedding.api_key = "plaintext-rejected".into();
+        assert!(save_file(&path, update, &environment).is_err());
+        let mut update = request(&path, &environment);
+        update.secrets.embedding_api_key = SecretChange::Clear;
+        save_file(&path, update, &environment).unwrap();
+        assert!(
+            Config::load_raw(&path)
+                .unwrap()
+                .embedding
+                .api_key
+                .is_empty()
         );
     }
 
