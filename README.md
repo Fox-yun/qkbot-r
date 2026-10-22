@@ -1,31 +1,121 @@
-# 小鱼 · qkbot-r
+# qkbot-r · 小鱼
 
-面向小规模 QQ 群聊的机器人：**Rust 核心、SQLite、远程模型 API、可选 NoneBot**。支持 Podman 部署，也能直接运行单个可执行文件。
+基于 Rust、SQLite 与 Milky 协议的 QQ 机器人，面向个人和小规模群聊部署。项目提供 AI 对话、会话与长期记忆管理、Web 管理及可选扩展，通过远程模型 API 提供智能能力。
 
-轻量来自少依赖、按需加载和有界任务，不靠删减功能或设定死板的内存门槛。QQ 客户端与 Milky 协议端独立运行；Rust 核心不启动 Python、Chromium、向量数据库或本地大模型。
+仓库维护三个功能范围不同的分支：`clean` 提供基础文本对话与记忆，`master` 提供完整群聊插件，`codex/embedding-stickers` 在主分支基础上增加语义检索、群表情回复和联网搜索。部署前应先选择分支，再使用该分支的配置与启动方式。
 
-## 可以做什么
+[分支选择](#分支选择) · [LLBot 与部署准备](#llbot-与部署准备) · [clean 部署](#clean-分支部署) · [master 部署](#master-分支部署) · [增强分支部署](#增强分支部署) · [首次配置](#首次配置与日常管理) · [性能数据](#性能数据与测量范围) · [文档索引](#文档索引与来源)
 
-| 能力 | 已实现 |
+## 分支选择
+
+| 分支 | 定位与适用场景 | 部署方式 |
+| --- | --- | --- |
+| [`clean`](https://github.com/Fox-yun/qkbot-r/tree/clean) | 基础对话分支。适合只需要文本聊天、人设、长期记忆、时钟与提醒的场景，也可作为 Rust 插件开发基础 | 原生编译运行；该分支未提供容器构建与部署文件 |
+| [`master`](https://github.com/Fox-yun/qkbot-r/tree/master) | 完整功能主分支。适合需要识图、群聊娱乐插件、图片菜单及可选 NoneBot 扩展的日常部署 | Linux rootless Podman，或原生编译运行 |
+| [`codex/embedding-stickers`](https://github.com/Fox-yun/qkbot-r/tree/codex/embedding-stickers) | 增强分支。保留主分支功能，增加向量记忆、AI 群表情回复、Tavily 搜索与可配置的 AI 提醒确认方式 | Linux rootless Podman，或原生编译运行；增强功能按需配置外部 API |
+
+以下能力已按 **2026-10-22** 的远端分支核对：`clean` 为 `b649d3e`，`master` 为 `7847285`，增强分支为 `416a617`。
+
+| 能力 | `clean` | `master` | `codex/embedding-stickers` |
+| --- | --- | --- | --- |
+| 文本 AI、群共享 / 按人隔离上下文、人设 | 支持 | 支持 | 支持 |
+| SQLite FTS5 记忆、摘要、证据管理与遗忘 | 支持 | 支持 | 支持 |
+| Web 管理、群与好友开关、LLBot 扫码代理 | 支持 | 支持 | 支持 |
+| 当前消息及明确引用中的图片识别 | 未提供 | 支持 | 支持 |
+| 引用机器人消息触发、结构化引用 / @ 回复 | 未提供 | 支持 | 支持 |
+| 日常经历与人物背景提炼、历史记忆重整命令 | 基础事实提炼，无重整命令 | 支持 | 支持 |
+| 13 项原生群聊插件与可选 NoneBot | 未提供 | 支持 | 支持 |
+| Embedding 语义记忆、AI 群表情库 | 未提供 | 未提供 | 可选，需配置向量服务 |
+| Tavily 联网搜索 | 未提供 | 未提供 | 可选，需配置搜索密钥 |
+| AI 提醒创建 / 取消 | 需本人二次确认 | 需本人二次确认 | 新配置默认直接执行，可开启二次确认 |
+| AI 根据上下文静默结束当前轮次 | 未提供该能力 | 未提供该能力 | 支持，不额外发起判断请求 |
+| `Containerfile`、Podman 脚本、Quadlet | 未提供 | 提供 | 提供 |
+
+三个分支的提醒插件均默认关闭，需先启用插件并允许对应模型工具。`master` 的手动表情保存插件与增强分支的 AI 表情检索、选图回复是不同功能。
+
+## LLBot 与部署准备
+
+### 公共依赖
+
+三个分支都需要独立的 Milky 协议端和兼容 Chat Completions 的模型接口。SQLite 随 Rust 程序编译；聊天模型在远端调用，无需在服务器部署本地大模型。
+
+本项目的扫码代理适配 **LLBot（LuckyLilliaBot）**。配套容器方案固定使用 `docker.io/linyuchen/llbot:8.3.2`，采用直连模式，无需在服务器另装桌面 QQ；首次登录仍需使用手机 QQ 扫码确认。运行模式与前置授权按 [LLBot 官方安装说明](https://luckylillia.com/guide/choice_install)配置。
+
+| 目的 | 文档入口 |
 | --- | --- |
-| AI 聊天 | 群内真实 @、关键词、好友私聊；模型列表获取；人设列表切换；结构化工具调用与本人确认 |
-| 上下文 | 群共享或群内按人隔离；近期消息、滚动摘要；输入预算、历史长度、模型与工具调用次数可调 |
-| 长期记忆 | 带来源证据的 SQLite FTS5 检索；人工编辑、锁定、停用、遗忘；后台事实提炼与摘要独立控制 |
-| 管理页 | 密码登录、LLBot 扫码代理、群与好友黑名单、每会话插件开关、工具勾选、保存与应用状态 |
-| Rust 插件 | 帮助图片、鹿管签到、Wordle、疯狂星期四、今日老婆、吃喝图片、MC 查询、表情保存、戳一戳、模拟聊天图片、模拟转发、轮盘禁言 |
-| 可选 NoneBot | 接入核对过的原版 B 站下载、查成分、多平台解析、漫展、兽聚、语音点歌插件 |
-| 可靠性 | 账号与会话隔离、消息去重、发送账本、有限并发、任务超时、取消失效、权限校验、数据库迁移 |
+| 安装 LLBot、选择运行方式 | [官方安装指南](https://luckylillia.com/guide/choice_install) |
+| 下载版本与查看变更 | [GitHub 仓库](https://github.com/LLOneBot/LuckyLilliaBot) · [Releases](https://github.com/LLOneBot/LuckyLilliaBot/releases) |
+| 配置 Milky 与 WebUI | [官方配置文档](https://luckylillia.com/guide/config) |
+| 排查登录、连接与媒体问题 | [官方常见问题](https://luckylillia.com/guide/faq) |
+| 使用本仓库的 LLBot 容器与登录恢复方案 | [master 部署指南](https://github.com/Fox-yun/qkbot-r/blob/master/docs/deployment.md#41-部署独立-llbot) · [增强分支部署指南](https://github.com/Fox-yun/qkbot-r/blob/codex/embedding-stickers/docs/deployment.md#41-部署独立-llbot) |
 
-群和好友默认开启，采用黑名单。**戳一戳、轮盘禁言及 NoneBot 预设默认全局关闭**，需要在管理页勾选并“保存并应用”。十二项 Rust 插件不依赖 NoneBot；误开未配置令牌的 NoneBot 会阻止配置应用，页面会显示原因并保留旧实例。
+`clean` 分支未携带 LLBot 部署文件，使用官方安装方式独立部署协议端即可；它仍支持通过小鱼管理页扫码。
 
-## Podman 快速部署
+### 端口与凭据
 
-下面在 **Linux 服务器**执行，要求已安装 rootless Podman。默认使用主机网络，适合 LLBot 已在同一 Linux 主机监听 `127.0.0.1:3010/3080` 的情况。所有项目文件放在 workspace：
+| 服务 | 默认地址 | 凭据与配置 |
+| --- | --- | --- |
+| 小鱼管理页 | `http://127.0.0.1:3210` | 首次用初始化码设置管理员密码 |
+| Milky HTTP / WebSocket | `http://127.0.0.1:3010` | `milky.url` 与 `milky.access_token` |
+| LLBot WebUI / 扫码代理 | `http://127.0.0.1:3080` | `qq_login.url` 与 LLBot WebUI 密码 `qq_login.token` |
+| 原生图片与 NoneBot 内部服务 | `127.0.0.1:3215` | 仅主分支与增强分支使用；NoneBot 使用独立桥接令牌 |
+
+小鱼管理员密码、Milky 令牌、LLBot WebUI 密码与 LLBot 签名授权分别管理。按配套方案部署时，后三项分别保存于 `~/workspace/llbot/data/` 下的 `milky_token.txt`、`webui_token.txt`、`auth_token.txt`；签名授权由 LLBot 使用，不填入小鱼的 Milky 或 WebUI 密码框。
+
+容器方案默认使用 Linux host 网络。Rust、LLBot 与可选 NoneBot 应共享回环网络，或部署在同一个 Pod，使协议端能够读取 `127.0.0.1:3215` 的临时图片。Windows / macOS 的 Podman 使用 Linux 虚拟机，host 网络对应虚拟机，需按[网络拓扑说明](docs/deployment.md#2-选择网络拓扑)安排组件位置。
+
+下面三套流程均用于**首次安装，选择其中一套执行**。源码目录统一示例为 `~/workspace/qkbot-r`；容器方案默认使用镜像 `localhost/qkbot-r:latest`、容器 `qkbot` 和卷 `qkbot-data`。已有部署请先阅读[更新与分支切换](#更新备份与分支切换)，避免复用旧容器后误以为已切换版本。
+
+## clean 分支部署
+
+`clean` 保留文本 AI、群共享或按用户隔离的上下文、五套内置人设、带证据的长期记忆、摘要、时钟、可选提醒和 Web 管理。它支持一层引用文字理解，但不包含后续新增的识图、原生群聊插件、NoneBot、向量检索和联网搜索。
+
+该分支采用**原生编译部署**，需要 Rust 工具链；Windows 还需要 MSVC C++ Build Tools。源码中没有 `Containerfile`、`deploy/podman.sh` 或 `deploy/*.container`，应使用以下命令。
+
+### Linux / macOS
 
 ```bash
 mkdir -p ~/workspace
 cd ~/workspace
-git clone https://github.com/Fox-yun/qkbot-r.git
+git clone --branch clean --single-branch https://github.com/Fox-yun/qkbot-r.git qkbot-r
+cd qkbot-r
+
+cargo build --release --locked
+./target/release/qkbot --config config.toml
+```
+
+### Windows PowerShell
+
+在准备存放源码的目录执行：
+
+```powershell
+git clone --branch clean --single-branch https://github.com/Fox-yun/qkbot-r.git qkbot-r
+cd qkbot-r
+
+.\scripts\cargo.ps1 build --release --locked
+.\target\release\qkbot.exe --config config.toml
+```
+
+首次运行创建 `config.toml`，终端显示管理地址与一次性初始化码。按[首次配置](#首次配置与日常管理)填写 LLBot 和模型参数，保存并应用后，可发送 `/clock` 及带「小鱼」关键词的消息验证。该分支没有图片版 `/帮助` 菜单。
+
+需要提醒时，启用 `plugins.reminder.enabled`，并在全局和当前会话允许 `reminder_list`、`reminder_create`、`reminder_cancel`。AI 创建 / 取消操作需本人在原聊天发送 `/bot confirm TOKEN`；普通 `/remind` 命令直接执行。
+
+原生运行的数据默认位于配置文件目录：`config.toml`、`qkbot.sqlite3` 及 `.qkbot-admin/`。长期运行可由系统服务管理器托管可执行文件，工作目录、配置路径和启动用户应保持一致。完整说明见 [clean 使用文档](https://github.com/Fox-yun/qkbot-r/blob/clean/README.md)与 [clean 配置示例](https://github.com/Fox-yun/qkbot-r/blob/clean/config.example.toml)。
+
+## master 分支部署
+
+`master` 提供完整的群聊功能：在基础对话与记忆之外，加入图片识别、引用机器人消息触发、结构化引用 / @ 回复、日常记忆提炼、历史记忆重整、13 项原生插件及可选 NoneBot。
+
+原生插件包括帮助菜单、随机选择、鹿管签到、Wordle、疯狂星期四、今日老婆、吃喝推荐、MC 查询、表情保存、戳一戳、模拟聊天图片、模拟转发和轮盘禁言。记忆检索采用 SQLite FTS5，该分支无需配置 Embedding 或 Tavily。
+
+### Linux Podman
+
+在已配置 rootless Podman 的 Linux 服务器执行；安装步骤见 [master 部署准备](https://github.com/Fox-yun/qkbot-r/blob/master/docs/deployment.md#1-准备-linux-主机)。
+
+```bash
+mkdir -p ~/workspace
+cd ~/workspace
+git clone --branch master --single-branch https://github.com/Fox-yun/qkbot-r.git qkbot-r
 cd qkbot-r
 
 sh deploy/podman.sh build
@@ -33,62 +123,124 @@ sh deploy/podman.sh start
 sh deploy/podman.sh logs
 ```
 
-镜像多阶段编译，运行层包含程序、系统库、证书、中文字体和固定餐图库，使用非 root 用户。配置、管理员凭据、数据库与自定义插件资源保存在 `qkbot-data` 卷的 `/data` 中，升级镜像不会覆盖它们。未指定内存或 CPU 硬限制。
+镜像采用多阶段构建，运行层包含程序、证书、中文字体和 151 张内置餐图，以 UID 10001 运行。配置、管理员凭据、数据库与自定义资源持久化到 `qkbot-data` 卷的 `/data`。
 
-管理页默认仅在服务器本机监听。远程电脑运行：
+完成[首次配置](#首次配置与日常管理)后，使用 `/帮助`、`/roll 米饭 面条 火锅` 与 AI 对话验证部署。图片识别需要支持视觉输入的聊天模型；`llm.vision` 默认开启，不支持视觉的模型应关闭该项。每轮最多读取当前消息与明确引用中的 4 张图片，图片会占用输入预算。
+
+戳一戳、轮盘禁言、提醒与 NoneBot 预设默认关闭。按需启用插件后保存并应用；AI 提醒的创建和取消仍需本人二次确认。需要 B 站下载、多平台解析等上游功能时，另按 [master NoneBot 部署](https://github.com/Fox-yun/qkbot-r/blob/master/sidecar/nonebot/README.md#podman-部署可选)安装独立扩展进程。
+
+Windows / macOS 或不使用容器的 Linux 主机，可在检出 `master` 后按[原生运行](#原生运行与开发检查)编译。自启动、升级、回滚与备份见 [master 运维指南](https://github.com/Fox-yun/qkbot-r/blob/master/docs/deployment.md)。
+
+## 增强分支部署
+
+完整分支名为 **`codex/embedding-stickers`**。该分支包含上述 `master` 功能，并增加：
+
+- **语义记忆**：通过独立 Embedding API 建立向量索引，与 FTS5 结果合并；向量索引或服务不可用时继续使用关键词检索。
+- **AI 群表情回复**：按账号与群隔离表情库，支持自动收集、手动加入、管理预览、检索选图及随最终回复发送。
+- **联网搜索**：通过 Tavily 获取摘要与来源，提供 `/搜索`、`/search` 和模型工具 `web_search`。
+- **对话与提醒调整**：模型可依据上下文静默结束轮次；AI 提醒支持直接创建 / 取消或二次确认两种方式。
+
+### Linux Podman
 
 ```bash
-ssh -N -L 127.0.0.1:13210:127.0.0.1:3210 你的SSH主机别名
+mkdir -p ~/workspace
+cd ~/workspace
+git clone --branch codex/embedding-stickers --single-branch https://github.com/Fox-yun/qkbot-r.git qkbot-r
+cd qkbot-r
+
+sh deploy/podman.sh build
+sh deploy/podman.sh start
+sh deploy/podman.sh logs
 ```
 
-浏览器打开 **http://127.0.0.1:13210**，用容器日志中的一次性初始化码设置管理员密码。在页面填写 Milky、模型 API 和 LLBot 登录管理配置。**LLBot 尚未部署时，管理页仍可初始化，QQ 聊天需等待协议端就绪。**
+该分支与 `master` 使用相同的容器构建、网络和持久化方式。先按[首次配置](#首次配置与日常管理)完成普通聊天，再按需启用下面的能力。Embedding 与联网搜索默认关闭，没有对应密钥时仍可运行基础对话与原生插件。原生部署同样适用[编译运行流程](#原生运行与开发检查)。
 
-完整流程见 **[Podman 部署与升级](docs/deployment.md)**：包含 Debian 安装、同 Pod 部署、密钥、首次登录、持久化、systemd 自启动、备份恢复及从原生版本迁移。可选 Python 部分见 **[NoneBot 容器部署](sidecar/nonebot/README.md#podman-部署可选)**。
+### 配置语义记忆与群表情
 
-还未安装 QQ 协议端时，可按部署文档的 **LLBot 8.3.2** 章节安装配套容器：配置和登录态集中在 `~/workspace/llbot/`，由小鱼管理页代理扫码。提供独立 Quadlet 和登录恢复入口；WebUI、Milky 均只监听回环，通过 SSH 转发访问管理页。
+1. 在管理页「向量接口（Embedding）」填写完整接口地址、模型、维度和独立密钥。当前配置模板使用 `https://api.siliconflow.cn/v1/embeddings`、`Qwen/Qwen3-VL-Embedding-8B`、1024 维；自定义接口需兼容项目的文字 / 图片向量请求格式。向量密钥不自动复用聊天模型密钥。
+2. 点击「测试文字和图片向量」，核对返回维度。测试发送两次合成请求；启用「向量服务」并「保存并应用」后，后台逐步为已有有效记忆建立索引。
+3. 需要 AI 表情回复时，同时启用 `stickers.enabled`、`llm.vision` 和 `llm.tool_calling`，使用支持视觉与原生工具调用的聊天模型，并在全局及当前会话允许 `search_stickers` 和 `reply_message`。
+4. 在表情库管理页核对收集与索引状态；可在群内引用一张图片并发送 `/sticker` 加入。模型检索本群候选后，每轮最多选择一张随最终回复发送。
 
-> Windows/macOS 的 Podman 使用 Linux 虚拟机，`--network host` 指向虚拟机，不是 Windows/macOS 宿主。不要直接把 Windows 上 LLBot 的 `127.0.0.1` 配置照搬到 Linux 容器；Rust、NoneBot、LLBot 的回环地址需要处于同一个网络空间。
+`stickers.enabled` 与 `stickers.auto_collect` 默认开启，但表情库需要已启用的向量服务。自动收集仅处理允许服务的群中由协议明确标记为表情的图片；每群默认最多 256 项 / 128 MiB，全局最多 4096 项 / 512 MiB，同群表情回复间隔为 60 秒。
 
-## 使用与配置
+向量保存在 SQLite，表情文件保存在数据库同目录的 `stickers/`，容器默认路径为 `/data/stickers/`，无需另行部署向量数据库。启用服务后，待索引的记忆文本、检索文本及表情图片会发送至所配置的向量接口，备份时应保存完整数据目录。
 
-- **模型**：兼容 Chat Completions，支持从接口获取模型列表；已有密钥不会返回前端。密钥框留空保留原值。
-- **人设**：内置五套成年男性角色，可预览、编辑、另存，并按会话切换；支持一键应用到当前账号全部群聊，保留历史与记忆。
-- **记忆**：近期上下文、摘要和长期事实分别管理。自动提炼兼容完整 JSON 代码块，校验人物和原文证据后才保存；可在记忆页核对。采用中文双字词检索；当前没有向量检索，换一种说法可能漏召回。
-- **开关**：“保存当前配置”只写文件，“保存并应用”才更新运行实例。群／好友及会话内插件黑名单立即保存生效。
-- **工具**：从实际工具注册表勾选。涉及写入的模型工具需本人在原聊天确认；模型正文不能冒充工具调用。
-- **帮助**：`/帮助` 查看按当前会话筛选的卡片菜单，`/帮助 序号` 查看完整命令；自动换行和分页，图片与查询编号一致。
-- **吃喝**：`早上吃什么`、`中午吃什么`、`晚上吃什么`、`今晚吃什么` 均可触发，也支持早餐／午餐／晚饭等说法和 `/` 前缀。内置 151 张原图随部署提供，发送不依赖 GitHub 外链；各时段共用菜品库。
-- **权限**：机器人命令、模型工具与群管理权限分别检查。模拟聊天有明确标记；轮盘禁言还需要 QQ 群权限。
+### 配置联网搜索
 
-常用默认值：模型并发 2、后台整理并发 1、近期消息 24 条、输入预算 6000、输出上限 800、每轮至多 3 次模型请求和 2 次工具调用。预算是估算值，不是模型 tokenizer 的精确计数；这些值均可按需求调整。
+1. 在管理页「联网搜索」填写 Tavily API 密钥，点击「测试搜索连接」。
+2. 启用联网搜索并保存应用，用 `/搜索 查询内容` 验证命令入口。
+3. 需要 AI 自行搜索时，启用模型原生工具调用，并在全局和当前会话勾选 `web_search`；已有会话的显式工具名单不会自动扩展。
 
-详见 [配置与使用](docs/user-guide.md)、[完整示例配置](config.example.toml) 和 [架构与边界](docs/architecture.md)。
+搜索默认每轮最多调用一次、返回最多五条结果，使用有界超时与调用额度。回复中的来源链接来自实际检索结果。详细配置、额度与执行范围见[联网搜索说明](docs/web-search.md)。
 
-## 性能数据
+### 配置 AI 提醒与回复行为
 
-2026-10-20 实测，全部 12 个 Rust 插件加载，执行双群 20 条聊天、工具调用、4 张图片、两群记忆提炼与召回。Linux 环境为 2 vCPU、约 1.90 GiB 内存的 Debian 13，rootless Podman 5.4.2；Windows 为 Ryzen AI 9 H 365。不同机器与系统指标不用于判断平台快慢。
+提醒插件仍需手动启用。该分支的新配置已将三个提醒工具加入允许列表，并将 `plugins.reminder.llm_writes_require_confirmation` 默认设为 `false`；启用插件后，可按用户请求直接创建或取消本人当前会话中的提醒。需要二次确认时，将该值设为 `true`。
 
-| 机器人进程指标 | Windows 原生工作集 | Linux 容器内 RSS |
-| --- | ---: | ---: |
-| 初始空闲中位数 | 11.60 MiB | 15.05 MiB |
-| 双群聊天采样峰值 | 13.64 MiB | 16.33 MiB |
-| 绘图、记忆测试后空闲中位数 | 34.90 MiB | 53.95 MiB |
-| 进程生命周期峰值 | 46.07 MiB | 53.95 MiB |
+从旧版本升级时，已有配置中的显式 `true` 会保留；原有全局和会话工具名单也需按需补选。仅切换分支或更换镜像不会自动改变这些设置。
 
-两端均完成 **32/32 次发送确认、2 份摘要、2 条长期记忆及 2 次召回验证**。该次基准的 Linux Rust 镜像约 **189.66 MiB**，包含中文字体；后续打包餐图增加约 10.75 MiB 原图资源，当前镜像大小以构建结果为准。可选 NoneBot core 镜像约 **197.2 MiB**，不含六个上游功能及浏览器。镜像大小是磁盘指标，不是运行内存。
+该分支允许 AI 对没有新信息的应和、重复内容等静默结束本轮，不发送占位文字，也不增加一轮判断请求。@、关键词和引用机器人消息仍是触发入口，原生插件命令按各自规则执行。
 
-这些是模拟模型每次等待 500 ms 的隔离测试，数字不包含 QQ／LLBot、NoneBot、浏览器、模型服务或容器运行时，也不是生产内存上限。完整环境、逐阶段延迟、CPU、原始样本与复现命令见 **[性能报告](docs/performance.md)**。
+## 首次配置与日常管理
 
-## 原生运行与开发
+三个分支的管理页默认监听 `127.0.0.1:3210`。本机部署直接访问[管理页](http://127.0.0.1:3210)；服务器部署时，在自己的电脑建立 SSH 转发，将 `your-server` 替换为实际 SSH 主机别名或 `用户@服务器地址`：
+
+```bash
+ssh -N -L 127.0.0.1:13210:127.0.0.1:3210 your-server
+```
+
+然后打开[转发后的管理页](http://127.0.0.1:13210)，依次完成：
+
+1. 使用原生进程终端或 `sh deploy/podman.sh logs` 输出的一次性初始化码设置管理员密码。
+2. 填写 Milky 地址与令牌、LLBot WebUI 地址与密码，保存配置。
+3. 在「QQ 登录」获取二维码，使用手机 QQ 扫码确认。
+4. 填写聊天模型接口、密钥和模型 ID；接口支持时可使用「获取模型列表」。
+5. 选择人设、插件及模型工具，点击「保存并应用」，核对账号、运行状态与实际启用项。
+6. 按所选分支的验证命令试用；增强分支的向量和搜索能力另行配置。
+
+LLBot 尚未就绪时，可先初始化管理页并保存配置。扫码请求由小鱼服务端代理，远程管理只需转发 `3210`。
+
+「保存当前配置」只保存文件，「保存并应用」才更新运行实例。群、好友及支持的会话插件黑名单即时保存生效；群与好友默认开启。人设支持预览、编辑、另存及按会话选择，切换后保留历史和记忆。
+
+常用默认值为模型并发 2、后台整理并发 1、近期消息 24 条、输入 / 输出预算 6000 / 800、每轮至多 3 次模型请求和 2 次工具调用。预算按估算 token 数计算，各分支完整默认值以对应的 `config.example.toml` 为准。
+
+模型工具同时受全局允许列表、会话设置与插件开关约束。新模板增加的工具不会自动写入已有的显式名单；配置校验失败时，管理页显示原因，旧运行实例保持原配置。
+
+### 密钥配置
+
+| 环境变量 | 适用分支与用途 |
+| --- | --- |
+| `QKBOT_API_KEY` | 全部分支，聊天模型密钥 |
+| `QKBOT_MILKY_TOKEN` | 全部分支，Milky 访问令牌 |
+| `QKBOT_LLBOT_TOKEN` | 全部分支，LLBot WebUI 密码 |
+| `QKBOT_NONEBOT_TOKEN` | `master` 与增强分支，NoneBot 桥接令牌，至少 32 字节 |
+| `QKBOT_EMBEDDING_API_KEY` | 仅增强分支，独立向量密钥 |
+| `QKBOT_SEARCH_API_KEY` | 仅增强分支，Tavily 搜索密钥 |
+
+也可直接在管理页填写密钥，已有值不返回前端，留空保留原值。环境变量优先于配置文件，且须实际注入机器人进程；容器不会自动继承宿主 shell 中新增的变量。默认 Podman 脚本仅为聊天、Milky、LLBot 和 NoneBot 提供 secret 映射，增强分支的向量与搜索密钥可先通过管理页配置；使用环境变量时需自行配置容器或 Quadlet 注入。
+
+## 原生运行与开发检查
+
+三个分支均可原生编译。先使用对应分支的克隆命令取得源码，在项目根目录运行：
 
 ```bash
 cargo build --release --locked
 ./target/release/qkbot --config config.toml
 ```
 
-Windows 可使用 `.\scripts\cargo.ps1 build --release --locked`，运行 `.\target\release\qkbot.exe`。首次启动创建配置，管理页默认 http://127.0.0.1:3210。SQLite 随程序编译，无需另装数据库。
+Windows PowerShell：
 
-原生部署餐图功能时同时携带 `assets/native/meal/images`，可放在工作目录或可执行文件旁；也可用 `QKBOT_MEAL_IMAGES_DIR` 指向该目录。容器已包含图库，无需额外下载。该变量一旦设置便只使用指定目录，配置错误不会悄悄改用其他来源。
+```powershell
+.\scripts\cargo.ps1 build --release --locked
+.\target\release\qkbot.exe --config config.toml
+```
+
+首次运行创建配置。已有配置可用 `--config config.toml --check` 校验，该操作不连接 QQ 或模型。Windows 编译需要 MSVC C++ Build Tools；SQLite 随程序构建，无需安装独立数据库服务。
+
+`master` 与增强分支的图片绘制需要系统中文字体；原生餐图功能还应携带 `assets/native/meal/images`，放在工作目录或可执行文件旁，也可用 `QKBOT_MEAL_IMAGES_DIR` 指定目录。容器镜像已包含字体与餐图，`clean` 无需这些资源。
+
+常规开发检查：
 
 ```bash
 cargo test --all-targets --locked
@@ -97,16 +249,60 @@ cargo clippy --all-targets -- -D warnings
 node --test tests/admin_frontend.mjs
 ```
 
-运行核心无需 Node.js；Node 只用于开发测试与可复现基准。测试使用独立数据库和本地模拟协议／模型，不依赖真实 QQ 或模型密钥。
+Windows 使用工作区工具链时，可将 `cargo` 替换为 `.\scripts\cargo.ps1`。Rust 核心运行无需 Node.js；此处 Node.js 用于前端测试和性能基准，独立 LLBot 的运行依赖由其部署方式提供。
 
-## 实现与来源
+## 更新、备份与分支切换
 
-这是参考 [qkbot](https://github.com/zclkkk/qkbot) 插件思路重新实现的 Rust 项目，提示词与记忆设计参考 [dafeiyu-bot](https://github.com/SAKURAfan1023/dafeiyu-bot)。不会直接加载 TypeScript／Fraq 插件。
+同一分支升级可先执行 `git pull --ff-only`，再按该分支方式构建。Podman 的 `start` 会复用已有容器，**重新构建镜像后仍需按升级流程重建容器**，才会运行新代码。脚本与 Quadlet 两种管理方式的停机、换镜像和回滚步骤见[部署文档](docs/deployment.md#8-升级与回滚)。
 
-原生插件按实际上游实现核对后移植；外部平台频繁变化的功能通过 NoneBot 运行原版插件。兼容范围和差异分别记录在：
+分支切换应按一次部署迁移处理：
 
-- [原生功能对照](docs/native-reference.md)
-- [群与媒体功能对照](docs/social-reference.md)
-- [帮助菜单与图片实现](docs/render-reference.md)
-- [NoneBot 上游与适配说明](docs/nonebot-reference.md)
-- [资源来源与许可证](assets/native/README.md)
+1. 停止旧机器人并完整备份。原生版本保存配置、数据库及 `.qkbot-admin/`；容器版本导出整个数据卷，增强分支还需包含表情目录。LLBot 的授权、配置和登录态单独备份。
+2. 在独立源码目录准备目标分支，以目标分支的配置模板为基础逐项迁移。不同分支的工具注册表、配置字段和数据库迁移存在差异，较新配置或数据库不能保证直接用于较旧分支。
+3. 用独立配置、数据库副本或新数据卷验证目标版本，确认登录、历史、记忆和插件功能后再接管原服务。保留升级前数据以便回滚。
+
+默认端口相同，变更容器名称并不能避免端口冲突；两个机器人也不应同时连接同一 QQ 账号处理消息。SQLite WAL 运行期间不要只复制主数据库文件，备份与恢复步骤见[运维说明](docs/deployment.md#9-备份与恢复)。
+
+`master` 与增强分支还支持对仍保留的有效聊天原文进行历史记忆重整。备份后使用 `--rebuild-memory` 与 `--memory-rebuild-status` 管理任务；该操作可能调用模型，范围与命令见[历史记忆重整](docs/deployment.md#91-历史记忆重整)。`clean` 不提供这组维护命令。
+
+## 性能数据与测量范围
+
+当前归档中**没有三个分支最新版本在同一条件下的对比测试**。以下 Linux 数据来自 2026-10-20 的历史源码 `256dff38365dcb13be28e3d7537368198becd2af`，早于识图、向量检索、群表情和联网搜索等新增能力。
+
+测试服务器为 Debian 13.7、2 vCPU、约 1.90 GiB 内存，使用 rootless Podman 5.4.2。基准加载当时的 12 项原生插件，执行双群共 20 条聊天、工具调用、4 张 PNG、两群记忆提炼与召回；模型由本地服务模拟，每次请求固定等待 500 ms。
+
+| 历史测试指标 | Linux Rust 核心 |
+| --- | ---: |
+| 初始空闲 RSS 中位数 | 15.05 MiB |
+| 双群聊天期间采样 RSS 峰值 | 16.33 MiB |
+| 绘图与记忆流程后空闲 RSS 中位数 | 53.95 MiB |
+| 进程生命周期峰值 RSS | 53.95 MiB |
+| 聊天回复延迟中位数 / P95 | 505.50 / 508.79 ms |
+| 截至末次采样的进程累计 CPU 时间 | 0.21 秒 |
+| 发送账本确认 | 32 / 32 次 |
+| 摘要 / 长期记忆 / 召回验证 | 2 / 2 / 2 |
+
+这些数据仅统计机器人进程，LLBot、可选 NoneBot、浏览器、系统服务和开发工具应另计。内存采样峰值不代表生产上限，模拟模型耗时也不能作为真实模型延迟。完整环境、Windows 对照与原始数据见[性能报告](docs/performance.md)、[Linux 样本](docs/performance-podman-sample.json)和 [Windows 样本](docs/performance-sample.json)；`clean` 的早期基线见[该分支性能报告](https://github.com/Fox-yun/qkbot-r/blob/clean/docs/performance.md)。
+
+`master` 与增强分支可在 Linux Podman 主机安装 Node.js 22.13 或更高版本后，运行现有隔离基准：
+
+```bash
+sh deploy/podman.sh build
+node scripts/perf-smoke.mjs \
+  --container-image localhost/qkbot-r:latest \
+  --output target/perf-smoke/podman.json
+```
+
+基准使用独立配置、随机端口和数据库，保留 JSON 报告，通常约两分钟。现有脚本不覆盖向量服务、AI 群表情检索和 Tavily 搜索；新增能力的部署成本需另行测量。
+
+## 文档索引与来源
+
+| 分支 | 配置与使用 | 部署与架构 |
+| --- | --- | --- |
+| `clean` | [使用说明](https://github.com/Fox-yun/qkbot-r/blob/clean/README.md) · [配置示例](https://github.com/Fox-yun/qkbot-r/blob/clean/config.example.toml) | [架构说明](https://github.com/Fox-yun/qkbot-r/blob/clean/docs/architecture.md) |
+| `master` | [使用手册](https://github.com/Fox-yun/qkbot-r/blob/master/docs/user-guide.md) · [配置示例](https://github.com/Fox-yun/qkbot-r/blob/master/config.example.toml) | [部署与运维](https://github.com/Fox-yun/qkbot-r/blob/master/docs/deployment.md) · [架构说明](https://github.com/Fox-yun/qkbot-r/blob/master/docs/architecture.md) |
+| `codex/embedding-stickers` | [使用手册](https://github.com/Fox-yun/qkbot-r/blob/codex/embedding-stickers/docs/user-guide.md) · [配置示例](https://github.com/Fox-yun/qkbot-r/blob/codex/embedding-stickers/config.example.toml) · [联网搜索](docs/web-search.md) | [部署与运维](https://github.com/Fox-yun/qkbot-r/blob/codex/embedding-stickers/docs/deployment.md) · [架构说明](docs/architecture.md) |
+
+主分支与增强分支的功能来源、适配范围及资源许可另见[原生功能对照](docs/native-reference.md)、[群与媒体功能](docs/social-reference.md)、[帮助与图片渲染](docs/render-reference.md)、[NoneBot 适配](docs/nonebot-reference.md)和[资源来源与许可证](assets/native/README.md)。
+
+本项目参考 [qkbot](https://github.com/zclkkk/qkbot) 的插件设计，以 Rust 重新实现核心与原生功能；提示词和记忆设计参考 [dafeiyu-bot](https://github.com/SAKURAfan1023/dafeiyu-bot)。TypeScript / Fraq 插件不直接加载，兼容范围以各分支实际实现和功能对照文档为准。
