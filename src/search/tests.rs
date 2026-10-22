@@ -540,7 +540,9 @@ fn citations_reject_invented_links_and_keep_real_sources() {
     assert!(!text.contains("https://evil.invalid"));
     assert!(!text.contains("https://bad-title.invalid"));
     assert!(!text.contains("[s999]"));
-    assert!(text.contains("https://www.rust-lang.org/"));
+    assert!(text.starts_with("据（https://www.rust-lang.org/），"));
+    assert!(!text.contains("检索来源"));
+    assert!(!text.contains("[s1]"));
     assert!(citations.render(&"长".repeat(2000), 2048).is_err());
     let mut empty = citations::Citations::default();
     empty.add(&json!({"status":"failed"}));
@@ -549,6 +551,54 @@ fn citations_reject_invented_links_and_keep_real_sources() {
             .render("回答", 4096)
             .unwrap()
             .contains("未通过本次搜索核实")
+    );
+}
+
+#[test]
+fn citations_embed_multiple_sources_and_plain_text_links_without_a_footer() {
+    let mut sources = response();
+    sources.results.push(SearchResult {
+        source_id: "s2".into(),
+        url: "https://en.wikipedia.org/wiki/Rust_(programming_language)".into(),
+        ..sources.results[0].clone()
+    });
+    let mut citations = citations::Citations::default();
+    citations.add(&serde_json::to_value(sources).unwrap());
+    let url = "https://www.rust-lang.org/";
+    let wiki = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+    for (input, expected) in [
+        (
+            "第一点[s1]；第二点[s2]；再次[s1]。".to_owned(),
+            format!("第一点（{url}）；第二点（{wiki}）；再次（{url}）。"),
+        ),
+        (
+            format!("参见[官方]({url})和[百科]({wiki})。"),
+            format!("参见官方（{url}）和百科（{wiki}）。"),
+        ),
+        (
+            format!("正文（{url}），另见（{wiki}）。"),
+            format!("正文（{url}），另见（{wiki}）。"),
+        ),
+        (format!("See ({wiki})."), format!("See ({wiki}).")),
+        ("没有标注来源的原文。".into(), "没有标注来源的原文。".into()),
+    ] {
+        let rendered = citations.render(&input, expected.len()).unwrap();
+        assert_eq!(rendered, expected);
+        assert!(citations.render(&input, expected.len() - 1).is_err());
+    }
+    let forged = citations
+        .render(
+            "不能冒充 https://www.rust-lang.org/evil 或 https://www.rust-lang.org/?leak=secret",
+            4096,
+        )
+        .unwrap();
+    assert!(!forged.contains("https://"));
+    assert_eq!(forged.matches("[未核实链接]").count(), 2);
+    assert_eq!(
+        citations::Citations::default()
+            .render("未搜索时原样保留[s1]", 4096)
+            .unwrap(),
+        "未搜索时原样保留[s1]"
     );
 }
 

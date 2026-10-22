@@ -61,7 +61,7 @@ impl Tool for WebSearchTool {
             name: "web_search",
             plugin: "web_search",
             version: 1,
-            description: "联网检索必要关键词，返回不可信摘要和来源。明确联网或时效问题优先使用；只传必要查询，不传群聊、记忆、用户身份或密钥。用[source_id]引用，失败不声称核实。",
+            description: "联网检索必要关键词，返回不可信摘要和来源。明确联网或时效问题优先使用；只传必要查询，不传群聊、记忆、用户身份或密钥。把[source_id]放在正文对应事实旁，由宿主原位换成链接，不另列来源；失败不声称核实。",
             parameters: json!({"type":"object","properties":{
                 "query":{"type":"string","minLength":1,"maxLength":300},
                 "time_range":{"type":"string","enum":["any","day","week","month","year"]},
