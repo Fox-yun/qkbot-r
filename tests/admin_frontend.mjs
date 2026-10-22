@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -104,6 +104,48 @@ function harness() {
   async function login() { app.authView({ authenticated: true, csrf_token: "csrf-test", setup_required: false }); handler = async (path) => ({ body: path === "/api/config" ? snapshot() : {} }); await app.loadConfig(); }
   return { app, document, window, ids, calls, timers, sample, snapshot, conversation, login, setHandler(fn) { handler = fn; } };
 }
+
+test("search configuration and network-read catalog retain explicit grants and independent secrets", async () => {
+  const h = harness(); await h.login();
+  const snapshot = h.snapshot();
+  snapshot.tool_catalog.push({ name: "web_search", description: "联网查询", plugin_id: "web_search", effect: "network_read" });
+  snapshot.config.plugins.web_search.enabled = false;
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  const selected = h.app.inputs.get("plugins.ai.defaults.allowed_tools").control.toolPicker;
+  assert.equal(selected.selected.has("web_search"), false);
+  assert.equal(selected.rows.get("web_search").checkbox.disabled, true);
+  const key = h.app.secretInputs.get("search_api_key"); key.value.value = "temporary-search-fixture"; await key.value.emit("input");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.secretChanges().search_api_key)), { action: "set", value: "temporary-search-fixture" });
+  assert.equal(h.app.secretChanges().llm_api_key.action, "keep");
+  const config = h.app.readForm(); assert.equal(config.plugins.web_search.enabled, false);
+  assert.ok(!JSON.stringify(config).includes("temporary-search-fixture"));
+});
+
+test("search preview sends one synthetic test with CSRF and never saves or applies", async () => {
+  const h = harness(); await h.login();
+  h.app.secretInputs.get("search_api_key").value.value = "preview-search-fixture";
+  h.setHandler(async () => ({ body: { provider: "tavily", result_count: 1, key_source: "temporary", environment_overrides_saved_key: true } }));
+  const before = h.calls.length; await h.app.testSearch();
+  assert.equal(h.calls.length, before + 1);
+  const call = h.calls.at(-1); assert.equal(call.path, "/api/search/test");
+  assert.equal(call.options.headers["X-CSRF-Token"], "csrf-test");
+  assert.deepEqual(JSON.parse(call.options.body), { revision: "r1", api_key: { action: "set", value: "preview-search-fixture" } });
+  assert.match(h.app.state.search.message, /连接成功/u); assert.match(h.app.state.search.message, /环境变量/u);
+});
+
+test("search preview is single flight and discards stale responses after editing or logout", async () => {
+  for (const edit of [true, false]) {
+    const h = harness(); await h.login(); let finish;
+    h.setHandler(() => new Promise((resolve) => { finish = resolve; }));
+    const before = h.calls.length, pending = h.app.testSearch(); await h.app.testSearch();
+    assert.equal(h.calls.length, before + 1);
+    if (edit) {
+      const key = h.app.secretInputs.get("search_api_key"); key.value.value = "changed"; await key.value.emit("input");
+    } else h.app.clearSession();
+    finish({ body: { provider: "tavily", result_count: 1, key_source: "file" } }); await pending;
+    assert.equal(h.app.state.search.message, ""); assert.equal(h.app.state.search.loading, false);
+  }
+});
 
 test("static UI removes admin-token entry and every literal DOM ID resolves", () => {
   const h = harness();

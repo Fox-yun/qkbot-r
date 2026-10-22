@@ -8,6 +8,7 @@ pub mod render;
 pub mod roll;
 pub mod roulette;
 pub mod social;
+pub mod web_search;
 
 use crate::{
     config::Config,
@@ -41,6 +42,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
         dependencies: &["host"],
     })?;
     plugins.register_handler(std::sync::Arc::new(clock::ClockPlugin))?;
+    plugins.register_handler(std::sync::Arc::new(web_search::WebSearchPlugin))?;
     plugins.register_handler(std::sync::Arc::new(reminder::ReminderPlugin))?;
     plugins.register_handler(std::sync::Arc::new(crate::catalog::HelpPlugin))?;
     plugins.register_handler(std::sync::Arc::new(roll::RollPlugin))?;
@@ -64,6 +66,9 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     if config.plugins.clock.enabled {
         enabled.insert("clock".into());
     }
+    if config.plugins.web_search.enabled {
+        enabled.insert("web_search".into());
+    }
     if config.plugins.reminder.enabled {
         enabled.insert("reminder".into());
     }
@@ -82,6 +87,7 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     let mut tools = ToolRegistry::new();
     crate::tools::register_reply(&mut tools)?;
     clock::register(&mut tools)?;
+    web_search::register(&mut tools, &config.plugins.web_search)?;
     reminder::register(&mut tools, config.plugins.reminder.max_active_per_user)?;
     for name in &config.plugins.ai.defaults.allowed_tools {
         anyhow::ensure!(

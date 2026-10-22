@@ -145,6 +145,15 @@ pub fn features(config: &Config) -> Vec<Feature> {
             enabled: config.plugins.native.enabled.iter().any(|s| s == id),
         })
         .collect();
+    entries.push(Feature {
+        id: "web_search".into(),
+        name: "联网搜索".into(),
+        description: "/搜索 关键词；向 Tavily 发送查询并返回摘要和来源，可能产生费用".into(),
+        runtime: "rust".into(),
+        commands: vec!["/搜索".into(), "/search".into()],
+        group_only: false,
+        enabled: config.plugins.web_search.enabled,
+    });
     entries.extend(config.nonebot.plugins.iter().map(|p| Feature {
         id: p.id.clone(),
         name: p.name.clone(),

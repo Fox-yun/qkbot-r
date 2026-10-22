@@ -12,6 +12,7 @@ pub mod milky;
 pub mod personas;
 pub mod plugin;
 pub mod plugins;
+pub mod search;
 pub mod store;
 pub mod tools;
 pub mod types;

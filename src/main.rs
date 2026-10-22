@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n--rebuild-memory TASK [--rebuild-max-batches N] 补整理当前会话保留的可学历史，同名任务可续跑；不启动机器人、不改变摘要和正常游标。\n--memory-rebuild-status TASK 查看回扫统计。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN、QKBOT_NONEBOT_TOKEN"
+                    "qkbot [--config config.toml] [--check]\n--check 只校验配置，不连接 QQ 或模型。\n--rebuild-memory TASK [--rebuild-max-batches N] 补整理当前会话保留的可学历史，同名任务可续跑；不启动机器人、不改变摘要和正常游标。\n--memory-rebuild-status TASK 查看回扫统计。\n首次启动自动创建配置，在终端显示管理地址和一次性初始化码，用于设置管理员密码。\n密钥环境变量：QKBOT_API_KEY、QKBOT_SEARCH_API_KEY、QKBOT_MILKY_TOKEN、QKBOT_LLBOT_TOKEN、QKBOT_NONEBOT_TOKEN"
                 );
                 return Ok(());
             }

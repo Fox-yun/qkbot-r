@@ -8,6 +8,7 @@ pub mod plugins;
 pub mod qq;
 pub mod qq_service;
 pub mod runtime;
+pub mod search;
 pub mod settings;
 pub mod stickers;
 
@@ -44,6 +45,7 @@ pub struct AdminState {
     contacts: ContactsService,
     models: ModelsService,
     embedding: embedding::EmbeddingTestService,
+    search: search::SearchTestService,
     mutations: tokio_util::task::TaskTracker,
 }
 impl AdminState {
@@ -57,6 +59,7 @@ impl AdminState {
             contacts: ContactsService::new(store.clone(), runtime.clone()),
             models: ModelsService::new(store.clone()),
             embedding: embedding::EmbeddingTestService::new(store.clone()),
+            search: search::SearchTestService::new(store.clone()),
             store,
             runtime,
             auth,
@@ -86,6 +89,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/config", get(config).put(save))
         .route("/api/llm/models", post(model_list))
         .route("/api/embedding/test", post(embedding_test))
+        .route("/api/search/test", post(search_test))
         .route("/api/runtime/apply", post(apply))
         .route("/api/runtime/stop", post(stop))
         .route("/api/qq/status", get(qq_status))
@@ -583,6 +587,16 @@ async fn operation(
     Path(id): Path<String>,
 ) -> Response {
     result(async { s.memories().await?.operation(&actor(a), &id).await }.await)
+}
+
+async fn search_test(
+    State(s): State<Arc<AdminState>>,
+    request: std::result::Result<Json<search::SearchTestRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return error(StatusCode::BAD_REQUEST, "搜索测试请求无效");
+    };
+    result(s.search.test(request).await)
 }
 
 async fn embedding_test(

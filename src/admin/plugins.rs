@@ -222,14 +222,14 @@ mod tests {
         let path = dir.path().join("switches.db");
         let store = Store::open(&path, 32).await.unwrap();
         let initial = read(&store, scope(1), features()).await.unwrap();
-        assert_eq!(initial.plugins.len(), 19);
+        assert_eq!(initial.plugins.len(), 20);
         assert_eq!(
             initial
                 .plugins
                 .iter()
                 .filter(|p| p.runtime == "rust")
                 .count(),
-            13
+            14
         );
         assert_eq!(
             initial

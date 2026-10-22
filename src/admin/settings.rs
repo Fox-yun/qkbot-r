@@ -39,6 +39,7 @@ impl fmt::Debug for SecretChange {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecretUpdates {
+    pub search_api_key: SecretChange,
     pub llm_api_key: SecretChange,
     pub embedding_api_key: SecretChange,
     pub milky_access_token: SecretChange,
@@ -108,6 +109,7 @@ impl std::error::Error for RevisionConflict {}
 
 #[derive(Clone, Default)]
 struct Environment {
+    search_api_key: Option<String>,
     llm_api_key: Option<String>,
     embedding_api_key: Option<String>,
     milky_access_token: Option<String>,
@@ -118,6 +120,7 @@ struct Environment {
 impl Environment {
     fn read() -> Self {
         Self {
+            search_api_key: std::env::var("QKBOT_SEARCH_API_KEY").ok(),
             llm_api_key: std::env::var("QKBOT_API_KEY").ok(),
             embedding_api_key: std::env::var("QKBOT_EMBEDDING_API_KEY").ok(),
             milky_access_token: std::env::var("QKBOT_MILKY_TOKEN").ok(),
@@ -127,6 +130,9 @@ impl Environment {
         }
     }
     fn apply(&self, config: &mut Config) {
+        if let Some(value) = &self.search_api_key {
+            config.plugins.web_search.api_key = value.clone();
+        }
         if let Some(value) = &self.embedding_api_key {
             config.embedding.api_key = value.clone();
         }
@@ -426,6 +432,7 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
         .err()
         .map(|error| error.to_string());
     let secrets = json!({
+        "search_api_key": secret_status(&config.plugins.web_search.api_key, &environment.search_api_key),
         "llm_api_key": secret_status(&config.llm.api_key, &environment.llm_api_key),
         "embedding_api_key": secret_status(&config.embedding.api_key, &environment.embedding_api_key),
         "milky_access_token": secret_status(config.milky.access_token.as_deref().unwrap_or(""), &environment.milky_access_token),
@@ -433,6 +440,7 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
         "nonebot_token": secret_status(&config.nonebot.token, &environment.nonebot_token),
     });
     config.llm.api_key.clear();
+    config.plugins.web_search.api_key.clear();
     config.embedding.api_key.clear();
     config.milky.access_token = None;
     config.web.token.clear();
@@ -485,6 +493,7 @@ fn save_file_cached(
     );
     ensure!(
         config.llm.api_key.is_empty()
+            && config.plugins.web_search.api_key.is_empty()
             && config.embedding.api_key.is_empty()
             && config
                 .milky
@@ -511,6 +520,10 @@ fn save_file_cached(
         );
     }
     config.llm.api_key = change_secret(&previous.llm.api_key, &request.secrets.llm_api_key)?;
+    config.plugins.web_search.api_key = change_secret(
+        &previous.plugins.web_search.api_key,
+        &request.secrets.search_api_key,
+    )?;
     config.embedding.api_key = change_secret(
         &previous.embedding.api_key,
         &request.secrets.embedding_api_key,
@@ -741,6 +754,47 @@ mod tests {
         fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
         (directory, path, Environment::default())
     }
+
+    #[test]
+    fn search_secret_lifecycle_redaction_and_environment_override() {
+        let (_directory, path, _) = fixture();
+        let environment = Environment::default();
+        let mut update = request(&path, &environment);
+        update.secrets.search_api_key = SecretChange::Set {
+            value: "search-file-fixture".into(),
+        };
+        let view = save_file(&path, update, &environment).unwrap();
+        assert_eq!(view["config"]["plugins"]["web_search"]["api_key"], "");
+        assert_eq!(view["secrets"]["search_api_key"]["file_set"], true);
+        assert!(!view.to_string().contains("search-file-fixture"));
+        save_file(&path, request(&path, &environment), &environment).unwrap();
+        assert_eq!(
+            Config::load_raw(&path).unwrap().plugins.web_search.api_key,
+            "search-file-fixture"
+        );
+        let mut illegal = request(&path, &environment);
+        illegal.config.plugins.web_search.api_key = "plaintext".into();
+        assert!(save_file(&path, illegal, &environment).is_err());
+        let environment = Environment {
+            search_api_key: Some("search-env-fixture".into()),
+            ..Default::default()
+        };
+        let mut update = request(&path, &environment);
+        update.secrets.search_api_key = SecretChange::Clear;
+        let view = save_file(&path, update, &environment).unwrap();
+        assert_eq!(view["secrets"]["search_api_key"]["file_set"], false);
+        assert_eq!(view["secrets"]["search_api_key"]["source"], "environment");
+        let mut saved = Config::load_raw(&path).unwrap();
+        assert!(saved.plugins.web_search.api_key.is_empty());
+        environment.apply(&mut saved);
+        assert_eq!(saved.plugins.web_search.api_key, "search-env-fixture");
+        assert!(!format!("{saved:?}").contains("search-env-fixture"));
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("search-env-fixture")
+        );
+    }
     fn request(path: &Path, environment: &Environment) -> SaveRequest {
         let view = snapshot(&read_file(path).unwrap(), environment).unwrap();
         serde_json::from_value(json!({"revision":view["revision"],"config":view["config"]}))
@@ -759,7 +813,11 @@ mod tests {
         let view = snapshot(&before, &environment).unwrap();
         let catalog = crate::plugins::tool_catalog(&config).unwrap();
         assert_eq!(view["tool_catalog"], json!(catalog));
-        assert_eq!(catalog.len(), 6);
+        assert_eq!(catalog.len(), 7);
+        assert!(
+            catalog.iter().any(|tool| tool.name == "web_search"
+                && tool.effect == crate::tools::Effect::NetworkRead)
+        );
         let reply = catalog
             .iter()
             .find(|entry| entry.name == "reply_message")
@@ -784,11 +842,14 @@ mod tests {
         );
         for entry in &catalog {
             assert!(!entry.name.is_empty() && !entry.description.is_empty());
-            assert!(matches!(entry.plugin_id, "clock" | "reminder" | "ai"));
+            assert!(matches!(
+                entry.plugin_id,
+                "clock" | "reminder" | "ai" | "web_search"
+            ));
             let value = serde_json::to_value(entry).unwrap();
             assert!(matches!(
                 value["effect"].as_str(),
-                Some("read" | "local_write" | "reply" | "async_read")
+                Some("read" | "local_write" | "reply" | "async_read" | "network_read")
             ));
             assert_eq!(value.as_object().unwrap().len(), 4);
         }
@@ -1007,6 +1068,7 @@ mod tests {
         let (_directory, path, _) = fixture();
         let environment = Environment {
             llm_api_key: Some("env-model-fixture".into()),
+            search_api_key: Some("env-search-fixture".into()),
             embedding_api_key: Some("env-embedding-fixture".into()),
             milky_access_token: Some("env-milky-fixture".into()),
             admin_token: Some("env-admin-fixture-at-least-32-bytes".into()),

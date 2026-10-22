@@ -65,8 +65,25 @@ impl Source {
 pub(crate) struct Authorization {
     sources: Vec<Source>,
     sticker: Option<(i64, i64, String)>,
+    external_operations: Vec<String>,
+    requires_reply_tool: bool,
 }
 impl Authorization {
+    pub(crate) fn external(operations: Vec<String>) -> Self {
+        Self {
+            sources: vec![],
+            sticker: None,
+            external_operations: operations,
+            requires_reply_tool: false,
+        }
+    }
+    pub(crate) fn with_external(mut self, operations: Vec<String>) -> Self {
+        self.external_operations = operations;
+        self
+    }
+    pub(crate) fn requires_reply_tool(&self) -> bool {
+        self.requires_reply_tool
+    }
     pub(crate) fn check_sources(
         &self,
         db: &Connection,
@@ -74,6 +91,9 @@ impl Authorization {
         guard: &ContextGuard,
     ) -> Result<()> {
         crate::host::check_guard(db, guard)?;
+        for operation in &self.external_operations {
+            crate::tools::check_external_result(db, operation)?;
+        }
         for source in &self.sources {
             source.check(db, scope, guard)?;
         }
@@ -374,6 +394,8 @@ impl References {
         let authorization = Authorization {
             sources,
             sticker: None,
+            external_operations: vec![],
+            requires_reply_tool: true,
         };
         authorization.check(db, &self.scope, guard)?;
         Ok(PreparedReply {

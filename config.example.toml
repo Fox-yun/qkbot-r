@@ -117,6 +117,22 @@ media_max_bytes = 20971520
 # 省略 plugins 时自动载入六项已核对预设，均默认关闭，在 Web 勾选。
 # 显式 plugins = [] 可清空；完整定义见 sidecar/nonebot/catalog.json。
 
+# 联网搜索默认关闭；密钥可用 QKBOT_SEARCH_API_KEY 覆盖。
+# AI 使用需另在 plugins.ai.defaults.allowed_tools 加入 web_search；已有会话单独授权。
+[plugins.web_search]
+enabled = false
+provider = "tavily"
+api_key = ""
+max_results = 5
+request_timeout_secs = 8      # 必须小于 limits.tool_timeout_secs
+max_response_bytes = 262144
+max_output_bytes = 6144
+max_concurrent_requests = 2
+max_calls_per_turn = 1
+user_per_hour = 10
+conversation_per_hour = 30
+global_per_hour = 60
+
 [limits]
 # 保护队列、成本和超时的运行边界，不是内存达标线；可按实际用途调整。
 queued_global = 32

@@ -14,11 +14,16 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tokio_util::sync::CancellationToken;
+mod external;
+pub(crate) use external::check_external_result;
+pub use external::{ExternalInvalidated, ExternalQuota, ExternalTool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
+    /// External reads may disclose a query and incur provider charges.
+    NetworkRead,
     /// Network-backed bounded reads, handled outside the SQLite gateway.
     AsyncRead,
     LocalWrite,
@@ -56,6 +61,9 @@ pub struct ToolResult {
 
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    fn external(&self) -> Option<&dyn ExternalTool> {
+        None
+    }
     /// Tool policy is checked independently from the plugin's command/event
     /// filter, including immediately before a confirmed operation commits.
     fn permits(&self, _scope: &Scope, _actor: i64) -> bool {
@@ -261,6 +269,7 @@ pub struct ToolContext {
     pub guard: ContextGuard,
     pub ai_epoch: i64,
     pub provider_epochs: BTreeMap<String, i64>,
+    pub plugin_revisions: BTreeMap<String, i64>,
     pub turn_id: String,
     pub received_at: i64,
     pub cancel: CancellationToken,
@@ -289,6 +298,7 @@ pub struct Gateway {
     registry: ToolRegistry,
     allowed: BTreeSet<String>,
     runtime_epochs: Arc<OnceLock<BTreeMap<String, i64>>>,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -387,7 +397,7 @@ fn apply_and_record(
     }
 }
 
-fn plugin_epoch(tx: &Transaction<'_>, id: &str) -> Result<i64> {
+fn plugin_epoch(tx: &rusqlite::Connection, id: &str) -> Result<i64> {
     let row = tx
         .query_row(
             "SELECT epoch,enabled FROM plugin_states WHERE id=?1",
@@ -401,7 +411,7 @@ fn plugin_epoch(tx: &Transaction<'_>, id: &str) -> Result<i64> {
     }
 }
 
-fn authorize(tx: &Transaction<'_>, ctx: &BoundContext, plugin: &str) -> Result<()> {
+fn authorize(tx: &rusqlite::Connection, ctx: &BoundContext, plugin: &str) -> Result<()> {
     crate::access::check_revision(tx, &ctx.scope.key(), ctx.access_revision)?;
     ensure!(
         plugin_epoch(tx, plugin)? == ctx.provider_epoch,
@@ -459,10 +469,12 @@ impl Gateway {
             registry,
             allowed: allowed_tools.into_iter().collect(),
             runtime_epochs: Arc::new(OnceLock::new()),
+            cancel: CancellationToken::new(),
         })
     }
     pub async fn migrate(&self) -> Result<()> {
         self.store.migrate("tools", 1, MIGRATION).await?;
+        self.migrate_external().await?;
         if self.runtime_epochs.get().is_none() {
             let epochs = self
                 .store
@@ -492,7 +504,9 @@ impl Gateway {
         self.store.call(move |conn| {
             let tx=conn.transaction()?;
             tx.execute("UPDATE tool_runs SET status='expired' WHERE status='pending_confirmation' AND expires_at<=?1",[now()])?;
-            tx.execute("DELETE FROM tool_runs WHERE status IN ('expired','rejected','failed','succeeded') AND created_at<?1",[now()-retention_seconds.max(300)])?;
+            tx.execute("UPDATE tool_runs SET status='cancelled',result_json=NULL,receipt=NULL WHERE status='executing' AND created_at<?1 AND operation_id IN (SELECT operation_id FROM external_tool_usage)",[now()-60])?;
+            tx.execute("DELETE FROM tool_runs WHERE status IN ('expired','rejected','failed','succeeded','cancelled') AND created_at<?1",[now()-retention_seconds.max(3600)])?;
+            tx.execute("DELETE FROM external_tool_usage WHERE created_at<?1 AND operation_id NOT IN (SELECT operation_id FROM tool_runs)",[now()-3600])?;
             tx.commit()?;Ok(())
         }).await
     }
@@ -510,10 +524,20 @@ impl Gateway {
         cancel: CancellationToken,
     ) -> Result<ToolContext> {
         let epochs = self.epochs()?.clone();
+        let plugins: Vec<String> = epochs.keys().cloned().collect();
         let key = scope.key();
-        let access_revision = self
+        let (access_revision, plugin_revisions) = self
             .store
-            .call(move |db| crate::access::require_enabled(db, &key))
+            .call(move |db| {
+                let access = crate::access::require_enabled(db, &key)?;
+                let mut revisions = BTreeMap::new();
+                for plugin in plugins {
+                    if let Some(revision) = crate::catalog::allowed_revision(db, &key, &plugin)? {
+                        revisions.insert(plugin, revision);
+                    }
+                }
+                Ok((access, revisions))
+            })
             .await?;
         Ok(ToolContext {
             scope,
@@ -521,6 +545,7 @@ impl Gateway {
             guard,
             ai_epoch,
             provider_epochs: epochs,
+            plugin_revisions,
             turn_id,
             received_at,
             cancel,
@@ -554,10 +579,19 @@ impl Gateway {
                 continue;
             }
             let plugin = spec.plugin.to_owned();
+            let expected_revision = ctx.plugin_revisions.get(spec.plugin).copied();
             if !self
                 .store
                 .call(move |conn| {
                     let tx = conn.transaction()?;
+                    if spec.effect == Effect::NetworkRead
+                        && (expected_revision.is_none()
+                            || crate::catalog::allowed_revision(&tx, &bound.scope.key(), &plugin)?
+                                != expected_revision
+                            || external::check_conversation(&tx, &bound, spec.name).is_err())
+                    {
+                        return Ok(false);
+                    }
                     Ok(authorize(&tx, &bound, &plugin).is_ok())
                 })
                 .await?
@@ -574,7 +608,9 @@ impl Gateway {
         ensure!(self.allowed.contains(name), "tool is not allowed");
         let tool = self.registry.get(name)?;
         let spec = tool.spec();
-        require_transaction_tool(&spec)?;
+        if spec.effect != Effect::NetworkRead {
+            require_transaction_tool(&spec)?;
+        }
         ensure!(
             tool.permits(&ctx.scope, ctx.actor_id),
             "tool is not permitted in this context"
@@ -606,8 +642,27 @@ impl Gateway {
             spec.name,
             canonical(&normalized)?
         ));
-        self.run(tool, normalized, bound, operation, true, ctx.cancel.clone())
+        if spec.effect == Effect::NetworkRead {
+            let revision = ctx
+                .plugin_revisions
+                .get(spec.plugin)
+                .copied()
+                .ok_or(ExternalInvalidated)?;
+            self.run_external(
+                tool,
+                normalized,
+                bound,
+                operation,
+                ctx.turn_id.clone(),
+                Some(revision),
+                None,
+                ctx.cancel.clone(),
+            )
             .await
+        } else {
+            self.run(tool, normalized, bound, operation, true, ctx.cancel.clone())
+                .await
+        }
     }
 
     /// Explicit host-parsed user commands use exactly the same local business code.
@@ -652,8 +707,11 @@ impl Gateway {
     ) -> Result<ToolOutcome> {
         let tool = self.registry.get(name)?;
         let spec = tool.spec();
-        require_transaction_tool(&spec)?;
+        if spec.effect != Effect::NetworkRead {
+            require_transaction_tool(&spec)?;
+        }
         let key = scope.key();
+        let external_source = source_key.clone();
         let access_revision = self
             .store
             .call(move |db| match source_key {
@@ -678,6 +736,31 @@ impl Gateway {
             provider_epoch: epoch,
             access_revision,
         };
+        if spec.effect == Effect::NetworkRead {
+            let turn = external_source
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let operation = hash(&format!(
+                "{}|{}|{}|{}|{}",
+                turn,
+                bound.scope.key(),
+                actor,
+                spec.name,
+                canonical(&normalized)?
+            ));
+            return self
+                .run_external(
+                    tool,
+                    normalized,
+                    bound,
+                    operation,
+                    turn,
+                    None,
+                    external_source,
+                    self.cancel.clone(),
+                )
+                .await;
+        }
         self.run(
             tool,
             normalized,

@@ -15,6 +15,7 @@
     scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
     embedding: { version: 0, loading: false, message: "", kind: "" },
+    search: { version: 0, loading: false, message: "", kind: "" },
     stickers: { version: 0, groupRequest: 0, itemRequest: 0, groupsLoading: false, loading: false, groups: [], groupPage: 1, totalGroupPages: 1, scope: "", rows: [], page: 1, totalPages: 1, total: 0, index: null, running: false, message: "", kind: "", operation: null, preview: null },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
   };
@@ -22,6 +23,7 @@
   const secretInputs = new Map();
   let pluginControls = null;
   let embeddingControls = null;
+  let searchControls = null;
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const get = (object, path) => path.split(".").reduce((value, key) => value?.[key], object);
   const put = (object, path, value) => {
@@ -98,6 +100,20 @@
       field("plugins.ai.read_group_background", "读取群内背景消息", "check", "未触发的群消息也可进入上下文，与长期记忆学习独立。"),
       field("plugins.ai.learn_all_group_messages", "学习群内背景消息", "check", "未触发的群消息也可用于长期记忆；仍受记忆写入开关约束。"),
       field("plugins.ai.defaults.paused", "默认暂停自动聊天", "check", "可在「记忆与上下文」恢复或只放行一次回复。"),
+    ] },
+    { title: "联网搜索", description: "将查询关键词发送至 Tavily，可能产生费用。配置完成后启用；AI 使用还需勾选 web_search 工具，会话独立工具设置继续生效。", search: true, fields: [
+      field("plugins.web_search.enabled", "启用联网搜索", "check", "提供 /搜索 和 /search 命令；群/好友可单独关闭。"),
+      field("plugins.web_search.provider", "搜索供应商", "select", "", { choices: [["tavily", "Tavily"]] }),
+      { secret: "search_api_key", label: "Tavily API 密钥" },
+      field("plugins.web_search.max_results", "最多结果数", "number", "", { min: 1, max: 5 }),
+      field("plugins.web_search.request_timeout_secs", "搜索超时（秒）", "number", "须短于工具总超时；超时不重试。", { min: 1, max: 12 }),
+      field("plugins.web_search.max_response_bytes", "响应字节上限", "number", "", { min: 4096, max: 1048576 }),
+      field("plugins.web_search.max_output_bytes", "工具输出字节上限", "number", "", { min: 2048, max: 8192 }),
+      field("plugins.web_search.max_concurrent_requests", "搜索并发上限", "number", "", { min: 1, max: 16 }),
+      field("plugins.web_search.max_calls_per_turn", "每轮搜索上限", "number", "同轮相同参数复用结果；失败请求也计入额度。", { min: 1, max: 2 }),
+      field("plugins.web_search.user_per_hour", "每人每小时搜索上限", "number", "", { min: 1, max: 100000 }),
+      field("plugins.web_search.conversation_per_hour", "每个会话每小时搜索上限", "number", "", { min: 1, max: 100000 }),
+      field("plugins.web_search.global_per_hour", "全局每小时搜索上限", "number", "", { min: 1, max: 100000 }),
     ] },
     { title: "插件", description: "启用需要的功能。写入类工具默认要求用户确认。", fields: [
       field("plugins.ai.enabled", "AI 聊天", "check", "启用后需配置有效的模型地址和名称。"),
@@ -231,7 +247,7 @@
       status.textContent = describeSecret(definition.secret) + (controls.clear ? " 已标记清除文件中的密钥，保存后生效。" : " 留空保持原密钥，输入后随配置保存。");
     };
     wrapper.append(input, clearButton, status); secretInputs.set(definition.secret, controls); refresh();
-    const changed = () => { if (definition.secret === "llm_api_key") invalidateModels(); if (definition.secret === "embedding_api_key") invalidateEmbeddingTest(); refresh(); markDirty(); };
+    const changed = () => { if (definition.secret === "llm_api_key") invalidateModels(); if (definition.secret === "embedding_api_key") invalidateEmbeddingTest(); if (definition.secret === "search_api_key") invalidateSearchTest(); refresh(); markDirty(); };
     clearButton.addEventListener("click", () => {
       if (controls.clear) { controls.clear = false; input.value = controls.undoValue; controls.undoValue = ""; }
       else { controls.clear = true; controls.undoValue = input.value; input.value = ""; }
@@ -358,12 +374,39 @@
     }
   }
 
+  function invalidateSearchTest() {
+    state.search.version++; state.search.message = ""; state.search.kind = ""; renderSearchTest();
+  }
+  function renderSearchTest() {
+    if (!searchControls) return;
+    searchControls.button.textContent = state.search.loading ? "正在测试…" : "测试搜索连接";
+    searchControls.message.textContent = state.search.message || (state.search.loading ? "正在检索测试关键词…" : "测试固定关键词 Rust programming language，发出一次可能计费的请求，不保存配置。环境变量 QKBOT_SEARCH_API_KEY 优先于文件密钥。");
+    searchControls.message.className = "hint" + (state.search.kind === "error" ? " error-text" : "");
+    updateControls();
+  }
+  async function testSearch() {
+    if (!state.authenticated || !state.config || state.search.loading || state.busy || state.jsonDirty || state.pendingOperation || state.stale) return;
+    const request = { session: state.session, version: state.search.version, revision: state.revision };
+    const current = () => state.authenticated && state.session === request.session && state.search.version === request.version && state.revision === request.revision && !state.jsonDirty;
+    try {
+      state.search.loading = true; state.search.message = ""; state.search.kind = ""; renderSearchTest();
+      const response = await api("/api/search/test", "POST", { revision: request.revision, api_key: secretChange(secretInputs.get("search_api_key")) });
+      if (!current()) return;
+      if (response.provider !== "tavily" || !Number.isInteger(response.result_count) || response.result_count < 0 || response.result_count > 1) throw new Error("搜索测试返回无效结果。");
+      state.search.message = `连接成功，收到 ${response.result_count} 条结果。配置尚未保存或应用。` + (response.environment_overrides_saved_key ? " 保存后环境变量仍优先于文件密钥。" : "");
+    } catch (error) {
+      if (!current() || error.status === -1 || error.code === "auth_required") return;
+      state.search.message = error.message || "搜索测试失败"; state.search.kind = "error";
+      if (error.code === "csrf_invalid") report(error);
+    } finally { state.search.loading = false; renderSearchTest(); }
+  }
+
   function validatePersonaMap(value, requireText = true) {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.entries(value).some(([name, text]) => !name.trim() || typeof text !== "string" || (requireText && !text.trim()))) throw new Error("自定义人设需要有效名称和非空正文。");
   }
 
   function validateToolCatalog(value) {
-    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "async_read", "local_write", "reply"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
+    if (!Array.isArray(value) || value.length > 4096 || value.some((tool) => !tool || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string" || typeof tool.plugin_id !== "string" || !tool.plugin_id || !["read", "network_read", "async_read", "local_write", "reply"].includes(tool.effect)) || new Set(value.map((tool) => tool.name)).size !== value.length) throw new Error("工具目录格式无效，请重新载入配置。");
   }
   function toolUnavailable(tool, mode) {
     if (!tool) return "未注册的旧工具，可取消选择";
@@ -400,7 +443,7 @@
       checkbox.setAttribute("aria-label", name + (unavailable ? "，" + unavailable : ""));
       const copy = element("span", "tool-copy"); copy.append(element("strong", "tool-name", name));
       if (tool) {
-        const effectLabel = { read: "只读", async_read: "异步只读", local_write: "本地写入", reply: "本轮回复" }[tool.effect];
+        const effectLabel = { read: "只读", network_read: "联网查询 · 可能计费", async_read: "异步只读", local_write: "本地写入", reply: "本轮回复" }[tool.effect];
         copy.append(element("span", "tool-meta", `${effectLabel} · ${tool.plugin_id}`));
         copy.append(element("span", "tool-description", tool.description));
       }
@@ -531,6 +574,7 @@
       if (definition.path === "llm.chat_completions_url") invalidateModels();
       if (definition.path === "llm.model") renderModels();
       if (definition.path.startsWith("embedding.")) invalidateEmbeddingTest();
+      if (definition.path.startsWith("plugins.web_search.")) invalidateSearchTest();
       if (definition.path.startsWith("plugins.") && definition.path.endsWith(".enabled")) refreshToolPickers();
       markDirty();
     });
@@ -602,7 +646,7 @@
     const card = element("section", "card plugin-config");
     card.append(element("h2", "", "插件功能"), element("p", "muted", "勾选是待保存的全局配置，实际运行以「当前运行已启用」为准。保存并应用成功后才会生效；会话开关只控制群或好友是否允许使用。"));
     const nativeList = element("div", "plugin-grid"), nativeChecks = new Map();
-    const known = new Map(state.pluginCatalog.filter((entry) => entry.runtime === "rust").map((entry) => [entry.id, entry]));
+    const known = new Map(state.pluginCatalog.filter((entry) => entry.runtime === "rust" && entry.id !== "web_search").map((entry) => [entry.id, entry]));
     for (const id of native.enabled || []) if (!known.has(id)) known.set(id, { id, name: id + "（已保存但未注册）", description: "保留原选择，可取消后修复配置。" });
     for (const item of known.values()) pluginCheck(nativeList, item.id, item.name, item.description, (native.enabled || []).includes(item.id), nativeChecks);
     card.append(nativeList);
@@ -652,6 +696,7 @@
     const personaManager = $("persona-manager"), modelPicker = $("model-picker");
     state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
     state.embedding.version++; state.embedding.message = ""; state.embedding.kind = ""; embeddingControls = null;
+    state.search.version++; state.search.message = ""; state.search.kind = ""; searchControls = null;
     inputs.clear(); secretInputs.clear();
     $("config-groups").replaceChildren();
     groups.forEach((group, index) => {
@@ -671,12 +716,18 @@
         button.addEventListener("click", () => { void testEmbedding(); });
         row.append(button, message); card.append(row); embeddingControls = { button, message };
       }
+      if (group.search) {
+        const row = element("div", "field full"), button = element("button", "secondary", "测试搜索连接"), message = element("p", "hint");
+        button.type = "button"; button.id = "search-test"; message.id = "search-test-message";
+        button.addEventListener("click", () => { void testSearch(); });
+        row.append(button, message); card.append(row); searchControls = { button, message };
+      }
       if (group.personas) card.append(personaManager); $("config-groups").append(card);
     });
     renderPluginConfig(pending);
     const web = state.config.web || {};
     $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
-    renderPersonaLibrary(); renderModels(); renderEmbeddingTest(); refreshToolPickers(); updateControls();
+    renderPersonaLibrary(); renderModels(); renderEmbeddingTest(); renderSearchTest(); refreshToolPickers(); updateControls();
   }
 
   function readForm() {
@@ -715,7 +766,7 @@
   function validateImmutable(config) {
     if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("配置必须是 JSON 对象。");
     if (canonical(config.web) !== canonical(state.config.web)) throw new Error("web 分组不能在线修改，请恢复此分组，或通过本机配置文件修改后重启管理服务。");
-    for (const path of ["llm.api_key", "embedding.api_key", "milky.access_token", "qq_login.token", "nonebot.token"]) {
+    for (const path of ["llm.api_key", "embedding.api_key", "plugins.web_search.api_key", "milky.access_token", "qq_login.token", "nonebot.token"]) {
       const value = get(config, path);
       if (value != null && value !== "") throw new Error(`请勿在 JSON 的 ${path} 中填入密钥；使用对应的密钥控件设置。`);
     }
@@ -819,6 +870,7 @@
     $("fetch-models").disabled = modelsBlocked || state.models.loading;
     $("model-list").disabled = modelsBlocked; $("manual-model").disabled = modelsBlocked;
     if (embeddingControls) embeddingControls.button.disabled = modelsBlocked || state.embedding.loading;
+    if (searchControls) searchControls.button.disabled = modelsBlocked || state.search.loading;
     for (const id of ["connect-runtime", "apply-runtime", "stop-runtime"]) $(id).disabled = unavailable || pending || ["starting", "stopping"].includes(state.status?.phase);
     $("stop-runtime").disabled ||= state.status?.phase === "stopped";
     $("get-qr").disabled = unavailable || !canPollQq() || Boolean(state.qq?.online);
@@ -1483,7 +1535,7 @@
     invalidateStickers(true);
     $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
-    invalidateModels(); invalidateEmbeddingTest();
+    invalidateModels(); invalidateEmbeddingTest(); invalidateSearchTest();
     clearMemorySelection(); state.memory.list = []; $("conversation-list").replaceChildren(); $("budget-usage").replaceChildren();
     document.querySelectorAll("dialog").forEach((dialog) => { if (dialog.open) dialog.close(); });
     document.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });

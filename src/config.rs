@@ -157,6 +157,7 @@ impl Default for Limits {
 #[serde(default, deny_unknown_fields)]
 pub struct PluginsConfig {
     pub ai: AiConfig,
+    pub web_search: crate::search::SearchConfig,
     pub clock: ClockConfig,
     pub reminder: ReminderConfig,
     pub native: NativeConfig,
@@ -510,6 +511,9 @@ impl Config {
         })
     }
     pub fn apply_environment(&mut self) {
+        if let Ok(key) = std::env::var("QKBOT_SEARCH_API_KEY") {
+            self.plugins.web_search.api_key = key;
+        }
         if let Ok(key) = std::env::var("QKBOT_EMBEDDING_API_KEY") {
             self.embedding.api_key = key;
         }
@@ -537,6 +541,10 @@ impl Config {
     }
     /// Readiness checks for saved settings, without constructing transport clients.
     pub fn validate_activation(&self) -> Result<()> {
+        ensure!(
+            !self.plugins.web_search.enabled || !self.plugins.web_search.api_key.trim().is_empty(),
+            "已启用联网搜索，请配置 Tavily API 密钥或 QKBOT_SEARCH_API_KEY。"
+        );
         ensure!(
             !self.embedding.enabled || !self.embedding.api_key.trim().is_empty(),
             "已启用Embedding，请配置独立API密钥或QKBOT_EMBEDDING_API_KEY环境变量。"
@@ -569,6 +577,12 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.plugins.web_search.validate()?;
+        ensure!(
+            !self.plugins.web_search.enabled
+                || self.plugins.web_search.request_timeout_secs < self.limits.tool_timeout_secs,
+            "搜索超时必须短于工具总超时"
+        );
         self.embedding.validate()?;
         self.stickers.validate()?;
         crate::catalog::validate_config(self)?;

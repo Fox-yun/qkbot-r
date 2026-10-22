@@ -97,7 +97,9 @@ impl Host {
         } else {
             vec![]
         };
-        let gateway = Gateway::new(store.clone(), &config.app.timezone, registry, allowed)?;
+        let cancel = CancellationToken::new();
+        let gateway = Gateway::new(store.clone(), &config.app.timezone, registry, allowed)?
+            .with_cancellation(cancel.clone());
         gateway.migrate().await?;
         crate::plugins::reminder::migrate(&store).await?;
         crate::plugins::native::migrate(&store).await?;
@@ -111,7 +113,7 @@ impl Host {
             stickers,
             memory,
             gateway,
-            cancel: CancellationToken::new(),
+            cancel,
             epochs,
             plugins,
             bridge: crate::bridge::Bridge::default(),
@@ -241,15 +243,16 @@ impl Host {
         id: String,
     ) -> Result<SendOutcome> {
         ensure!(
-            self.config.llm.tool_calling
-                && self
-                    .config
-                    .plugins
-                    .ai
-                    .defaults
-                    .allowed_tools
-                    .iter()
-                    .any(|tool| tool == "reply_message"),
+            !reply.authorization.requires_reply_tool()
+                || (self.config.llm.tool_calling
+                    && self
+                        .config
+                        .plugins
+                        .ai
+                        .defaults
+                        .allowed_tools
+                        .iter()
+                        .any(|tool| tool == "reply_message")),
             "结构化回复工具未启用"
         );
         self.send_authorized_message(
