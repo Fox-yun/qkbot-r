@@ -649,6 +649,225 @@ async fn queued_prompt_sees_previous_reply_excludes_future_input_and_deduplicate
 }
 
 #[tokio::test]
+async fn no_reply_uses_history_without_sending_and_keeps_later_questions_runnable() {
+    for tool_calling in [false, true] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.llm.tool_calling = tool_calling;
+        })
+        .await;
+        router
+            .dispatch(message(1, "previous-question"))
+            .await
+            .unwrap();
+        mock.model()
+            .await
+            .reply
+            .send(answer("previous-confirmed-answer"))
+            .unwrap();
+        assert_eq!(mock.sent().await, "previous-confirmed-answer");
+        wait_for_outbox(&host, "confirmed", 1).await;
+
+        router.dispatch(message(2, "重复收到，谢谢")).await.unwrap();
+        let repeated = mock.model().await;
+        let history = repeated.body["messages"].as_array().unwrap();
+        assert!(history.iter().any(|message| {
+            message["role"] == "assistant" && message["content"] == "previous-confirmed-answer"
+        }));
+        assert_eq!(
+            current_message_payload(&repeated.body)["text"],
+            "重复收到，谢谢"
+        );
+        router
+            .dispatch(message(3, "new-independent-question"))
+            .await
+            .unwrap();
+        repeated.reply.send(answer(" \n<NO_REPLY>\t ")).unwrap();
+
+        // A new model request proves the silent turn finished and released the lane.
+        let next = mock.model().await;
+        assert_eq!(
+            current_message_payload(&next.body)["text"],
+            "new-independent-question"
+        );
+        assert!(
+            mock.sends.try_recv().is_err(),
+            "silence must not send a marker or error receipt"
+        );
+        let counts: (i64, i64, i64) = host
+            .store
+            .call(|db| {
+                Ok((
+                    db.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?,
+                    db.query_row("SELECT COUNT(*) FROM tool_runs", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            counts,
+            (1, 1, 0),
+            "a silent turn must leave no outbound or tool records"
+        );
+        assert!(
+            !next.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "assistant"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("<NO_REPLY>"))
+                })
+        );
+
+        let literal = "正文中的 <NO_REPLY> 是示例，不是独立的静默标记。";
+        next.reply.send(answer(literal)).unwrap();
+        assert_eq!(mock.sent().await, literal);
+        wait_for_outbox(&host, "confirmed", 2).await;
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn no_reply_discards_attached_tool_calls_before_any_side_effect() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |_| {}).await;
+    router.dispatch(message(1, "机器人重复接话")).await.unwrap();
+    let request = mock.model().await;
+    for name in ["clock_now", "reminder_create", "reply_message"] {
+        assert!(
+            request.body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == name)
+        );
+    }
+    let mut response = model_tool_response(vec![
+        model_tool_call("silent-clock", "clock_now", json!({})),
+        model_tool_call(
+            "silent-reminder",
+            "reminder_create",
+            json!({"after_seconds":60,"text":"静默时不能创建提醒"}),
+        ),
+        model_tool_call(
+            "silent-send",
+            "reply_message",
+            json!({"text":"静默时不能发送"}),
+        ),
+    ]);
+    response["choices"][0]["message"]["content"] = json!("<NO_REPLY>");
+    router.dispatch(message(2, "新的实际问题")).await.unwrap();
+    request.reply.send(response).unwrap();
+
+    let next = mock.model().await;
+    assert_eq!(current_message_payload(&next.body)["text"], "新的实际问题");
+    assert!(
+        !next.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool")
+    );
+    assert!(mock.sends.try_recv().is_err());
+    let counts: (i64, i64, i64, i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row("SELECT COUNT(*) FROM tool_runs", [], |row| row.get(0))?,
+                db.query_row("SELECT COUNT(*) FROM reminder_jobs", [], |row| row.get(0))?,
+                db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+    next.reply.send(answer("新的问题照常回答")).unwrap();
+    assert_eq!(mock.sent().await, "新的问题照常回答");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn no_reply_in_final_reply_tool_suppresses_quote_and_mentions() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.limits.max_model_calls = 1;
+    })
+    .await;
+    router.dispatch(message(1, "不需要再接话")).await.unwrap();
+    let request = mock.model().await;
+    let current = current_message_payload(&request.body);
+    router
+        .dispatch(message(2, "需要正常回答的新问题"))
+        .await
+        .unwrap();
+    request.reply.send(model_tool_response(vec![model_tool_call(
+        "silent-final-reply", "reply_message",
+        json!({"text":"<NO_REPLY>","reply_to":current["message_ref"],"mention_users":[current["sender_ref"]]}),
+    )])).unwrap();
+    let next = mock.model().await;
+    assert_eq!(
+        current_message_payload(&next.body)["text"],
+        "需要正常回答的新问题"
+    );
+    assert!(
+        mock.sends.try_recv().is_err(),
+        "a silent structured reply must not emit a mention or quote"
+    );
+    let counts: (i64, i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    let literal = "说明中保留 <NO_REPLY> 示例。";
+    next.reply
+        .send(model_tool_response(vec![model_tool_call(
+            "normal-final-reply",
+            "reply_message",
+            json!({"text":literal}),
+        )]))
+        .unwrap();
+    assert_eq!(mock.sent().await, literal);
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
 async fn reset_during_model_wait_releases_capacity_and_suppresses_stale_reply() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup(&mock, true).await;
