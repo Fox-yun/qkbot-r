@@ -98,6 +98,26 @@ impl std::fmt::Display for TruncatedToolResponse {
 
 impl std::error::Error for TruncatedToolResponse {}
 
+/// Only validated protocol names are retained; provider text, arguments and
+/// call IDs must never enter the diagnostic error or its source chain.
+#[derive(Debug)]
+pub(crate) struct UnofferedTool {
+    requested: String,
+    allowed_names: Vec<String>,
+}
+
+impl std::fmt::Display for UnofferedTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "模型请求了本轮未开放的工具（{}），未执行。",
+            self.requested
+        )
+    }
+}
+
+impl std::error::Error for UnofferedTool {}
+
 const MAX_TOOL_CALL_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,12 +520,17 @@ impl Llm {
             "duplicate model tool names"
         );
         let tool_count = tools.len();
+        let has_tool_history = messages.iter().any(|message| message["role"] == "tool");
         let mut body = json!({"model": self.config.model, "messages": messages,
             "max_tokens": max_output, "stream": false});
         if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
             body["parallel_tool_calls"] = json!(false);
+        } else if self.config.tool_calling && has_tool_history {
+            // Earlier tool calls remain in protocol history during the final
+            // answer. They do not authorize another call after tools are closed.
+            body["tool_choice"] = json!("none");
         }
         let operation = async {
             if let Some((milky, generation)) = account {
@@ -605,6 +630,17 @@ impl Llm {
                     id_bytes = error.id_bytes,
                     max_id_bytes = MAX_TOOL_CALL_ID_BYTES,
                     "model tool response had invalid call id"
+                );
+            }
+            if let Some(error) = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<UnofferedTool>())
+            {
+                tracing::warn!(
+                    requested = error.requested.as_str(),
+                    allowed_names = ?error.allowed_names,
+                    "model requested a tool not offered in this request"
                 );
             }
             result
@@ -904,10 +940,15 @@ fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmRe
     }
     let calls = tool_calls(message)?;
     for (_, name) in &calls {
-        ensure!(
-            allowed_tools.contains(name),
-            "model called a tool not offered in this request"
-        );
+        if !allowed_tools.contains(name) {
+            let mut allowed_names: Vec<_> = allowed_tools.iter().cloned().collect();
+            allowed_names.sort_unstable();
+            return Err(UnofferedTool {
+                requested: name.clone(),
+                allowed_names,
+            }
+            .into());
+        }
     }
     ensure!(
         !calls.is_empty()
@@ -1448,11 +1489,123 @@ mod tests {
     #[test]
     fn native_tools_require_valid_arguments_and_offered_name() {
         let mut message = json!({"role":"assistant","content":null,"tool_calls":[call("call1")]});
-        assert!(parse_response(response(message.clone()), &HashSet::new()).is_err());
+        let error = parse_response(response(message.clone()), &HashSet::new()).unwrap_err();
+        let unavailable = error.downcast_ref::<UnofferedTool>().unwrap();
+        assert_eq!(unavailable.requested, "clock_now");
+        assert!(unavailable.allowed_names.is_empty());
         let allowed = HashSet::from(["clock_now".to_owned()]);
         assert!(parse_response(response(message.clone()), &allowed).is_ok());
         message["tool_calls"][0]["function"]["arguments"] = json!("{bad}");
         assert!(parse_response(response(message), &allowed).is_err());
+    }
+
+    #[test]
+    fn unoffered_tool_error_only_retains_validated_names_and_rejects_the_whole_batch() {
+        let allowed = HashSet::from(["reply_message".to_owned(), "clock_now".to_owned()]);
+        let unoffered = json!({"id":"private-call-id","type":"function","function":{
+            "name":"web_search","arguments":"{\"query\":\"private search secret\"}"
+        }});
+        for calls in [
+            vec![call("allowed"), unoffered.clone()],
+            vec![unoffered, call("allowed")],
+        ] {
+            let value = response(json!({
+                "role":"assistant","content":"private provider content","tool_calls":calls
+            }));
+            let error = parse_response(value.clone(), &allowed).unwrap_err();
+            let typed = error.downcast_ref::<UnofferedTool>().unwrap();
+            assert_eq!(typed.requested, "web_search");
+            assert_eq!(typed.allowed_names, ["clock_now", "reply_message"]);
+            assert_eq!(
+                error.to_string(),
+                "模型请求了本轮未开放的工具（web_search），未执行。"
+            );
+            assert!(std::error::Error::source(typed).is_none());
+            for private in ["private", "secret", "arguments", "query"] {
+                assert!(!format!("{error:#?}").contains(private));
+            }
+            let mut truncated = value;
+            truncated["choices"][0]["finish_reason"] = json!("length");
+            assert!(
+                parse_response(truncated.clone(), &allowed)
+                    .unwrap_err()
+                    .is::<TruncatedToolResponse>()
+            );
+            truncated["choices"][0]["message"]["refusal"] = json!("private refusal");
+            assert!(
+                parse_response(truncated, &allowed)
+                    .unwrap_err()
+                    .is::<ProviderBlocked>()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_unoffered_names_are_never_retained_in_diagnostics() {
+        for name in [
+            "private name".to_owned(),
+            "private\nname".to_owned(),
+            "private-name".repeat(6),
+            "private-工具".to_owned(),
+        ] {
+            let mut entry = call("private-call-id");
+            entry["function"]["name"] = json!(name);
+            let error = parse_response(
+                response(json!({"role":"assistant","content":null,"tool_calls":[entry]})),
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert!(!error.is::<UnofferedTool>());
+            assert_eq!(error.to_string(), "invalid tool call name");
+            assert!(!format!("{error:#?}").contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unoffered_tool_http_diagnostics_only_log_requested_and_allowed_names() {
+        use tracing::instrument::WithSubscriber;
+        let message = json!({"role":"assistant","content":"private provider content",
+        "tool_calls":[{"id":"private-call-id","type":"function","function":{
+            "name":"web_search","arguments":"{\"query\":\"private search secret\"}"
+        }}]});
+        let body = response(message).to_string();
+        let (url, server) = server("200 OK", &body).await;
+        let client = Llm::new(
+            config(url),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        let (log, subscriber) = diagnostic_log();
+        let error = client.complete(
+            vec![json!({"role":"user","content":"private request"})],
+            vec![
+                json!({"type":"function","function":{"name":"reply_message","parameters":{"type":"object"}}}),
+                json!({"type":"function","function":{"name":"clock_now","parameters":{"type":"object"}}}),
+            ],
+            128,
+            &CancellationToken::new(),
+        ).with_subscriber(subscriber).await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.is::<UnofferedTool>());
+        let logged = log.text();
+        for field in [
+            "model requested a tool not offered in this request",
+            "requested=\"web_search\"",
+            "allowed_names=[\"clock_now\", \"reply_message\"]",
+        ] {
+            assert!(logged.contains(field), "missing diagnostic field {field}");
+        }
+        for private in [
+            "private",
+            "secret",
+            "arguments",
+            "llm-only",
+            "http://",
+            "Bearer",
+        ] {
+            assert!(!logged.contains(private));
+            assert!(!format!("{error:#?}").contains(private));
+        }
     }
 
     #[test]
@@ -1839,6 +1992,53 @@ mod tests {
         assert!(request.contains("Bearer llm-only"));
         assert!(!request.contains("milky-only"));
         assert!(request.contains("\"max_tokens\":128"));
+    }
+
+    #[tokio::test]
+    async fn tool_choice_closes_tools_only_for_tool_capable_history_followups() {
+        for (tool_calling, has_history, offer_tools, expected_choice) in [
+            (true, true, false, Some("none")),
+            (true, false, false, None),
+            (false, true, false, None),
+            (true, true, true, Some("auto")),
+        ] {
+            let body = response(json!({"role":"assistant","content":"done"})).to_string();
+            let (url, server) = server("200 OK", &body).await;
+            let mut config = config(url);
+            config.tool_calling = tool_calling;
+            let client = Llm::new(
+                config,
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            )
+            .unwrap();
+            let mut messages = vec![json!({"role":"user","content":"time please"})];
+            if has_history {
+                messages
+                    .push(json!({"role":"assistant","content":null,"tool_calls":[call("clock")]}));
+                messages
+                    .push(json!({"role":"tool","tool_call_id":"clock","content":"time result"}));
+            }
+            let tools = if offer_tools {
+                vec![
+                    json!({"type":"function","function":{"name":"clock_now","parameters":{"type":"object"}}}),
+                ]
+            } else {
+                vec![]
+            };
+            client
+                .complete(messages, tools, 128, &CancellationToken::new())
+                .await
+                .unwrap();
+            let request = server.await.unwrap();
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                body.get("tool_choice").and_then(Value::as_str),
+                expected_choice
+            );
+            assert_eq!(body.get("tools").is_some(), offer_tools);
+            assert_eq!(body.get("parallel_tool_calls").is_some(), offer_tools);
+        }
     }
 
     #[tokio::test]

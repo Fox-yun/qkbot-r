@@ -921,9 +921,12 @@ async fn disabled_ai_keeps_clock_commands_and_does_not_call_model() {
 }
 
 #[tokio::test]
-async fn native_write_tool_waits_for_owner_confirmation_and_commits_once() {
+async fn native_reminder_can_require_owner_confirmation_when_configured() {
     let mut mock = MockServer::start().await;
-    let (_temp, host, router) = setup(&mock, true).await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.reminder.llm_writes_require_confirmation = true;
+    })
+    .await;
     router
         .dispatch(message(1, "remind-me-later"))
         .await
@@ -972,6 +975,227 @@ async fn native_write_tool_waits_for_owner_confirmation_and_commits_once() {
         mock.models.try_recv().is_err(),
         "confirmation must not regenerate model arguments"
     );
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn native_reminder_create_and_cancel_need_no_confirmation_and_commit_once() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.allowed_tools = vec![
+            "reminder_create".into(),
+            "reminder_list".into(),
+            "reminder_cancel".into(),
+        ];
+    })
+    .await;
+    assert!(!host.config.plugins.reminder.llm_writes_require_confirmation);
+    let creation = message(1, "小鱼，提醒我20分钟后吃饭");
+    let expected_due = creation.received_at + 20 * 60;
+    router.dispatch(creation.clone()).await.unwrap();
+    let mut request = mock.model().await;
+    for tool in ["reminder_create", "reminder_list", "reminder_cancel"] {
+        assert!(
+            request.body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["function"]["name"] == tool })
+        );
+    }
+    let mut created = None;
+    // A provider retry with a fresh call ID must reuse the same durable operation.
+    for call_id in ["create-first", "create-repeated"] {
+        request
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                call_id,
+                "reminder_create",
+                json!({"after_seconds":1200,"text":"吃饭"}),
+            )]))
+            .unwrap();
+        request = mock.model().await;
+        let result = last_model_tool_result(&request.body, call_id);
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["result"]["due_at"], expected_due);
+        assert_eq!(result["result"]["text"], "吃饭");
+        assert_eq!(result["result"]["status"], "pending");
+        assert!(!result.to_string().contains("/bot confirm"));
+        if let Some(previous) = &created {
+            assert_eq!(&result, previous);
+        } else {
+            created = Some(result);
+        }
+        assert!(
+            mock.sends.try_recv().is_err(),
+            "no confirmation preview is sent"
+        );
+    }
+    assert!(request.body.get("tools").is_none());
+    request
+        .reply
+        .send(answer("好，20分钟后提醒你吃饭。"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "好，20分钟后提醒你吃饭。");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    router.dispatch(creation).await.unwrap();
+
+    let cancellation = message(2, "取消刚才吃饭的提醒");
+    router.dispatch(cancellation.clone()).await.unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "list-before-cancel",
+            "reminder_list",
+            json!({}),
+        )]))
+        .unwrap();
+    let request = mock.model().await;
+    let list = last_model_tool_result(&request.body, "list-before-cancel");
+    assert_eq!(list["status"], "succeeded");
+    let reminders = list["result"]["reminders"].as_array().unwrap();
+    assert_eq!(reminders.len(), 1);
+    let id = reminders[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created.unwrap()["result"]["id"], id);
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "cancel-listed-reminder",
+            "reminder_cancel",
+            json!({"reminder_id":id}),
+        )]))
+        .unwrap();
+    let request = mock.model().await;
+    let result = last_model_tool_result(&request.body, "cancel-listed-reminder");
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["result"], json!({"id":id,"status":"cancelled"}));
+    assert!(
+        request.body.get("tools").is_none(),
+        "list and cancel fit the default three model calls"
+    );
+    assert!(
+        mock.sends.try_recv().is_err(),
+        "cancellation does not request confirmation"
+    );
+    request.reply.send(answer("已取消吃饭提醒。")).unwrap();
+    assert_eq!(mock.sent().await, "已取消吃饭提醒。");
+    wait_for_outbox(&host, "confirmed", 2).await;
+    router.dispatch(cancellation).await.unwrap();
+
+    let counts: (i64, i64, i64, i64) = host.store.call(|db| {
+        db.execute("UPDATE reminder_jobs SET due_at=?1", [now()-1])?;
+        Ok((
+            db.query_row("SELECT COUNT(*) FROM reminder_jobs", [], |row| row.get(0))?,
+            db.query_row("SELECT COUNT(*) FROM reminder_jobs WHERE status='cancelled'", [], |row| row.get(0))?,
+            db.query_row("SELECT COUNT(*) FROM tool_runs WHERE tool_name='reminder_create' AND status='succeeded'", [], |row| row.get(0))?,
+            db.query_row("SELECT COUNT(*) FROM tool_runs WHERE status='pending_confirmation' OR token IS NOT NULL", [], |row| row.get(0))?,
+        ))
+    }).await.unwrap();
+    assert_eq!(counts, (1, 1, 1, 0));
+    router.reminders().await.unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(
+        mock.models.try_recv().is_err(),
+        "replayed messages must not run the model again"
+    );
+    assert!(
+        mock.sends.try_recv().is_err(),
+        "a cancelled reminder must never be delivered"
+    );
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn native_reminder_list_and_cancel_are_scoped_to_the_requesting_user_and_chat() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.allowed_tools =
+            vec!["reminder_list".into(), "reminder_cancel".into()];
+    })
+    .await;
+    for (seq, actor, peer, text) in [
+        (1, 789, 456, "本人本群"),
+        (2, 999, 456, "其他用户"),
+        (3, 789, 654, "另一个群"),
+    ] {
+        let mut incoming = message(seq, &format!("/remind add 1200 {text}"));
+        incoming.sender_id = actor;
+        incoming.key.scope.peer_id = peer;
+        router.dispatch(incoming).await.unwrap();
+        assert!(mock.sent().await.contains("已创建提醒"));
+    }
+    let ids: Vec<(String, String)> = host
+        .store
+        .call(|db| {
+            let mut query = db.prepare("SELECT id,text FROM reminder_jobs ORDER BY text")?;
+            Ok(query
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    let own_id = &ids.iter().find(|(_, text)| text == "本人本群").unwrap().0;
+    for (offset, (foreign_id, _)) in ids
+        .iter()
+        .filter(|(_, text)| text != "本人本群")
+        .enumerate()
+    {
+        router
+            .dispatch(message(10 + offset as i64, "取消我的提醒"))
+            .await
+            .unwrap();
+        mock.model()
+            .await
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                "list-own-reminders",
+                "reminder_list",
+                json!({}),
+            )]))
+            .unwrap();
+        let request = mock.model().await;
+        let result = last_model_tool_result(&request.body, "list-own-reminders");
+        let reminders = result["result"]["reminders"].as_array().unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0]["id"], *own_id);
+        assert_eq!(reminders[0]["text"], "本人本群");
+        request
+            .reply
+            .send(model_tool_response(vec![model_tool_call(
+                "foreign-cancel",
+                "reminder_cancel",
+                json!({"reminder_id":foreign_id}),
+            )]))
+            .unwrap();
+        let request = mock.model().await;
+        assert_failed_tool_results(&request.body, &["foreign-cancel"]);
+        request
+            .reply
+            .send(answer("只能取消你在当前聊天中的提醒。"))
+            .unwrap();
+        assert_eq!(mock.sent().await, "只能取消你在当前聊天中的提醒。");
+    }
+    let pending: i64 = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT COUNT(*) FROM reminder_jobs WHERE status='pending'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pending, 3,
+        "cross-user and cross-chat cancellation must not change any reminder"
+    );
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
     drop(host);
     mock.stop().await;
 }
@@ -1767,6 +1991,7 @@ async fn native_clock_result_has_matching_tool_id_and_final_request_omits_tools(
         "tool_calls":[{"id":"clock-call-123","type":"function","function":{"name":"clock_now","arguments":"{}"}}]}}]})).unwrap();
     let last = mock.model().await;
     assert!(last.body.get("tools").is_none());
+    assert_final_tools_prompt(&last.body, false);
     let messages = last.body["messages"].as_array().unwrap();
     let assistant = &messages[messages.len() - 2];
     let result = &messages[messages.len() - 1];
@@ -1830,7 +2055,8 @@ async fn four_tool_rounds_preserve_protocol_and_end_at_the_smaller_http_budget()
             // The HTTP cap, not the larger model-call cap, determines the last
             // request; it must leave a text-only round to finish the answer.
             assert!(request.body.get("tools").is_none());
-            assert!(request.body.get("tool_choice").is_none());
+            assert_eq!(request.body["tool_choice"], "none");
+            assert_final_tools_prompt(&request.body, false);
             request
                 .reply
                 .send(answer("four-tool-rounds-complete"))
@@ -1899,6 +2125,40 @@ fn model_tool_response(calls: Vec<Value>) -> Value {
     json!({"model":"mock","choices":[{"finish_reason":"tool_calls","message":{
         "role":"assistant","content":null,"tool_calls":calls
     }}]})
+}
+
+fn last_model_tool_result(body: &Value, call_id: &str) -> Value {
+    let result = body["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["tool_call_id"], call_id);
+    serde_json::from_str(result["content"].as_str().unwrap()).unwrap()
+}
+
+fn assert_final_tools_prompt(body: &Value, reply_enabled: bool) {
+    let system = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "system")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    let rules = system.split_once("【当前人设】").unwrap().0;
+    assert!(rules.contains("禁调历史工具"));
+    assert!(rules.contains("仅empty可称空库"));
+    assert!(!rules.contains("表情先search_stickers"));
+    if reply_enabled {
+        assert!(rules.contains("不再检索表情"));
+        assert!(rules.contains("reply_message.sticker_ref"));
+    } else {
+        assert!(!rules.contains("reply_message"));
+        assert!(rules.contains("最终直接输出正文"));
+    }
+    assert!(rules.contains(if reply_enabled {
+        "本轮仅reply_message或文字结束"
+    } else {
+        "本轮仅文字结束"
+    }));
 }
 
 fn enable_sticker_search(config: &mut Config, mock_url: &str) {
@@ -2144,6 +2404,7 @@ async fn sticker_search_budget_omits_unseen_references_without_claiming_empty_li
     let embedding = within(mock.embeddings.recv()).await.unwrap();
     embedding.reply.send(json!({"object":"list","model":"Qwen/Qwen3-VL-Embedding-8B","data":[{"object":"embedding","index":0,"embedding":sticker_vector()}],"usage":{"prompt_tokens":3,"total_tokens":3}})).unwrap();
     let followup = mock.model().await;
+    assert_final_tools_prompt(&followup.body, true);
     let messages = followup.body["messages"].as_array().unwrap();
     let index = messages
         .iter()
@@ -3005,6 +3266,7 @@ async fn reply_tool_remains_available_after_the_ordinary_tool_budget_is_exhauste
     let tools = final_request.body["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["function"]["name"], "reply_message");
+    assert_final_tools_prompt(&final_request.body, true);
     let current = current_message_payload(&final_request.body);
     final_request
         .reply

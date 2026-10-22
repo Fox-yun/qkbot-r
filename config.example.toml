@@ -82,7 +82,7 @@ memory_write = true
 summary = true
 paused = false
 once = false
-allowed_tools = ["clock_now", "reply_message", "search_stickers"]  # 搜索本群表情并由模型选择；需支持视觉和工具调用
+allowed_tools = ["clock_now", "reply_message", "search_stickers", "reminder_list", "reminder_create", "reminder_cancel"]  # 工具还需启用对应插件；表情需视觉能力
 
 [plugins.ai.personas]
 # 内置：雄小鬼、清朗青年、温柔学长、理性搭档、沉稳前辈，无须在这里重复填写。
@@ -94,7 +94,7 @@ enabled = true
 [plugins.reminder]
 enabled = false
 max_active_per_user = 10
-llm_writes_require_confirmation = true  # 首版必须保持 true
+llm_writes_require_confirmation = false  # AI 按用户请求直接创建/取消；设 true 可要求本人再次确认
 
 [plugins.native]
 # 群/好友默认可用；管理页可分别关闭某插件。戳一戳、禁言游戏按需勾选。

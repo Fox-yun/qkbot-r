@@ -61,6 +61,11 @@ pub struct ToolResult {
 
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Model-initiated local writes require approval unless the implementation
+    /// explicitly permits immediate execution. Authorization still applies.
+    fn requires_confirmation(&self) -> bool {
+        true
+    }
     fn external(&self) -> Option<&dyn ExternalTool> {
         None
     }
@@ -809,7 +814,7 @@ impl Gateway {
                 };
             }
             let time = now();
-            if confirm && spec.effect == Effect::LocalWrite {
+            if confirm && spec.effect == Effect::LocalWrite && tool.requires_confirmation() {
                 tx.execute("UPDATE tool_runs SET status='expired' WHERE status='pending_confirmation' AND expires_at<=?1",[time])?;
                 let pending:i64=tx.query_row("SELECT count(*) FROM tool_runs WHERE status='pending_confirmation'",[],|r|r.get(0))?;
                 ensure!(pending<128,"too many pending confirmations; retry after they expire");
@@ -893,6 +898,10 @@ mod tests {
     };
 
     async fn setup() -> (Store, Gateway, ToolContext) {
+        setup_with_confirmation(true).await
+    }
+
+    async fn setup_with_confirmation(confirm_reminders: bool) -> (Store, Gateway, ToolContext) {
         let store = Store::open(":memory:", 32).await.unwrap();
         store
             .activate_plugins(vec!["ai".into(), "clock".into(), "reminder".into()])
@@ -902,7 +911,11 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register_reply(&mut registry).unwrap();
         clock::register(&mut registry).unwrap();
-        reminder::register(&mut registry, 10).unwrap();
+        if confirm_reminders {
+            reminder::register_with_confirmation(&mut registry, 10, true).unwrap();
+        } else {
+            reminder::register(&mut registry, 10).unwrap();
+        }
         reminder::migrate(&store).await.unwrap();
         let names = registry.names().map(str::to_owned).collect();
         let gateway = Gateway::new(store.clone(), "Asia/Shanghai", registry, names).unwrap();
@@ -1307,6 +1320,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ai_reminders_execute_without_confirmation_and_keep_owner_scope_and_idempotency() {
+        let (store, gateway, ctx) = setup_with_confirmation(false).await;
+        let args = json!({"after_seconds":1200,"text":"吃饭"});
+        let ToolOutcome::Completed {
+            operation_id,
+            result,
+            receipt,
+        } = gateway
+            .execute(&ctx, "reminder_create", args.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("AI reminders should execute without a second confirmation");
+        };
+        assert_eq!(result["due_at"], ctx.received_at + 1200);
+        assert_eq!(result["text"], "吃饭");
+        assert!(!receipt.contains("/bot confirm"));
+        let id = result["id"].as_str().unwrap().to_owned();
+        let ToolOutcome::Completed {
+            operation_id: repeated_operation,
+            result: repeated_result,
+            ..
+        } = gateway
+            .execute(&ctx, "reminder_create", args)
+            .await
+            .unwrap()
+        else {
+            panic!("repeated execution should return the committed receipt");
+        };
+        assert_eq!(operation_id, repeated_operation);
+        assert_eq!(result, repeated_result);
+
+        let mut other_actor = ctx.clone();
+        other_actor.actor_id = 99;
+        let mut other_chat = ctx.clone();
+        other_chat.scope.peer_id = 99;
+        for denied in [&other_actor, &other_chat] {
+            let ToolOutcome::Completed { result, .. } = gateway
+                .execute(denied, "reminder_list", json!({}))
+                .await
+                .unwrap()
+            else {
+                panic!("reads should execute immediately");
+            };
+            assert_eq!(result["reminders"], json!([]));
+            assert!(
+                gateway
+                    .execute(denied, "reminder_cancel", json!({"reminder_id":id}))
+                    .await
+                    .is_err()
+            );
+        }
+        for _ in 0..2 {
+            let ToolOutcome::Completed {
+                result, receipt, ..
+            } = gateway
+                .execute(&ctx, "reminder_cancel", json!({"reminder_id":id}))
+                .await
+                .unwrap()
+            else {
+                panic!("AI cancellation should execute without a second confirmation");
+            };
+            assert_eq!(result["status"], "cancelled");
+            assert!(!receipt.contains("/bot confirm"));
+        }
+        store
+            .call(move |db| {
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM reminder_jobs", [], |r| r
+                        .get::<_, i64>(0))?,
+                    1
+                );
+                let (owner, scope, status): (i64, String, String) = db.query_row(
+                    "SELECT actor_id,scope_key,status FROM reminder_jobs WHERE id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                assert_eq!(owner, ctx.actor_id);
+                assert_eq!(scope, ctx.scope.key());
+                assert_eq!(status, "cancelled");
+                assert_eq!(
+                    db.query_row(
+                        "SELECT count(*) FROM tool_runs WHERE status='pending_confirmation' OR token IS NOT NULL",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_ai_reminders_still_reject_stale_or_disabled_contexts() {
+        for change in [
+            "UPDATE ai_conversations SET epoch=epoch+1",
+            "UPDATE plugin_states SET epoch=epoch+1 WHERE id='reminder'",
+            "UPDATE plugin_states SET enabled=0 WHERE id='reminder'",
+            "UPDATE plugin_states SET enabled=0 WHERE id='ai'",
+        ] {
+            let (store, gateway, ctx) = setup_with_confirmation(false).await;
+            let ToolOutcome::Completed { result, .. } = gateway
+                .execute(
+                    &ctx,
+                    "reminder_create",
+                    json!({"after_seconds":1200,"text":"吃饭"}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected immediate reminder creation");
+            };
+            store
+                .call(move |db| {
+                    db.execute(change, [])?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            for (name, args) in [
+                (
+                    "reminder_create",
+                    json!({"after_seconds":1800,"text":"喝水"}),
+                ),
+                ("reminder_cancel", json!({"reminder_id":result["id"]})),
+            ] {
+                assert!(gateway.execute(&ctx, name, args).await.is_err(), "{change}");
+            }
+            store
+                .call(|db| {
+                    assert_eq!(
+                        db.query_row("SELECT count(*) FROM reminder_jobs", [], |r| r
+                            .get::<_, i64>(0))?,
+                        1
+                    );
+                    assert_eq!(
+                        db.query_row("SELECT status FROM reminder_jobs", [], |r| r
+                            .get::<_, String>(0))?,
+                        "pending"
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            store.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_ai_reminders_still_require_allowed_tools_and_active_turns() {
+        let (store, gateway, ctx) = setup_with_confirmation(false).await;
+        let limited = Gateway::new(store.clone(), "UTC", gateway.registry.clone(), vec![]).unwrap();
+        limited.migrate().await.unwrap();
+        assert!(
+            limited
+                .execute(
+                    &ctx,
+                    "reminder_create",
+                    json!({"after_seconds":1200,"text":"吃饭"}),
+                )
+                .await
+                .is_err()
+        );
+        ctx.cancel.cancel();
+        assert!(
+            gateway
+                .execute(
+                    &ctx,
+                    "reminder_create",
+                    json!({"after_seconds":1200,"text":"吃饭"}),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .call(
+                    |db| Ok(db.query_row("SELECT count(*) FROM reminder_jobs", [], |r| r
+                        .get::<_, i64>(0))?)
+                )
+                .await
+                .unwrap(),
+            0
+        );
         store.stop().await.unwrap();
     }
 

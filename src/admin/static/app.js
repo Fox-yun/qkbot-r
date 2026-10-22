@@ -115,11 +115,11 @@
       field("plugins.web_search.conversation_per_hour", "每个会话每小时搜索上限", "number", "", { min: 1, max: 100000 }),
       field("plugins.web_search.global_per_hour", "全局每小时搜索上限", "number", "", { min: 1, max: 100000 }),
     ] },
-    { title: "插件", description: "启用需要的功能。写入类工具默认要求用户确认。", fields: [
+    { title: "插件", description: "启用需要的功能。提醒可由 AI 直接创建和取消，也可选择要求再次确认。", fields: [
       field("plugins.ai.enabled", "AI 聊天", "check", "启用后需配置有效的模型地址和名称。"),
       field("plugins.clock.enabled", "时间查询", "check", "提供 /clock 指令和 clock_now 工具。"),
       field("plugins.reminder.enabled", "提醒", "check", "提供提醒创建、查询和取消功能。"),
-      field("plugins.reminder.llm_writes_require_confirmation", "模型创建提醒需要确认", "check", "写入操作先展示预览，再由用户明确确认。"),
+      field("plugins.reminder.llm_writes_require_confirmation", "AI 创建和取消提醒需要再次确认", "check", "默认关闭：按用户请求直接执行。开启后先展示预览，由本人确认。"),
       field("plugins.reminder.max_active_per_user", "每人最多活跃提醒", "number", "", { min: 1 }),
     ] },
     { title: "容量与整理", description: "并发、队列和后台整理均有边界。可先保留默认值，再按使用情况调整。", fields: [

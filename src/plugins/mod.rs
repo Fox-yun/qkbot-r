@@ -88,7 +88,11 @@ pub fn assemble(config: &Config) -> Result<(PluginRegistry, ToolRegistry, BTreeS
     crate::tools::register_reply(&mut tools)?;
     clock::register(&mut tools)?;
     web_search::register(&mut tools, &config.plugins.web_search)?;
-    reminder::register(&mut tools, config.plugins.reminder.max_active_per_user)?;
+    reminder::register_with_confirmation(
+        &mut tools,
+        config.plugins.reminder.max_active_per_user,
+        config.plugins.reminder.llm_writes_require_confirmation,
+    )?;
     for name in &config.plugins.ai.defaults.allowed_tools {
         anyhow::ensure!(
             tools.names().any(|registered| registered == name),

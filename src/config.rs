@@ -396,7 +396,7 @@ impl Default for ReminderConfig {
         Self {
             enabled: false,
             max_active_per_user: 10,
-            llm_writes_require_confirmation: true,
+            llm_writes_require_confirmation: false,
         }
     }
 }
@@ -435,6 +435,9 @@ impl Default for AiSettings {
                 "clock_now".into(),
                 "reply_message".into(),
                 "search_stickers".into(),
+                "reminder_list".into(),
+                "reminder_create".into(),
+                "reminder_cancel".into(),
             ],
         }
     }
@@ -663,10 +666,6 @@ impl Config {
                 && (1..=365).contains(&self.limits.retention_days)
                 && self.limits.send_cooldown_secs <= 60,
             "invalid send/retention limit"
-        );
-        ensure!(
-            self.plugins.reminder.llm_writes_require_confirmation,
-            "LLM write confirmation cannot be disabled in v1"
         );
         ensure!(
             (1..=10).contains(&self.plugins.reminder.max_active_per_user),

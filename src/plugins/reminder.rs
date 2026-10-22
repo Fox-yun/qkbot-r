@@ -49,11 +49,22 @@ impl Plugin for ReminderPlugin {
 }
 
 pub fn register(registry: &mut ToolRegistry, max_active: usize) -> Result<()> {
+    register_with_confirmation(registry, max_active, false)
+}
+
+pub fn register_with_confirmation(
+    registry: &mut ToolRegistry,
+    max_active: usize,
+    require_confirmation: bool,
+) -> Result<()> {
     registry.register(Arc::new(ReminderList))?;
     registry.register(Arc::new(ReminderCreate {
         max_active: max_active.clamp(1, 10),
+        require_confirmation,
     }))?;
-    registry.register(Arc::new(ReminderCancel))
+    registry.register(Arc::new(ReminderCancel {
+        require_confirmation,
+    }))
 }
 
 pub async fn migrate(store: &Store) -> Result<()> {
@@ -103,12 +114,21 @@ fn spec(
 }
 struct ReminderCreate {
     max_active: usize,
+    require_confirmation: bool,
 }
 impl Tool for ReminderCreate {
+    fn requires_confirmation(&self) -> bool {
+        self.require_confirmation
+    }
+
     fn spec(&self) -> ToolSpec {
         spec(
             "reminder_create",
-            "Create a reminder for the requesting user in this chat. Requires that user's confirmation.",
+            if self.require_confirmation {
+                "按用户明确请求创建本人本会话提醒；after_seconds从本条消息收信时刻起计秒，20分钟=1200。需本人确认。"
+            } else {
+                "按用户明确请求直接创建本人本会话提醒，无需再次确认；after_seconds从本条消息收信时刻起计秒，20分钟=1200。时间或内容不明先问。"
+            },
             json!({"type":"object","properties":{"after_seconds":{"type":"integer","minimum":60,"maximum":2592000},"text":{"type":"string","minLength":1,"maxLength":200}},"required":["after_seconds","text"],"additionalProperties":false}),
             Effect::LocalWrite,
         )
@@ -176,7 +196,7 @@ impl Tool for ReminderList {
     fn spec(&self) -> ToolSpec {
         spec(
             "reminder_list",
-            "List only the requesting user's pending or uncertain-delivery reminders in this same chat; at most 10, active first. Unknown deliveries must not be retried automatically.",
+            "查询当前用户在本会话的提醒及真实ID，最多10条，待处理优先。取消前先查询，按内容和时间匹配；投递状态unknown不得自动重试。",
             json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
             Effect::Read,
         )
@@ -226,12 +246,22 @@ impl Tool for ReminderList {
         })
     }
 }
-struct ReminderCancel;
+struct ReminderCancel {
+    require_confirmation: bool,
+}
 impl Tool for ReminderCancel {
+    fn requires_confirmation(&self) -> bool {
+        self.require_confirmation
+    }
+
     fn spec(&self) -> ToolSpec {
         spec(
             "reminder_cancel",
-            "Cancel one of the requesting user's pending reminders in this same chat. Requires confirmation.",
+            if self.require_confirmation {
+                "取消当前用户本会话待发送提醒；先用reminder_list取得真实ID，多个候选不明确先问。需本人确认。"
+            } else {
+                "按用户明确请求直接取消本人本会话待发送提醒，无需再次确认；先用reminder_list取得真实ID，多个候选不明确先问，不猜ID。"
+            },
             json!({"type":"object","properties":{"reminder_id":{"type":"string","minLength":1,"maxLength":64}},"required":["reminder_id"],"additionalProperties":false}),
             Effect::LocalWrite,
         )
@@ -840,7 +870,7 @@ mod tests {
         migrate(&store).await.unwrap();
         store.call(|db|{db.execute("INSERT INTO ai_conversations(id,scope,mode) VALUES('test','1:group:2','group')",[])?;Ok(())}).await.unwrap();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, 10).unwrap();
+        register_with_confirmation(&mut registry, 10, true).unwrap();
         let gateway = Gateway::new(
             store.clone(),
             "UTC",

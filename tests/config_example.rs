@@ -28,8 +28,50 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     assert!(config.plugins.ai.defaults.reply_to_bot);
     assert_eq!(
         config.plugins.ai.defaults.allowed_tools,
-        ["clock_now", "reply_message", "search_stickers"]
+        [
+            "clock_now",
+            "reply_message",
+            "search_stickers",
+            "reminder_list",
+            "reminder_create",
+            "reminder_cancel"
+        ]
     );
+    assert!(!config.plugins.reminder.llm_writes_require_confirmation);
+}
+
+#[test]
+fn reminder_confirmation_can_be_disabled_or_explicitly_kept() {
+    for required in [false, true] {
+        let config: Config = toml::from_str(&format!(
+            "[plugins.reminder]\nenabled = true\nllm_writes_require_confirmation = {required}"
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.plugins.reminder.llm_writes_require_confirmation,
+            required
+        );
+        let (_, registry, _) = qkbot::plugins::assemble(&restored).unwrap();
+        for name in ["reminder_create", "reminder_cancel"] {
+            let entry = registry
+                .catalog()
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(entry.description.contains("需本人确认"), required);
+            assert!(
+                restored
+                    .plugins
+                    .ai
+                    .defaults
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == name)
+            );
+        }
+    }
 }
 
 #[test]
