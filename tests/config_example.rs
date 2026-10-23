@@ -1,4 +1,8 @@
-use qkbot::{config::Config, llm::Llm, milky::Milky};
+use qkbot::{
+    config::{AutoReplyConfig, Config},
+    llm::Llm,
+    milky::Milky,
+};
 
 #[test]
 fn external_presets_are_valid_disabled_and_explicit_lists_take_precedence() {
@@ -20,6 +24,7 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     assert!(config.llm.vision);
     assert!(config.plugins.ai.global_memory_shared);
     assert_eq!(config.plugins.ai.memory_input_budget, 8000);
+    assert_eq!(config.plugins.ai.auto_reply, AutoReplyConfig::default());
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -102,6 +107,108 @@ fn global_memory_sharing_defaults_on_and_explicit_off_roundtrips() {
         let json_roundtrip: Config =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert_eq!(json_roundtrip.plugins.ai.global_memory_shared, shared);
+    }
+}
+
+#[test]
+fn auto_reply_policy_defaults_are_backward_compatible_and_partial_values_merge() {
+    let legacy = Config::from_toml("[plugins.ai]\nkeywords = ['小鱼']").unwrap();
+    legacy.validate().unwrap();
+    let policy = &legacy.plugins.ai.auto_reply;
+    assert_eq!(policy, &AutoReplyConfig::default());
+    assert_eq!(policy.cooldown_seconds, 30);
+    assert_eq!(policy.debounce_ms, 1500);
+    assert_eq!(policy.max_wait_ms, 5000);
+    assert_eq!(policy.max_messages, 8);
+    assert_eq!(policy.max_age_seconds, 120);
+    assert!(!policy.prompt.contains("NO_REPLY"));
+
+    let partial = Config::from_toml("[plugins.ai.auto_reply]\ncooldown_seconds = 0").unwrap();
+    partial.validate().unwrap();
+    assert_eq!(
+        partial.plugins.ai.auto_reply,
+        AutoReplyConfig {
+            cooldown_seconds: 0,
+            ..AutoReplyConfig::default()
+        }
+    );
+    // Policy configuration has no global activation flag; opt-in is stored per chat.
+    assert!(Config::from_toml("[plugins.ai.auto_reply]\nenabled = true").is_err());
+}
+
+#[test]
+fn auto_reply_rejects_invalid_limits_even_when_ai_is_disabled() {
+    for enabled in [false, true] {
+        for fields in [
+            "cooldown_seconds = 3601",
+            "debounce_ms = 99",
+            "debounce_ms = 10001",
+            "max_wait_ms = 99",
+            "max_wait_ms = 30001",
+            "max_wait_ms = 1499",
+            "max_messages = 0",
+            "max_messages = 33",
+            "max_age_seconds = 4",
+            "max_age_seconds = 601",
+            "max_age_seconds = 5\nmax_wait_ms = 5001",
+            "prompt = '   '",
+        ] {
+            let config = Config::from_toml(&format!(
+                "[plugins.ai]\nenabled = {enabled}\n[plugins.ai.auto_reply]\n{fields}"
+            ))
+            .unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted {fields} with AI enabled={enabled}"
+            );
+        }
+        let mut config = Config::default();
+        config.plugins.ai.enabled = enabled;
+        config.plugins.ai.auto_reply.max_age_seconds = u64::MAX;
+        assert!(config.validate().is_err());
+    }
+    assert!(Config::from_toml("[plugins.ai.auto_reply]\ncooldown_seconds = -1").is_err());
+}
+
+#[test]
+fn auto_reply_valid_boundaries_and_trimmed_unicode_prompt_are_supported() {
+    for fields in [
+        "cooldown_seconds = 0\ndebounce_ms = 100\nmax_wait_ms = 100\nmax_messages = 1\nmax_age_seconds = 5",
+        "cooldown_seconds = 3600\ndebounce_ms = 10000\nmax_wait_ms = 30000\nmax_messages = 32\nmax_age_seconds = 600",
+        "debounce_ms = 10000\nmax_wait_ms = 10000\nmax_age_seconds = 10",
+    ] {
+        let config = Config::from_toml(&format!("[plugins.ai.auto_reply]\n{fields}")).unwrap();
+        config.validate().unwrap();
+    }
+    let mut config = Config::default();
+    config.plugins.ai.auto_reply.prompt = format!(" \n{}\t ", "聊".repeat(2000));
+    config.validate().unwrap();
+    config.plugins.ai.auto_reply.prompt = "聊".repeat(2001);
+    assert!(config.validate().is_err());
+    config.plugins.ai.enabled = false;
+    assert!(config.validate().is_err());
+    config.plugins.ai.auto_reply.prompt = " \n\t\u{3000} ".into();
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn auto_reply_custom_policy_roundtrips_through_toml_and_admin_json() {
+    let mut config = Config::default();
+    config.plugins.ai.auto_reply = AutoReplyConfig {
+        prompt: "  只在有新信息时接话。\n看到闲聊时保持克制。  ".into(),
+        cooldown_seconds: 90,
+        debounce_ms: 2500,
+        max_wait_ms: 12_000,
+        max_messages: 16,
+        max_age_seconds: 45,
+    };
+    config.validate().unwrap();
+    let toml_roundtrip = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+    let json_roundtrip: Config =
+        serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+    for restored in [toml_roundtrip, json_roundtrip] {
+        restored.validate().unwrap();
+        assert_eq!(restored.plugins.ai.auto_reply, config.plugins.ai.auto_reply);
     }
 }
 

@@ -443,11 +443,68 @@ impl Default for AiSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoReplyConfig {
+    pub prompt: String,
+    pub cooldown_seconds: u64,
+    pub debounce_ms: u64,
+    pub max_wait_ms: u64,
+    pub max_messages: usize,
+    pub max_age_seconds: u64,
+}
+
+impl Default for AutoReplyConfig {
+    fn default() -> Self {
+        Self {
+            prompt: "最新发言未必对你说，按完整上下文、人设、发言者和真实引用/@关系判断是否自然参与。可接续与你的对话或合适闲聊，不抢答他人问答、不重复已解决内容，不凭旁人聊天执行操作。适合参与时直接回复，不解释接话理由。".into(),
+            cooldown_seconds: 30,
+            debounce_ms: 1500,
+            max_wait_ms: 5000,
+            max_messages: 8,
+            max_age_seconds: 120,
+        }
+    }
+}
+
+impl AutoReplyConfig {
+    pub fn validate(&self) -> Result<()> {
+        let prompt = self.prompt.trim();
+        ensure!(
+            !prompt.is_empty() && prompt.chars().count() <= 2000,
+            "自动接话策略去除首尾空白后须为 1..2000 个字符"
+        );
+        ensure!(
+            self.cooldown_seconds <= 3600,
+            "自动接话冷却时间须为 0..3600 秒"
+        );
+        ensure!(
+            (100..=10_000).contains(&self.debounce_ms),
+            "自动接话合并等待须为 100..10000 毫秒"
+        );
+        ensure!(
+            (100..=30_000).contains(&self.max_wait_ms) && self.max_wait_ms >= self.debounce_ms,
+            "自动接话最长等待须为 100..30000 毫秒，且不小于合并等待"
+        );
+        ensure!(
+            (1..=32).contains(&self.max_messages),
+            "自动接话每批消息数须为 1..32"
+        );
+        ensure!(
+            (5..=600).contains(&self.max_age_seconds)
+                && self.max_age_seconds * 1000 >= self.max_wait_ms,
+            "自动接话批次有效期须为 5..600 秒，且不短于最长等待"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub enabled: bool,
     pub defaults: AiSettings,
+    pub auto_reply: AutoReplyConfig,
     pub keywords: Vec<String>,
     pub global_memory_shared: bool,
     pub read_group_background: bool,
@@ -466,6 +523,7 @@ impl Default for AiConfig {
         Self {
             enabled: true,
             defaults: AiSettings::default(),
+            auto_reply: AutoReplyConfig::default(),
             keywords: vec!["小鱼".into()],
             global_memory_shared: true,
             read_group_background: true,
@@ -674,6 +732,7 @@ impl Config {
             "reminder max_active_per_user must be 1..10"
         );
         let ai = &self.plugins.ai;
+        ai.auto_reply.validate()?;
         ensure!(ai.persona(&ai.defaults.persona).is_some(), "人设不存在");
         ensure!(
             ai.personas

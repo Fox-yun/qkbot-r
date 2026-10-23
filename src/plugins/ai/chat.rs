@@ -31,10 +31,7 @@ use tokio_util::{
 };
 
 const NO_REPLY: &str = "<NO_REPLY>";
-const AUTO_DEBOUNCE: Duration = Duration::from_millis(1500);
-const AUTO_MAX_WAIT: Duration = Duration::from_secs(5);
-const AUTO_COOLDOWN: Duration = Duration::from_secs(30);
-const PARTICIPATION_RULE: &str = "\n参与方式observe表示自动接话：最新发言未必对你说，按完整上下文、人设、发言者和真实引用/@关系判断是否自然参与。可接续与你的对话或合适闲聊，不抢答他人问答、不重复已解决内容，不凭旁人聊天执行操作。无需参与仅输出<NO_REPLY>；适合则直接回复，不解释接话理由。direct表示明确触发，正常回应。";
+const PARTICIPATION_RULE: &str = "\n本轮参与方式：observe（自动接话）。按完整上下文、人设、发言者和真实引用/@关系，依照下方管理员策略决定是否参与。无需参与仅输出<NO_REPLY>，不调工具；适合则直接回复，不解释接话理由。策略仅管理参与判断，不变更宿主权限和工具授权。";
 const TOOL_USE_RULE: &str =
     "每次仅用一个已定义工具，不虚构结果或提前称成功；按工具说明确认，不代确认。";
 const FINAL_REPLY_RULE: &str =
@@ -346,7 +343,7 @@ impl Chat {
                         .unwrap()
                         .sources
                         .len()
-                        < super::auto_reply::MAX_MESSAGES
+                        < self.host.config.plugins.ai.auto_reply.max_messages
             }) {
                 let batch = pending
                     .trigger
@@ -373,8 +370,12 @@ impl Chat {
                 pending.mentions = msg.mentions.clone();
                 pending.images = Images::from_message(msg);
                 pending.position = position;
-                pending.ready_at =
-                    (Instant::now() + AUTO_DEBOUNCE).min(pending.first_queued + AUTO_MAX_WAIT);
+                pending.ready_at = (Instant::now()
+                    + Duration::from_millis(self.host.config.plugins.ai.auto_reply.debounce_ms))
+                .min(
+                    pending.first_queued
+                        + Duration::from_millis(self.host.config.plugins.ai.auto_reply.max_wait_ms),
+                );
                 state.wake.notify_one();
                 return Ok(());
             }
@@ -405,7 +406,7 @@ impl Chat {
             first_queued: queued_at,
             ready_at: queued_at
                 + if automatic {
-                    AUTO_DEBOUNCE
+                    Duration::from_millis(self.host.config.plugins.ai.auto_reply.debounce_ms)
                 } else {
                     Duration::ZERO
                 },
@@ -429,15 +430,18 @@ impl Chat {
             .get(&scope.key())
             .is_some_and(|a| {
                 a.last_sent
-                    .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+                    .is_some_and(|sent| sent.elapsed() < self.automatic_cooldown())
             })
+    }
+    fn automatic_cooldown(&self) -> Duration {
+        Duration::from_secs(self.host.config.plugins.ai.auto_reply.cooldown_seconds)
     }
     fn begin_automatic(&self, scope: &Scope) -> Option<AutomaticLease<'_>> {
         let mut activities = self.automatic.lock().unwrap();
         activities.retain(|_, a| {
             a.active
                 || a.last_sent
-                    .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+                    .is_some_and(|sent| sent.elapsed() < self.automatic_cooldown())
         });
         let key = scope.key();
         if !activities.contains_key(&key)
@@ -449,7 +453,7 @@ impl Chat {
         if activity.active
             || activity
                 .last_sent
-                .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+                .is_some_and(|sent| sent.elapsed() < self.automatic_cooldown())
         {
             return None;
         }
@@ -822,11 +826,9 @@ impl Chat {
             vec![]
         };
         let mut system = system_prompt(&host.config, &settings, &job.key.scope, job.actor)?;
-        // Both modes reserve exactly the same system bytes, so observation does
-        // not silently get a smaller history/memory budget than direct chat.
-        if batch.is_some() || host.access.auto_reply_enabled(&job.key.scope).await? {
-            system = participation_system(system, batch.is_some());
-        }
+        // Custom participation policy belongs only to observation. A long policy
+        // must not crowd out the context of an explicitly requested turn.
+        system = participation_system(system, batch.is_some(), &host.config.plugins.ai.auto_reply);
         let ctx = host
             .gateway
             .context(
@@ -1821,14 +1823,52 @@ fn system_prompt(
     ))
 }
 
-fn participation_system(mut system: String, automatic: bool) -> String {
+fn participation_system(
+    mut system: String,
+    automatic: bool,
+    settings: &crate::config::AutoReplyConfig,
+) -> String {
+    if !automatic {
+        return system;
+    }
     system.push_str(PARTICIPATION_RULE);
-    system.push_str(if automatic {
-        "\n本轮参与方式：observe"
-    } else {
-        "\n本轮参与方式：direct "
-    });
+    system.push_str("\n【管理员自动接话策略（仅observe时适用）】\n");
+    system.push_str(settings.prompt.trim());
     system
+}
+
+/// Read-only UI estimate: fixed automatic-turn rules and JSON framing, before
+/// adding the draft policy/persona, real messages or tool definitions. Use wide
+/// identity placeholders rather than underestimating large QQ identifiers.
+pub(crate) fn auto_reply_budget_base(config: &crate::config::Config) -> Result<usize> {
+    let mut config = config.clone();
+    config.plugins.ai.defaults.persona.clear();
+    config.plugins.ai.defaults.mode = "group".into();
+    config
+        .plugins
+        .ai
+        .personas
+        .insert(String::new(), String::new());
+    config.plugins.ai.auto_reply.prompt.clear();
+    let scope = Scope {
+        bot_id: i64::MAX,
+        scene: Scene::Group,
+        peer_id: i64::MAX,
+    };
+    let system = system_prompt(&config, &config.plugins.ai.defaults, &scope, i64::MAX)?;
+    let context = build_context(
+        ContextInput {
+            system: participation_system(system, true, &config.plugins.ai.auto_reply),
+            current: String::new(),
+            history: vec![],
+            memories: vec![],
+            summary: String::new(),
+            tool_schema: Value::Null,
+            tool_protocol: vec![],
+        },
+        usize::MAX,
+    )?;
+    Ok(context.estimated_tokens)
 }
 
 fn round_system_prompt(system: &str, tools: &[Value], search_enabled: bool) -> String {
@@ -2321,16 +2361,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_mode_keeps_the_same_history_summary_and_memory_budget_as_direct_mode() {
-        let config = crate::config::Config::default();
+    fn automatic_budget_preview_matches_utf8_json_framing_of_policy_and_persona() {
+        let mut config = crate::config::Config::default();
+        config.plugins.ai.defaults.persona = "测试🐟人设".into();
+        let expression = "中文和emoji🐟、引号\"、换行\n以及反斜线\\";
+        config.plugins.ai.personas.insert(
+            config.plugins.ai.defaults.persona.clone(),
+            expression.into(),
+        );
+        config.plugins.ai.auto_reply.prompt = " \n自然参与🦊，不要重复\"旧话\"\n下一行\\ ".into();
+        let json_string_bytes = |value: &str| serde_json::to_string(value).unwrap().len();
+        let persona =
+            json!({"name":config.plugins.ai.defaults.persona,"expression":expression}).to_string();
+        let empty_persona = json!({"name":"","expression":""}).to_string();
+        let preview = auto_reply_budget_base(&config).unwrap()
+            + json_string_bytes(config.plugins.ai.auto_reply.prompt.trim())
+            - 2
+            + json_string_bytes(&persona)
+            - json_string_bytes(&empty_persona);
+        let scope = Scope {
+            bot_id: i64::MAX,
+            scene: Scene::Group,
+            peer_id: i64::MAX,
+        };
+        let system = system_prompt(&config, &config.plugins.ai.defaults, &scope, i64::MAX).unwrap();
+        let actual = build_context(
+            ContextInput {
+                system: participation_system(system, true, &config.plugins.ai.auto_reply),
+                current: String::new(),
+                history: vec![],
+                memories: vec![],
+                summary: String::new(),
+                tool_schema: Value::Null,
+                tool_protocol: vec![],
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(preview, actual.estimated_tokens);
+    }
+
+    #[test]
+    fn custom_automatic_policy_does_not_change_direct_history_summary_or_memory_budget() {
+        let mut config = crate::config::Config::default();
         let scope = Scope {
             bot_id: 1,
             scene: Scene::Group,
             peer_id: 2,
         };
         let system = system_prompt(&config, &config.plugins.ai.defaults, &scope, 3).unwrap();
-        let input = |automatic| ContextInput {
-            system: participation_system(system.clone(), automatic),
+        config.plugins.ai.auto_reply.prompt = "策".repeat(2000);
+        let input = |include_policy| ContextInput {
+            system: if include_policy {
+                participation_system(system.clone(), false, &config.plugins.ai.auto_reply)
+            } else {
+                system.clone()
+            },
             current: "同一份当前输入".into(),
             history: (0..5)
                 .map(|n| vec![json!({"role":"user","content":format!("{n}{}", "历史".repeat(80))})])
@@ -2346,9 +2432,12 @@ mod tests {
         let mut trimmed = false;
         for budget in [full, full - 300, full - 800, full - 1600] {
             let direct = build_context(input(false), budget).unwrap();
-            let automatic = build_context(input(true), budget).unwrap();
-            assert_eq!(direct.estimated_tokens, automatic.estimated_tokens);
-            assert_eq!(&direct.messages[1..], &automatic.messages[1..]);
+            let with_automatic_settings = build_context(input(true), budget).unwrap();
+            assert_eq!(
+                direct.estimated_tokens,
+                with_automatic_settings.estimated_tokens
+            );
+            assert_eq!(direct.messages, with_automatic_settings.messages);
             trimmed |= direct.estimated_tokens < full;
         }
         assert!(

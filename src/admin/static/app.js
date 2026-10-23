@@ -10,7 +10,7 @@
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
     pendingOperation: null,
-    personaTemplates: {}, personaSelected: null, toolCatalog: [], pluginCatalog: [],
+    personaTemplates: {}, personaSelected: null, toolCatalog: [], pluginCatalog: [], autoReplyBaseEstimate: null,
     groupPersona: { saving: false, message: "", kind: "" },
     scopePlugins: { version: 0, query: null, rows: [], loading: false, saving: false, uncertain: false },
     models: { version: 0, loading: false, items: [], manual: true, message: "", kind: "" },
@@ -24,6 +24,7 @@
   let pluginControls = null;
   let embeddingControls = null;
   let searchControls = null;
+  let autoReplyBudgetControl = null;
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const get = (object, path) => path.split(".").reduce((value, key) => value?.[key], object);
   const put = (object, path, value) => {
@@ -47,6 +48,14 @@
 
   // Definitions build ordinary DOM elements; configuration and server data never become HTML.
   const field = (path, label, type = "text", hint = "", options = {}) => ({ path, label, type, hint, ...options });
+  const autoReplyFields = [
+    field("plugins.ai.auto_reply.prompt", "接话策略", "textarea", "告诉模型什么情况下适合接话、何时保持安静。沿用当前聊天模型、人设和上下文；最多 2000 个字符，不能为空。策略计入自动接话的输入预算，较长时请相应提高输入预算；正常 @ 提问不加载这段策略。", { full: true, rows: 6 }),
+    field("plugins.ai.auto_reply.cooldown_seconds", "主动发言冷却（秒）", "number", "每个已开启聊天独立计时；设为 0 时不限制主动发言间隔。", { min: 0, max: 3600 }),
+    field("plugins.ai.auto_reply.debounce_ms", "消息合并等待（毫秒）", "number", "收到新消息后等待这段时间，将短时间内的连续发言合并判断。1000 毫秒 = 1 秒。", { min: 100, max: 10000 }),
+    field("plugins.ai.auto_reply.max_wait_ms", "最长合并等待（毫秒）", "number", "持续有新消息时，最迟在这段时间后判断是否接话；不能短于消息合并等待。", { min: 100, max: 30000 }),
+    field("plugins.ai.auto_reply.max_messages", "每批最多新消息数", "number", "单批最多合并这么多条新消息，后续消息进入下一批。", { min: 1, max: 32 }),
+    field("plugins.ai.auto_reply.max_age_seconds", "待接话消息有效期（秒）", "number", "超过有效期的批次不再主动回复；应覆盖最长合并等待。只限制待接话的新消息，不截断完整聊天上下文、摘要或长期记忆。", { min: 5, max: 600, full: true }),
+  ];
   const groups = [
     { title: "模型接口", description: "兼容 Chat Completions 的远程 API；获取模型列表不会保存密钥或发送聊天请求。", models: true, fields: [
       field("llm.chat_completions_url", "API 地址", "text", "可填写基础地址或 /v1 后获取模型列表，成功后补全聊天接口路径。直接手填模型时，请使用服务商的完整聊天接口地址。", { full: true, placeholder: "https://…/v1 或 https://…/v1/chat/completions" }),
@@ -85,6 +94,7 @@
       field("plugins.ai.keywords", "关键词触发", "lines", "每行一个；子串匹配。清空后仍可通过真实 @或私聊触发。"),
       field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有会话在「记忆与上下文」中单独管理。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
     ] },
+    { title: "自动接话", description: "全局策略仅用于已在「群与好友」单独开启自动接话的聊天；每个群聊和私聊默认关闭。保存并应用后生效。真实 @、关键词和引用机器人消息的明确触发仍优先，不受自动接话的合并等待与冷却限制。", autoReply: true, fields: autoReplyFields },
     { title: "人设", description: "从列表选择默认人设，也可编辑自定义内容。会话可单独选择已保存的人设。", personas: true, fields: [
       field("plugins.ai.defaults.persona", "默认人设", "persona", "选择后随配置一起保存；下方可预览模板和编辑自定义人设。", { full: true }),
     ] },
@@ -470,6 +480,31 @@
   function personaChoices(config) {
     return new Map([...Object.entries(state.personaTemplates), ...Object.entries(config?.plugins?.ai?.personas || {})]);
   }
+  function renderAutoReplyBudget() {
+    if (!autoReplyBudgetControl || !state.draft) return;
+    const prompt = (inputs.get("plugins.ai.auto_reply.prompt")?.control.value ?? "").trim();
+    const name = inputs.get("plugins.ai.defaults.persona")?.control.value ?? "";
+    const expression = personaChoices(state.draft).get(name);
+    const budget = Number(inputs.get("plugins.ai.defaults.input_budget")?.control.value);
+    if (typeof expression !== "string" || !Number.isSafeInteger(budget) || budget <= 0) {
+      autoReplyBudgetControl.className = "hint";
+      autoReplyBudgetControl.textContent = "选择有效的默认人设并填写输入预算后，可在这里查看自动接话的预算估算。";
+      return;
+    }
+    // The persona is JSON embedded inside a system message, so count its outer
+    // JSON escaping too. This matches the server's conservative UTF-8 budget.
+    const jsonBytes = (value) => new TextEncoder().encode(JSON.stringify(value)).length;
+    const variable = jsonBytes(prompt) - 2 + jsonBytes(JSON.stringify({ name, expression })) - jsonBytes(JSON.stringify({ name: "", expression: "" }));
+    const complete = state.autoReplyBaseEstimate !== null;
+    const estimate = (state.autoReplyBaseEstimate ?? 0) + variable;
+    const remaining = budget - estimate;
+    const warning = estimate >= budget ? "已达到或超出输入预算，可能无法自动接话。"
+      : estimate >= budget * 0.75 || remaining < 1000 ? "接近输入预算，剩余空间可能不足。" : "";
+    autoReplyBudgetControl.className = warning || !complete ? "notice warning" : "hint";
+    autoReplyBudgetControl.textContent = warning + `${complete ? "策略/人设及固定规则" : "仅策略/人设"}约占 ${estimate} / ${budget} 输入预算，剩余 ${Math.max(0, remaining)}${remaining < 0 ? `（超出 ${-remaining}）` : ""}。`
+      + (complete ? "" : "未计入宿主固定规则开销，实际占用更高，无法判断预算是否足够。")
+      + "还需容纳当前消息、历史、摘要、记忆和工具。这里是保守估算，不是模型精确 token；会话单独覆盖预算或人设时，以该会话设置为准。";
+  }
   function requirePersona(config, name, label = "人设") {
     if (!personaChoices(config).has(name)) throw new Error(`「${label}」已失效，请从列表重新选择。`);
   }
@@ -538,10 +573,11 @@
     let control;
     if (definition.type === "tools") {
       control = element("div", "tool-choices"); control.setAttribute("role", "group"); control.setAttribute("aria-label", definition.label);
-    } else if (["lines", "ids", "json"].includes(definition.type)) {
+    } else if (["lines", "ids", "json", "textarea"].includes(definition.type)) {
       control = document.createElement("textarea");
-      control.rows = definition.type === "json" ? 5 : 3;
+      control.rows = definition.rows ?? (definition.type === "json" ? 5 : 3);
       control.spellcheck = false;
+      if (definition.type === "textarea") control.required = true;
     } else if (definition.type === "persona") {
       control = document.createElement("select"); control.required = true;
       fillPersonaSelect(control, get(state.draft, definition.path), state.draft);
@@ -698,7 +734,7 @@
     state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
     state.embedding.version++; state.embedding.message = ""; state.embedding.kind = ""; embeddingControls = null;
     state.search.version++; state.search.message = ""; state.search.kind = ""; searchControls = null;
-    inputs.clear(); secretInputs.clear();
+    inputs.clear(); secretInputs.clear(); autoReplyBudgetControl = null;
     $("config-groups").replaceChildren();
     groups.forEach((group, index) => {
       const card = element("section", "card");
@@ -711,6 +747,11 @@
         if (group.models && definition.path === "llm.model") grid.append(modelPicker);
       }
       card.append(heading, grid);
+      if (group.autoReply) {
+        autoReplyBudgetControl = element("p", "hint"); autoReplyBudgetControl.id = "auto-reply-budget";
+        autoReplyBudgetControl.setAttribute("role", "status"); autoReplyBudgetControl.setAttribute("aria-live", "polite"); autoReplyBudgetControl.setAttribute("aria-atomic", "true");
+        card.append(autoReplyBudgetControl);
+      }
       if (group.embedding) {
         const row = element("div", "field full"), button = element("button", "secondary", "测试文字和图片向量"), message = element("p", "hint");
         button.type = "button"; button.id = "embedding-test"; message.id = "embedding-test-message";
@@ -728,7 +769,7 @@
     renderPluginConfig(pending);
     const web = state.config.web || {};
     $("web-readonly").textContent = `管理服务：${String(web.listen || "未配置")} · Secure Cookie：${web.secure_cookie ? "开启" : "关闭"} · web 分组只读；监听地址、数据库路径和日志过滤级别的变更需要重启整个程序。`;
-    renderPersonaLibrary(); renderModels(); renderEmbeddingTest(); renderSearchTest(); refreshToolPickers(); updateControls();
+    renderPersonaLibrary(); renderModels(); renderEmbeddingTest(); renderSearchTest(); refreshToolPickers(); renderAutoReplyBudget(); updateControls();
   }
 
   function readForm() {
@@ -760,8 +801,21 @@
       put(config, def.path, value);
     }
     readPluginConfig(config);
-    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config);
+    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config);
     return config;
+  }
+
+  function validateAutoReply(config) {
+    const policy = get(config, "plugins.ai.auto_reply");
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)) throw new Error("自动接话配置不完整，请重新载入配置。");
+    if (typeof policy.prompt !== "string" || !policy.prompt.trim() || [...policy.prompt.trim()].length > 2000) throw new Error("「接话策略」需要填写 1–2000 个字符，不能只含空白。");
+    for (const def of autoReplyFields.filter((entry) => entry.type === "number")) {
+      const value = get(config, def.path);
+      if (!Number.isSafeInteger(value) || value < def.min || value > def.max) throw new Error(`「${def.label}」需要填写 ${def.min}–${def.max} 范围内的整数。`);
+    }
+    if (policy.max_wait_ms < policy.debounce_ms) throw new Error("「最长合并等待」不能短于「消息合并等待」。");
+    if (policy.max_age_seconds * 1000 < policy.max_wait_ms) throw new Error("「待接话消息有效期」不能短于「最长合并等待」，请注意秒与毫秒的单位。");
+    policy.prompt = policy.prompt.trim();
   }
 
   function validateImmutable(config) {
@@ -784,6 +838,7 @@
 
   function markDirty() {
     state.dirty = true;
+    renderAutoReplyBudget();
     if ($("advanced").open && !state.jsonDirty) syncJson();
     updateControls();
   }
@@ -821,6 +876,7 @@
       if (!valid) throw new Error(`JSON 字段 ${def.path} 的类型不正确。`);
       if (def.type === "select" && !def.choices.some(([key]) => key === value)) throw new Error(`JSON 字段 ${def.path} 的选项无效。`);
     }
+    validateAutoReply(config);
     const pending = secretSnapshot();
     state.draft = config; state.jsonDirty = false; state.formInvalid = false; state.dirty = true;
     renderFields(pending); syncJson();
@@ -923,6 +979,8 @@
     state.personaTemplates = clone(result.persona_templates || {});
     validatePluginCatalog(result.plugin_catalog || []); state.pluginCatalog = clone(result.plugin_catalog || []);
     state.config = clone(result.config); state.draft = clone(result.config);
+    const baseEstimate = result.auto_reply_budget?.base_estimate;
+    state.autoReplyBaseEstimate = Number.isSafeInteger(baseEstimate) && baseEstimate >= 0 ? baseEstimate : null;
     state.revision = result.revision; state.secrets = result.secrets || {}; state.applyError = result.apply_error || null;
     if (state.applyFailure?.revision !== state.revision) state.applyFailure = null;
     state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
@@ -1535,6 +1593,7 @@
   function clearSession(message = "") {
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
     state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false; state.applyError = null; state.applyFailure = null;
+    state.autoReplyBaseEstimate = null; autoReplyBudgetControl = null;
     state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; state.pluginCatalog = []; pluginControls = null; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
     state.groupPersona = { saving: false, message: "", kind: "" }; $("group-persona-select").replaceChildren(); $("group-persona-select").value = "";
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();

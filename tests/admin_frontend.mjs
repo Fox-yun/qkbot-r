@@ -94,16 +94,233 @@ function harness() {
       obj[keys.at(-1)] = def.type === "check" ? true : def.type === "number" ? def.min ?? 1 : def.type === "nullableNumber" ? null : ["lines", "ids", "tools"].includes(def.type) ? [] : def.type === "select" ? def.choices[0][0] : def.type === "json" ? { "默认": "帮助群成员" } : "value";
     }
     result.plugins.ai.defaults = { ...result.plugins.ai.defaults, persona: "默认", paused: false, once: false, recent_messages: 24, input_budget: 6000, output_budget: 800 };
+    result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
     result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
     result.app.database = "data/test.db"; return result;
   }
   const sample = config();
-  const snapshot = () => ({ config: structuredClone(sample), revision: "r1", tool_catalog: [{ name: "clock_now", description: "读取当前时间", plugin_id: "clock", effect: "read" }, { name: "reminder_create", description: "创建提醒", plugin_id: "reminder", effect: "local_write" }], persona_templates: { "默认": "内置默认正文", "模板甲": "内置模板正文" }, secrets: { llm_api_key: { effective_set: true }, milky_access_token: { effective_set: false }, llbot_token: { effective_set: true } } });
+  const snapshot = () => ({ config: structuredClone(sample), revision: "r1", auto_reply_budget: { base_estimate: 1000 }, tool_catalog: [{ name: "clock_now", description: "读取当前时间", plugin_id: "clock", effect: "read" }, { name: "reminder_create", description: "创建提醒", plugin_id: "reminder", effect: "local_write" }], persona_templates: { "默认": "内置默认正文", "模板甲": "内置模板正文" }, secrets: { llm_api_key: { effective_set: true }, milky_access_token: { effective_set: false }, llbot_token: { effective_set: true } } });
   const conversation = (id = "1:group:10:0") => ({ id, scope: "1:group:10", bot_id: 1, scene: "group", peer_id: 10, owner_id: null, mode: "group", scope_mode: "group", is_current: true, epoch: 0, memory_revision: 1, settings: sample.plugins.ai.defaults, summary: "", context_count: 2, memory_count: 1 });
   async function login() { app.authView({ authenticated: true, csrf_token: "csrf-test", setup_required: false }); handler = async (path) => ({ body: path === "/api/config" ? snapshot() : {} }); await app.loadConfig(); }
   return { app, document, window, ids, calls, timers, sample, snapshot, conversation, login, setHandler(fn) { handler = fn; } };
 }
+
+test("automatic reply has a separate configuration group and uses server-normalized legacy defaults", async () => {
+  const h = harness(); await h.login();
+  const group = h.app.groups.find((entry) => entry.title === "自动接话");
+  assert.ok(group); assert.equal(group.fields.length, 6);
+  assert.match(group.description, /群与好友.*单独开启/u);
+  assert.match(group.description, /默认关闭.*保存并应用/u);
+  assert.match(group.description, /@.*关键词.*引用.*优先/u);
+  const policy = h.sample.plugins.ai.auto_reply;
+  for (const def of group.fields) {
+    const control = h.app.inputs.get(def.path).control;
+    assert.equal(control.value, String(policy[def.path.split(".").at(-1)]));
+    if (def.type === "number") {
+      assert.equal(control.type, "number"); assert.equal(control.step, "1");
+      assert.equal(control.min, String(def.min)); assert.equal(control.max, String(def.max));
+    }
+  }
+  const prompt = h.app.inputs.get("plugins.ai.auto_reply.prompt").control;
+  assert.equal(prompt.tagName, "TEXTAREA"); assert.equal(prompt.rows, 6); assert.equal(prompt.required, true);
+  const age = h.app.inputs.get("plugins.ai.auto_reply.max_age_seconds").wrapper;
+  assert.match(age.textContent, /不截断完整聊天上下文.*摘要.*长期记忆/u);
+  assert.match(h.app.inputs.get("plugins.ai.auto_reply.cooldown_seconds").wrapper.textContent, /0.*不限制/u);
+
+  // The API supplies serde-normalized defaults for old files. The browser must
+  // retain whatever policy the backend returns, rather than copy a prompt into JS.
+  const normalized = h.snapshot();
+  normalized.config.plugins.ai.auto_reply = { ...policy, prompt: "另一版本的服务端策略\n保持 🐟 风格", cooldown_seconds: 45, max_messages: 12 };
+  h.setHandler(async () => ({ body: normalized })); await h.app.loadConfig();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.readForm().plugins.ai.auto_reply)), normalized.config.plugins.ai.auto_reply);
+  assert.equal(h.app.state.formInvalid, false); assert.equal(h.app.state.dirty, false);
+});
+
+test("automatic reply settings save typed integers and apply without changing per-chat opt-ins", async () => {
+  const h = harness(); await h.login();
+  const values = { prompt: "  有新的问题时自然接话。\n无须回复时保持安静。  ", cooldown_seconds: "0", debounce_ms: "250", max_wait_ms: "1500", max_messages: "4", max_age_seconds: "5" };
+  for (const [key, value] of Object.entries(values)) {
+    const control = h.app.inputs.get("plugins.ai.auto_reply." + key).control;
+    control.value = value; await control.emit("input");
+  }
+  let saved;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/config" && options.method === "PUT") { saved = JSON.parse(options.body); return { body: {} }; }
+    if (path === "/api/config") return { body: { ...h.snapshot(), config: saved.config, revision: "r2" } };
+    return { body: { phase: "running", applied_revision: "r2", loaded_plugins: [] } };
+  });
+  await h.app.saveConfig(true);
+  assert.deepEqual(saved.config.plugins.ai.auto_reply, { prompt: values.prompt.trim(), cooldown_seconds: 0, debounce_ms: 250, max_wait_ms: 1500, max_messages: 4, max_age_seconds: 5 });
+  assert.equal(saved.revision, "r1");
+  assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
+  assert.equal(h.calls.some((call) => call.path.startsWith("/api/qq/contacts")), false);
+  assert.equal(h.ids.get("config-state").textContent, "已应用");
+});
+
+test("automatic reply numeric fields reject fractions and out-of-range form values", async () => {
+  const h = harness(); await h.login();
+  const fields = h.app.groups.find((entry) => entry.title === "自动接话").fields.filter((def) => def.type === "number");
+  const control = (key) => h.app.inputs.get("plugins.ai.auto_reply." + key).control;
+  for (const def of fields) {
+    control("debounce_ms").value = "100"; control("max_wait_ms").value = "30000"; control("max_age_seconds").value = "600";
+    const input = h.app.inputs.get(def.path).control, original = input.value;
+    for (const invalid of ["", "1.5", "NaN", "Infinity", "9007199254740992", String(def.min - 1), String(def.max + 1)]) {
+      input.value = invalid; assert.throws(() => h.app.readForm(), /整数/u, def.path + "=" + invalid);
+    }
+    for (const accepted of [def.min, def.max]) {
+      input.value = String(accepted);
+      if (def.path.endsWith("max_age_seconds")) control("max_wait_ms").value = "5000";
+      const value = h.app.readForm().plugins.ai.auto_reply[def.path.split(".").at(-1)];
+      assert.equal(value, accepted); assert.equal(typeof value, "number");
+    }
+    input.value = original;
+  }
+});
+
+test("automatic reply prompt validates trimmed Unicode characters and preserves multiline text", async () => {
+  const h = harness(); await h.login(); const input = h.app.inputs.get("plugins.ai.auto_reply.prompt").control;
+  for (const invalid of ["", " \n\t　 ", "鱼".repeat(2001), "🐟".repeat(2001)]) {
+    input.value = invalid; assert.throws(() => h.app.readForm(), /接话策略.*2000/u);
+  }
+  for (const valid of ["单字", "🐟".repeat(2000), "第一段\n\n第二段"]) {
+    input.value = " \n" + valid + "\t "; assert.equal(h.app.readForm().plugins.ai.auto_reply.prompt, valid);
+  }
+});
+
+test("automatic reply waiting and age bounds apply to both forms and advanced JSON", async () => {
+  const h = harness(); await h.login();
+  const input = (key) => h.app.inputs.get("plugins.ai.auto_reply." + key).control;
+  input("max_wait_ms").value = "1499";
+  assert.throws(() => h.app.readForm(), /最长合并等待.*消息合并等待/u);
+  input("max_wait_ms").value = "5001"; input("max_age_seconds").value = "5";
+  assert.throws(() => h.app.readForm(), /消息有效期.*最长合并等待/u);
+  input("max_wait_ms").value = "5000"; assert.equal(h.app.readForm().plugins.ai.auto_reply.max_age_seconds, 5);
+  const original = h.app.state.draft;
+  for (const patch of [
+    { prompt: "\n " }, { prompt: "🐟".repeat(2001) },
+    { cooldown_seconds: -1 }, { cooldown_seconds: 3601 }, { cooldown_seconds: "30" },
+    { debounce_ms: 99 }, { debounce_ms: 10001 }, { debounce_ms: 2.5 },
+    { max_wait_ms: 99 }, { max_wait_ms: 30001 }, { max_wait_ms: 1499 },
+    { max_messages: 0 }, { max_messages: 33 },
+    { max_age_seconds: 4 }, { max_age_seconds: 601 }, { max_wait_ms: 5001, max_age_seconds: 5 },
+  ]) {
+    const config = structuredClone(h.sample); Object.assign(config.plugins.ai.auto_reply, patch);
+    h.ids.get("config-json").value = JSON.stringify(config);
+    assert.throws(() => h.app.adoptJson(), /类型|接话策略|整数|不能短于/u);
+    assert.equal(h.app.state.draft, original, "invalid JSON must preserve existing controls and draft");
+  }
+  const accepted = structuredClone(h.sample); accepted.plugins.ai.auto_reply.prompt = "  🐟\n可编辑策略  "; accepted.plugins.ai.auto_reply.cooldown_seconds = 0;
+  h.ids.get("config-json").value = JSON.stringify(accepted); h.app.adoptJson();
+  assert.equal(h.app.readForm().plugins.ai.auto_reply.prompt, "🐟\n可编辑策略");
+  assert.equal(h.app.readForm().plugins.ai.auto_reply.cooldown_seconds, 0);
+});
+
+test("automatic reply budget counts UTF-8 and the final JSON escaping locally", async () => {
+  const h = harness(); await h.login(); const snapshot = h.snapshot();
+  snapshot.config.plugins.ai.auto_reply.prompt = " \n中文🐟\"\\\n行\t ";
+  snapshot.config.plugins.ai.defaults.persona = "助手🐟\"";
+  snapshot.config.plugins.ai.personas = { "助手🐟\"": "读\"图\"\n路径\\文🐟" };
+  snapshot.config.plugins.ai.defaults.input_budget = 20000;
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  const hint = h.ids.get("auto-reply-budget"), requests = h.calls.length;
+  assert.equal(hint.attrs.role, "status"); assert.equal(hint.attrs["aria-live"], "polite");
+  // 19 UTF-8 bytes of policy, plus 48 bytes of persona after the system
+  // message's outer JSON escaping. Padding whitespace is not submitted.
+  assert.match(hint.textContent, /策略\/人设及固定规则约占 1067 \/ 20000 输入预算，剩余 18933/u);
+  assert.match(hint.textContent, /当前消息.*历史.*摘要.*记忆.*工具/u);
+  assert.match(hint.textContent, /保守估算.*不是模型精确 token.*会话.*预算或人设/u);
+  assert.doesNotMatch(hint.className, /warning/u);
+  h.window.confirm = () => { assert.fail("budget estimation must not ask for confirmation"); };
+  const prompt = h.app.inputs.get("plugins.ai.auto_reply.prompt").control;
+  prompt.value = prompt.value.trim() + "\n🐟\""; await prompt.emit("input");
+  assert.match(hint.textContent, /约占 1075 \/ 20000/u, "newline, emoji and quote contribute 2 + 4 + 2 bytes");
+  assert.equal(h.calls.length, requests, "typing must not probe APIs or invoke a model");
+});
+
+test("automatic reply budget warns at both thresholds and clears when the budget grows", async () => {
+  const h = harness(); await h.login(); const snapshot = h.snapshot();
+  snapshot.config.plugins.ai.auto_reply.prompt = "A"; snapshot.config.plugins.ai.defaults.persona = "N";
+  snapshot.config.plugins.ai.personas = { N: "E" }; snapshot.auto_reply_budget.base_estimate = 4497;
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  let hint = h.ids.get("auto-reply-budget"), budget = h.app.inputs.get("plugins.ai.defaults.input_budget").control;
+  const requests = h.calls.length;
+  assert.match(hint.textContent, /接近输入预算.*4500 \/ 6000.*剩余 1500/u, "75% warns even with at least 1000 left");
+  for (const [value, expected] of [[4500, /已达到或超出.*剩余 0/u], [4499, /已达到或超出.*超出 1/u], [6001, /约占 4500 \/ 6001/u]]) {
+    budget.value = String(value); await budget.emit("input"); assert.match(hint.textContent, expected);
+  }
+  assert.doesNotMatch(hint.className, /warning/u); assert.doesNotMatch(hint.textContent, /接近|超出/u);
+  budget.value = "20000"; await budget.emit("input"); assert.doesNotMatch(hint.className, /warning/u);
+  assert.equal(h.calls.length, requests); assert.equal(budget.value, "20000");
+
+  snapshot.auto_reply_budget.base_estimate = 997; snapshot.config.plugins.ai.defaults.input_budget = 2000;
+  await h.app.loadConfig(); hint = h.ids.get("auto-reply-budget"); budget = h.app.inputs.get("plugins.ai.defaults.input_budget").control;
+  assert.doesNotMatch(hint.className, /warning/u);
+  budget.value = "1999"; await budget.emit("input");
+  assert.match(hint.textContent, /接近输入预算.*1000 \/ 1999.*剩余 999/u, "less than 1000 remaining warns below 75%");
+  budget.value = "2000"; await budget.emit("input"); assert.doesNotMatch(hint.className, /warning/u);
+});
+
+test("automatic reply budget follows default persona edits, JSON adoption and loaded metadata", async () => {
+  const h = harness(); await h.login();
+  const usage = () => Number(h.ids.get("auto-reply-budget").textContent.match(/约占 (\d+) \/ /u)[1]);
+  const initial = usage(), requests = h.calls.length;
+  const body = h.ids.get("persona-text"); body.value += "🐟\"\n"; await body.emit("input");
+  assert.equal(usage(), initial + 11, "custom persona body needs outer escaping: 4 + 4 + 3");
+  const selected = h.app.inputs.get("plugins.ai.defaults.persona").control;
+  selected.value = "模板甲"; await selected.emit("change");
+  assert.equal(usage(), initial - 3, "built-in selection replaces both name and body costs");
+  body.value += "这不是当前默认人设"; await body.emit("input");
+  assert.equal(usage(), initial - 3, "editing an unselected persona does not inflate the default estimate");
+  assert.equal(h.calls.length, requests);
+
+  const adopted = structuredClone(h.sample);
+  adopted.plugins.ai.defaults.persona = "N"; adopted.plugins.ai.personas = { N: "E" };
+  adopted.plugins.ai.auto_reply.prompt = "  A  "; adopted.plugins.ai.defaults.input_budget = 2048;
+  h.ids.get("config-json").value = JSON.stringify(adopted); h.app.adoptJson();
+  assert.match(h.ids.get("auto-reply-budget").textContent, /约占 1003 \/ 2048.*剩余 1045/u);
+  assert.equal(h.calls.length, requests, "adopting JSON only recomputes locally");
+  const snapshot = h.snapshot(); snapshot.config = adopted; snapshot.auto_reply_budget.base_estimate = 3000;
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  assert.match(h.ids.get("auto-reply-budget").textContent, /已达到或超出.*约占 3003 \/ 2048.*超出 955/u);
+});
+
+test("automatic reply budget warnings never block saving or leak metadata into configuration", async () => {
+  const h = harness(); await h.login(); const snapshot = h.snapshot();
+  snapshot.auto_reply_budget.base_estimate = 7000;
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+  assert.match(h.ids.get("auto-reply-budget").textContent, /已达到或超出/u);
+  const prompt = h.app.inputs.get("plugins.ai.auto_reply.prompt").control;
+  prompt.value = "保留原本的策略🐟"; await prompt.emit("input");
+  const requests = h.calls.length; let saved;
+  h.window.confirm = () => { assert.fail("budget warning must not request confirmation"); };
+  h.setHandler(async (path, options) => {
+    assert.equal(path, "/api/config", "saving must not probe a model or an estimate endpoint");
+    if (options.method === "PUT") { saved = JSON.parse(options.body); return { body: {} }; }
+    return { body: { ...snapshot, config: saved.config, revision: "r2", auto_reply_budget: { base_estimate: 8000 } } };
+  });
+  await h.app.saveConfig(false);
+  assert.deepEqual(h.calls.slice(requests).map((call) => call.options.method), ["PUT", "GET"]);
+  assert.equal(saved.config.plugins.ai.auto_reply.prompt, "保留原本的策略🐟");
+  assert.equal(saved.config.plugins.ai.defaults.input_budget, 6000);
+  assert.equal(Object.hasOwn(saved, "auto_reply_budget"), false); assert.equal(Object.hasOwn(saved.config, "auto_reply_budget"), false);
+  assert.equal(JSON.stringify(saved).includes("base_estimate"), false);
+  assert.match(h.ids.get("auto-reply-budget").textContent, /约占 8055 \/ 6000/u, "saved reload refreshes metadata and policy");
+});
+
+test("automatic reply budget degrades honestly when fixed overhead metadata is missing", async () => {
+  const h = harness(); await h.login();
+  for (const metadata of [undefined, { base_estimate: -1 }, { base_estimate: "1000" }]) {
+    const snapshot = h.snapshot(); snapshot.auto_reply_budget = metadata;
+    h.setHandler(async () => ({ body: snapshot })); await h.app.loadConfig();
+    const hint = h.ids.get("auto-reply-budget");
+    assert.match(hint.textContent, /仅策略\/人设约占/u);
+    assert.match(hint.textContent, /未计入宿主固定规则.*无法判断预算是否足够/u);
+    assert.match(hint.className, /warning/u);
+    assert.equal(h.app.state.formInvalid, false); assert.doesNotThrow(() => h.app.readForm());
+  }
+  h.app.clearSession(); assert.equal(h.app.state.autoReplyBaseEstimate, null);
+});
 
 test("search configuration and network-read catalog retain explicit grants and independent secrets", async () => {
   const h = harness(); await h.login();

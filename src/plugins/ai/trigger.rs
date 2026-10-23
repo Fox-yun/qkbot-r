@@ -596,13 +596,15 @@ impl Ingress {
         conversation.settings = settings;
         let automatic = reason == Some(Reason::Automatic);
         if automatic {
-            decision.auto_batch = Some(super::auto_reply::AutoBatch::new(
+            decision.auto_batch = Some(super::auto_reply::AutoBatch::new_with_limits(
                 super::auto_reply::AutoSource::from_message(
                     &job.message,
                     job.position,
                     decision.quote.clone(),
                 ),
-            ));
+                host.config.plugins.ai.auto_reply.max_messages,
+                host.config.plugins.ai.auto_reply.max_age_seconds,
+            )?);
         }
         match chat.enqueue_resolved(&job.message, job.position, &conversation, Some(decision)) {
             Ok(()) if conversation.settings.once && !automatic => {

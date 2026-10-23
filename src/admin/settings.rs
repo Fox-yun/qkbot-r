@@ -447,6 +447,9 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
     config.qq_login.token.clear();
     config.nonebot.token.clear();
     let plugin_catalog = crate::catalog::features(&config);
+    let auto_reply_budget = json!({
+        "base_estimate": crate::plugins::ai::chat::auto_reply_budget_base(&config)?,
+    });
     let mut config = serde_json::to_value(config)?;
     config["web"].as_object_mut().unwrap().remove("token");
     Ok(json!({
@@ -454,6 +457,7 @@ fn snapshot(bytes: &[u8], environment: &Environment) -> Result<Value> {
         "persona_templates": crate::personas::templates(),
         "tool_catalog": tool_catalog,
         "plugin_catalog":plugin_catalog,
+        "auto_reply_budget":auto_reply_budget,
         "apply_error": apply_error,
     }))
 }

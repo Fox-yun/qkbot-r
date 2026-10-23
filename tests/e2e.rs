@@ -249,6 +249,206 @@ fn recall_message(seq: i64) -> Incoming {
 }
 
 #[tokio::test]
+async fn auto_reply_custom_policy_and_zero_cooldown_take_effect_in_real_turns() {
+    let mut mock = MockServer::start().await;
+    let policy = "只在讨论天文时主动接话；参与时先分享一条相关知识。marker-custom-policy";
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.auto_reply.prompt = policy.into();
+        config.plugins.ai.auto_reply.cooldown_seconds = 0;
+        config.plugins.ai.auto_reply.debounce_ms = 100;
+        config.plugins.ai.auto_reply.max_wait_ms = 200;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    for seq in 1..=2 {
+        router
+            .dispatch(ordinary_message(seq, &format!("天文话题 {seq}")))
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), mock.model())
+            .await
+            .expect("configured 100ms debounce and zero cooldown must both take effect");
+        let system = request.body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains(policy));
+        assert!(system.contains("本轮参与方式：observe"));
+        assert!(system.contains("无需参与仅输出<NO_REPLY>"));
+        assert!(
+            !system.contains("可接续与你的对话或合适闲聊"),
+            "the custom policy replaces the default policy"
+        );
+        request.reply.send(answer("天文回复")).unwrap();
+        assert_eq!(mock.sent().await, "天文回复");
+        wait_for_outbox(&host, "confirmed", seq).await;
+    }
+    router
+        .dispatch(message(3, "明确提问仍然优先"))
+        .await
+        .unwrap();
+    let explicit = mock.model().await;
+    let system = explicit.body["messages"][0]["content"].as_str().unwrap();
+    assert!(!system.contains(policy));
+    assert!(!system.contains("本轮参与方式：observe"));
+    explicit.reply.send(answer("<NO_REPLY>")).unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn long_automatic_policy_does_not_block_explicit_requests() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.auto_reply.prompt = "策".repeat(2000);
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    router
+        .dispatch(message(1, "explicit-request-with-long-automatic-policy"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    assert!(
+        !request.body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&"策".repeat(2000))
+    );
+    request.reply.send(answer("explicit-answer")).unwrap();
+    assert_eq!(mock.sent().await, "explicit-answer");
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_custom_cooldown_expires_at_its_configured_duration() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.auto_reply.cooldown_seconds = 1;
+        config.plugins.ai.auto_reply.debounce_ms = 100;
+        config.plugins.ai.auto_reply.max_wait_ms = 200;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    router
+        .dispatch(ordinary_message(1, "first-topic"))
+        .await
+        .unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(answer("first-answer"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "first-answer");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    router
+        .dispatch(ordinary_message(2, "topic-during-one-second-cooldown"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), mock.models.recv())
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    router
+        .dispatch(ordinary_message(3, "topic-after-one-second-cooldown"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    assert!(
+        request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("topic-after-one-second-cooldown")
+    );
+    request.reply.send(answer("<NO_REPLY>")).unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_custom_batch_limit_flushes_without_losing_earlier_messages() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.auto_reply.max_messages = 2;
+        config.plugins.ai.auto_reply.debounce_ms = 1000;
+        config.plugins.ai.auto_reply.max_wait_ms = 2000;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    for seq in 1..=3 {
+        router
+            .dispatch(ordinary_message(seq, &format!("fragment-{seq}")))
+            .await
+            .unwrap();
+    }
+    let first = tokio::time::timeout(Duration::from_millis(800), mock.model())
+        .await
+        .expect("the configured two-message batch must flush before its debounce deadline");
+    let current = first.body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(current.contains("fragment-1") && current.contains("fragment-2"));
+    assert!(!current.contains("fragment-3"));
+    first.reply.send(answer("<NO_REPLY>")).unwrap();
+    let second = mock.model().await;
+    let current = second.body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(current.contains("fragment-3"));
+    assert!(!current.contains("fragment-1") && !current.contains("fragment-2"));
+    second.reply.send(answer("<NO_REPLY>")).unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_custom_maximum_wait_caps_a_continuously_extended_batch() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.auto_reply.debounce_ms = 1000;
+        config.plugins.ai.auto_reply.max_wait_ms = 1300;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    for seq in 1..=3 {
+        if seq > 1 {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+        router
+            .dispatch(ordinary_message(seq, &format!("continuing-fragment-{seq}")))
+            .await
+            .unwrap();
+    }
+    let request = tokio::time::timeout(Duration::from_millis(800), mock.model())
+        .await
+        .expect("the 1300ms maximum wait must cap repeated 1000ms debounce extensions");
+    let current = request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    for seq in 1..=3 {
+        assert!(current.contains(&format!("continuing-fragment-{seq}")));
+    }
+    request.reply.send(answer("<NO_REPLY>")).unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
 async fn auto_reply_defaults_off_and_opt_in_is_isolated_from_other_groups_and_private_chats() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup(&mock, true).await;

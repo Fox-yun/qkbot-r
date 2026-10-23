@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) const MAX_MESSAGES: usize = 8;
 const MAX_AGE_SECONDS: i64 = 120;
+const HARD_MAX_MESSAGES: usize = 32;
+const MIN_AGE_SECONDS: u64 = 5;
+const HARD_MAX_AGE_SECONDS: u64 = 600;
 // The fifth input slot remains available for the existing sticker preview.
 const MAX_BATCH_IMAGES: usize = crate::llm::MAX_INPUT_IMAGES - 1;
 
@@ -69,18 +72,62 @@ impl AutoSource {
 #[derive(Clone)]
 pub(super) struct AutoBatch {
     pub sources: Vec<AutoSource>,
+    limits: BatchLimits,
+}
+
+/// Queue admission freezes these values so a turn and its final send use the
+/// same limits even if the administrator changes the runtime configuration.
+#[derive(Clone, Copy)]
+struct BatchLimits {
+    max_messages: usize,
+    max_age_seconds: u64,
+}
+
+impl BatchLimits {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=HARD_MAX_MESSAGES).contains(&self.max_messages),
+            "自动接话批次上限须为 1..=32"
+        );
+        ensure!(
+            (MIN_AGE_SECONDS..=HARD_MAX_AGE_SECONDS).contains(&self.max_age_seconds),
+            "自动接话消息有效期须为 5..=600 秒"
+        );
+        Ok(())
+    }
 }
 
 impl AutoBatch {
     pub(super) fn new(source: AutoSource) -> Self {
         Self {
             sources: vec![source],
+            limits: BatchLimits {
+                max_messages: MAX_MESSAGES,
+                max_age_seconds: MAX_AGE_SECONDS as u64,
+            },
         }
+    }
+
+    pub(super) fn new_with_limits(
+        source: AutoSource,
+        max_messages: usize,
+        max_age_seconds: u64,
+    ) -> Result<Self> {
+        let limits = BatchLimits {
+            max_messages,
+            max_age_seconds,
+        };
+        limits.validate()?;
+        let mut batch = Self::new(source);
+        batch.limits = limits;
+        Ok(batch)
     }
 
     /// A full batch is flushed by its owner; it never silently evicts an earlier message.
     pub(super) fn push(&mut self, source: AutoSource) -> bool {
-        if self.sources.len() >= MAX_MESSAGES
+        if self.limits.validate().is_err()
+            || self.sources.len() >= self.limits.max_messages
+            || self.sources.len() >= HARD_MAX_MESSAGES
             || self.sources.iter().any(|old| old.key == source.key)
             || self.sources.last().is_some_and(|last| {
                 last.key.scope != source.key.scope || last.position >= source.position
@@ -98,6 +145,7 @@ impl AutoBatch {
 
     pub(super) fn authorization(&self) -> BatchCheck {
         BatchCheck {
+            limits: self.limits,
             sources: self
                 .sources
                 .iter()
@@ -126,14 +174,18 @@ struct SourceCheck {
 #[derive(Clone)]
 pub(super) struct BatchCheck {
     sources: Vec<SourceCheck>,
+    limits: BatchLimits,
 }
 
 impl BatchCheck {
     pub(super) fn check(&self, db: &Connection, guard: &ContextGuard, scope: &Scope) -> Result<()> {
         crate::host::check_guard(db, guard)?;
         crate::access::require_auto_reply(db, &scope.key())?;
+        self.limits.validate()?;
         ensure!(
-            !self.sources.is_empty() && self.sources.len() <= MAX_MESSAGES,
+            !self.sources.is_empty()
+                && self.sources.len() <= self.limits.max_messages
+                && self.sources.len() <= HARD_MAX_MESSAGES,
             "自动接话批次无效"
         );
         let timestamp = now();
@@ -151,7 +203,7 @@ impl BatchCheck {
             );
             last_position = source.position;
             ensure!(
-                source.received_at >= timestamp.saturating_sub(MAX_AGE_SECONDS)
+                source.received_at >= timestamp.saturating_sub(self.limits.max_age_seconds as i64)
                     && source.received_at <= timestamp.saturating_add(5),
                 "自动接话消息已过期"
             );
@@ -560,6 +612,75 @@ mod tests {
         let snapshot = source.images.raw_snapshot().to_string();
         assert!(snapshot.contains("verified-resource"));
         assert!(!snapshot.contains("secret"));
+    }
+
+    #[test]
+    fn configured_batch_sizes_are_enforced_with_a_fixed_worst_case_cap() {
+        let (db, scope, guard, fixture) = fixture();
+        let first = fixture.sources[0].clone();
+        for maximum in [1, 3, HARD_MAX_MESSAGES] {
+            let mut batch = AutoBatch::new_with_limits(first.clone(), maximum, 120).unwrap();
+            for offset in 1..maximum {
+                let mut source = first.clone();
+                source.key.message_seq += offset as i64;
+                source.position += offset as i64;
+                assert!(batch.push(source));
+            }
+            let mut overflow = first.clone();
+            overflow.key.message_seq += maximum as i64;
+            overflow.position += maximum as i64;
+            assert!(!batch.push(overflow));
+            assert_eq!(batch.sources.len(), maximum);
+        }
+        for maximum in [0, HARD_MAX_MESSAGES + 1, usize::MAX] {
+            assert!(AutoBatch::new_with_limits(first.clone(), maximum, 120).is_err());
+        }
+        for seconds in [0, MIN_AGE_SECONDS - 1, HARD_MAX_AGE_SECONDS + 1, u64::MAX] {
+            assert!(AutoBatch::new_with_limits(first.clone(), 3, seconds).is_err());
+        }
+        // The validation boundary does not trust callers to use push correctly.
+        let mut batch = AutoBatch::new_with_limits(first, 1, 120).unwrap();
+        check(&db, &guard, &scope, &batch).unwrap();
+        batch.sources.push(fixture.sources[1].clone());
+        assert!(check(&db, &guard, &scope, &batch).is_err());
+    }
+
+    #[test]
+    fn configured_expiry_and_final_authorization_use_the_frozen_limits() {
+        let (db, scope, guard, fixture) = fixture();
+        for (maximum_age, age, expected) in [
+            (5, 0, true),
+            (5, 10, false),
+            (600, 300, true),
+            (600, 610, false),
+        ] {
+            let mut source = fixture.sources[0].clone();
+            source.received_at = now() - age;
+            db.execute(
+                "UPDATE messages SET received_at=?1 WHERE key=?2",
+                params![source.received_at, source.key.key()],
+            )
+            .unwrap();
+            let batch = AutoBatch::new_with_limits(source, 3, maximum_age).unwrap();
+            assert_eq!(check(&db, &guard, &scope, &batch).is_ok(), expected);
+        }
+
+        let mut source = fixture.sources[0].clone();
+        source.received_at = now() - 30;
+        db.execute(
+            "UPDATE messages SET received_at=?1 WHERE key=?2",
+            params![source.received_at, source.key.key()],
+        )
+        .unwrap();
+        let mut batch = AutoBatch::new_with_limits(source, 3, 600).unwrap();
+        let authorization = super::super::reply::Authorization::external(vec![])
+            .with_auto_reply(&batch, CancellationToken::new());
+        authorization.check_sources(&db, &scope, &guard).unwrap();
+        // Simulate a later settings replacement: the already-issued send grant
+        // keeps its accepted lifetime rather than borrowing mutable settings.
+        batch.limits.max_age_seconds = 5;
+        assert!(check(&db, &guard, &scope, &batch).is_err());
+        authorization.check_sources(&db, &scope, &guard).unwrap();
     }
 
     #[test]

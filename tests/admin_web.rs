@@ -484,6 +484,68 @@ async fn http_config_save_preserves_clears_sets_secrets_and_rejects_external_rev
 }
 
 #[tokio::test]
+async fn automatic_reply_policy_roundtrips_through_admin_save_and_apply() {
+    let panel = Panel::start().await;
+    panel.phase("waiting_login", None).await;
+    let mut snapshot = panel.snapshot().await;
+    let base = snapshot["auto_reply_budget"]["base_estimate"]
+        .as_u64()
+        .unwrap();
+    assert!(base > 0);
+    assert!(snapshot["config"].get("auto_reply_budget").is_none());
+    let policy = json!({
+        "prompt": "只在可以补充有用信息时参与闲聊。",
+        "cooldown_seconds": 7,
+        "debounce_ms": 250,
+        "max_wait_ms": 1000,
+        "max_messages": 3,
+        "max_age_seconds": 45
+    });
+    snapshot["config"]["plugins"]["ai"]["auto_reply"] = policy.clone();
+    let response = panel.save(&snapshot, json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: Value = response.json().await.unwrap();
+    assert_eq!(saved["auto_reply_budget"]["base_estimate"], base);
+    assert_eq!(saved["config"]["plugins"]["ai"]["auto_reply"], policy);
+    assert_eq!(
+        serde_json::to_value(panel.stored().plugins.ai.auto_reply).unwrap(),
+        policy
+    );
+    let response = panel
+        .request(Method::POST, "/api/runtime/apply")
+        .json(&json!({"revision":saved["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    panel
+        .phase("waiting_login", saved["revision"].as_str())
+        .await;
+    assert_eq!(
+        panel.snapshot().await["config"]["plugins"]["ai"]["auto_reply"],
+        policy
+    );
+
+    let original = std::fs::read(&panel.path).unwrap();
+    for invalid in [json!({"prompt":" \n\t "}), json!({"max_wait_ms":100})] {
+        let mut rejected = saved.clone();
+        for (key, value) in invalid.as_object().unwrap() {
+            rejected["config"]["plugins"]["ai"]["auto_reply"][key] = value.clone();
+        }
+        let response = panel.save(&rejected, json!({})).await;
+        assert!(response.status().is_client_error());
+        assert!(
+            response.json::<Value>().await.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("自动接话")
+        );
+        assert_eq!(std::fs::read(&panel.path).unwrap(), original);
+    }
+    panel.shutdown().await;
+}
+
+#[tokio::test]
 async fn malformed_partial_and_oversized_requests_never_replace_configuration() {
     let panel = Panel::start().await;
     panel.phase("waiting_login", None).await;
