@@ -244,9 +244,9 @@
     }
     if (error.status === 409 && error.path === "/api/config") {
       state.stale = true;
-      $("config-warning").textContent = "配置已被其他页面或本机修改。本页编辑仍保留；请先复制需要保留的内容，再点击「重新载入」取得最新版本。";
+      $("config-warning").textContent = "服务器配置已更新，本页修改仍保留。请点击「保留修改，刷新版本」核对后再保存；有冲突的字段不会被覆盖。";
       $("config-warning").hidden = false;
-      updateControls();
+      configSaveFeedback($("config-warning").textContent, "warning");
     }
     notice(error.message || "操作未完成。", "error");
   }
@@ -508,8 +508,8 @@
     if (conversation) renderToolPicker(conversation, undefined, "conversation");
   }
   function readToolPicker(control) { return [...control.toolPicker.selected]; }
-  function personaChoices(config) {
-    return new Map([...Object.entries(state.personaTemplates), ...Object.entries(config?.plugins?.ai?.personas || {})]);
+  function personaChoices(config, templates = state.personaTemplates) {
+    return new Map([...Object.entries(templates), ...Object.entries(config?.plugins?.ai?.personas || {})]);
   }
   function renderAutoReplyBudget() {
     if (!autoReplyBudgetControl || !state.draft) return;
@@ -536,8 +536,8 @@
       + (complete ? "" : "未计入宿主固定规则开销，实际占用更高，无法判断预算是否足够。")
       + "还需容纳当前消息、历史、摘要、记忆和工具。这里是保守估算，不是模型精确 token；会话单独覆盖预算或人设时，以该会话设置为准。";
   }
-  function requirePersona(config, name, label = "人设") {
-    if (!personaChoices(config).has(name)) throw new Error(`「${label}」已失效，请从列表重新选择。`);
+  function requirePersona(config, name, label = "人设", templates = state.personaTemplates) {
+    if (!personaChoices(config, templates).has(name)) throw new Error(`「${label}」已失效，请从列表重新选择。`);
   }
   function fillPersonaSelect(control, selected, config) {
     const choices = personaChoices(config); control.replaceChildren();
@@ -638,8 +638,12 @@
     hint.id = `${id}-hint`; control.setAttribute("aria-describedby", hint.id);
     if (definition.type === "check") { const copy = element("div"); copy.append(label, hint); wrapper.append(control, copy); }
     else { wrapper.append(label, control); if (range || definition.hint) wrapper.append(hint); }
-    inputs.set(definition.path, { control, definition, wrapper });
+    const error = element("p", "inline-error"); error.id = `${id}-error`; error.hidden = true;
+    wrapper.append(error);
+    inputs.set(definition.path, { control, definition, wrapper, error });
     control.addEventListener("input", () => {
+      error.hidden = true; error.textContent = ""; control.removeAttribute("aria-invalid");
+      control.setAttribute("aria-describedby", hint.id);
       if (definition.path === "llm.chat_completions_url") invalidateModels();
       if (definition.path === "llm.model") renderModels();
       if (definition.path.startsWith("embedding.")) invalidateEmbeddingTest();
@@ -807,6 +811,7 @@
 
   function readForm() {
     const config = clone(state.draft);
+    const errors = [];
     for (const { control, definition: def } of inputs.values()) {
       if (def.type === "tools") { put(config, def.path, readToolPicker(control)); continue; }
       let value = control.value.trim();
@@ -818,7 +823,8 @@
           const numeric = Number(value);
           if (value === "" || !Number.isSafeInteger(numeric) || !control.validity.valid || (def.min !== undefined && numeric < def.min) || (def.max !== undefined && numeric > def.max)) {
             const range = def.min !== undefined && def.max !== undefined ? `${def.min}–${def.max} 范围内` : def.min !== undefined ? `不小于 ${def.min}` : "有效范围内";
-            throw new Error(`「${def.label}」需要填写${range}的整数。`);
+            errors.push({ path: def.path, message: `「${def.label}」需要填写${range}的整数。` });
+            continue;
           }
           value = numeric;
         }
@@ -836,9 +842,39 @@
       }
       put(config, def.path, value);
     }
+    if (errors.length) throw configFieldError(errors);
     readPluginConfig(config);
-    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config); validateLearning(config); validateContext(config);
+    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config); validateLearning(config); validateContext(config); validateSearch(config);
     return config;
+  }
+
+  function configFieldError(errors) {
+    return Object.assign(new Error(errors.map((entry) => entry.message).join("\n")), { fieldErrors: errors });
+  }
+  function showConfigProblem(error) {
+    for (const entry of inputs.values()) {
+      entry.error.hidden = true; entry.error.textContent = "";
+      entry.control.removeAttribute("aria-invalid");
+      entry.control.setAttribute("aria-describedby", `${entry.control.id}-hint`);
+    }
+    for (const issue of error.fieldErrors || []) {
+      const entry = inputs.get(issue.path); if (!entry) continue;
+      entry.error.textContent = issue.message; entry.error.hidden = false;
+      entry.control.setAttribute("aria-invalid", "true");
+      entry.control.setAttribute("aria-describedby", `${entry.control.id}-hint ${entry.error.id}`);
+    }
+    const first = inputs.get(error.fieldErrors?.[0]?.path);
+    if (first) {
+      const group = groups.find((entry) => entry.fields.includes(first.definition));
+      if (group && state.configCategory !== "all") filterConfig(configGroupCategory(group));
+      first.wrapper.scrollIntoView?.({ block: "center", behavior: "instant" });
+    }
+  }
+  function validateSearch(config) {
+    const search = config.plugins.web_search, timeout = config.limits.tool_timeout_secs;
+    if (search.enabled && Number.isFinite(timeout) && search.request_timeout_secs >= timeout) {
+      throw configFieldError([{ path: "plugins.web_search.request_timeout_secs", message: `「搜索超时（秒）」必须小于工具总超时（${timeout} 秒）。` }]);
+    }
   }
 
   function validateAutoReply(config) {
@@ -959,7 +995,7 @@
       if (!valid) throw new Error(`JSON 字段 ${def.path} 的类型不正确。`);
       if (def.type === "select" && !def.choices.some(([key]) => key === value)) throw new Error(`JSON 字段 ${def.path} 的选项无效。`);
     }
-    validateAutoReply(config); validateLearning(config); validateContext(config);
+    validateAutoReply(config); validateLearning(config); validateContext(config); validateSearch(config);
     const pending = secretSnapshot();
     state.draft = config; state.jsonDirty = false; state.formInvalid = false; state.dirty = true;
     renderFields(pending); syncJson();
@@ -1002,17 +1038,21 @@
   }
   function renderConfigSave() {
     const saving = state.configSave, pending = state.pendingOperation;
-    const checking = pending && ["config", "runtime"].includes(pending.kind);
+    const checking = Boolean(pending);
     const message = checking ? pending.label + "的响应未确认，请查询结果；不会重复提交。" + (saving.kind === "error" ? " " + saving.message : "")
-      : state.stale ? saving.message || "保存状态待核对。请先保留当前编辑，再重新载入服务器配置。" : saving.message;
-    const node = $("config-save-message"); node.textContent = message;
-    node.hidden = !message; node.className = "config-save-message" + (checking || state.stale ? " warning-text" : saving.kind ? " " + saving.kind + "-text" : "");
-    $("config-check-operation").hidden = !checking;
-    $("config-check-operation").disabled = state.busy || !state.authenticated;
+      : state.stale ? (saving.message ? saving.message + " " : "") + "保存已暂停。可保留修改并刷新版本，核对后继续保存。" : saving.message;
+    for (const suffix of ["", "-top"]) {
+      const node = $("config-save-message" + suffix); node.textContent = message;
+      node.hidden = !message; node.className = "config-save-message" + (checking || state.stale ? " warning-text" : saving.kind ? " " + saving.kind + "-text" : "");
+      $("config-check-operation" + suffix).hidden = !checking;
+      $("config-check-operation" + suffix).disabled = state.busy || !state.authenticated;
+      $("config-refresh-draft" + suffix).hidden = !state.stale || checking;
+      $("config-refresh-draft" + suffix).disabled = state.busy || !state.authenticated;
+    }
     for (const id of ["save-config", "save-config-top", "save-apply"]) {
       $(id).textContent = saving.phase || (id === "save-apply" ? "保存并应用" : "保存当前配置");
       $(id).setAttribute("aria-busy", String(Boolean(saving.phase)));
-      $(id).setAttribute("aria-describedby", "config-save-message");
+      $(id).setAttribute("aria-describedby", id === "save-config-top" ? "config-save-message-top" : "config-save-message");
     }
   }
   function updateControls() {
@@ -1073,25 +1113,73 @@
     renderConfigSave();
   }
 
-  async function loadConfig() {
-    const result = await api("/api/config");
+  function validateConfigSnapshot(result) {
     if (!result.config || typeof result.revision !== "string") throw new Error("配置响应缺少 config 或 revision。");
     if (result.apply_error != null && typeof result.apply_error !== "string") throw new Error("配置应用校验结果无效。");
     validatePersonaMap(result.persona_templates || {}, false); validatePersonaMap(get(result.config, "plugins.ai.personas"), false);
-    validateToolCatalog(result.tool_catalog ?? []); state.toolCatalog = clone(result.tool_catalog ?? []);
+    validateToolCatalog(result.tool_catalog ?? []); validatePluginCatalog(result.plugin_catalog || []);
+  }
+  async function loadConfig(result = null, draft = null) {
+    result ||= await api("/api/config");
+    validateConfigSnapshot(result);
+    state.toolCatalog = clone(result.tool_catalog ?? []);
     state.personaTemplates = clone(result.persona_templates || {});
-    validatePluginCatalog(result.plugin_catalog || []); state.pluginCatalog = clone(result.plugin_catalog || []);
-    state.config = clone(result.config); state.draft = clone(result.config);
+    state.pluginCatalog = clone(result.plugin_catalog || []);
+    state.config = clone(result.config); state.draft = clone(draft || result.config);
     const baseEstimate = result.auto_reply_budget?.base_estimate;
     state.autoReplyBaseEstimate = Number.isSafeInteger(baseEstimate) && baseEstimate >= 0 ? baseEstimate : null;
     state.revision = result.revision; state.secrets = result.secrets || {}; state.applyError = result.apply_error || null;
     if (state.applyFailure?.revision !== state.revision) state.applyFailure = null;
-    state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
+    state.dirty = Boolean(draft); state.jsonDirty = false; state.formInvalid = false; state.stale = false;
     if (!state.configSave.phase) state.configSave = { phase: "", message: "", kind: "" };
     resumeQqPolling(); clearQr();
     $("config-warning").hidden = true;
     $("saved-revision").textContent = "已保存版本：" + state.revision;
     renderFields(); refreshPersonaSelectors(); syncJson(); renderStatus(); renderQq(); scheduleQq(0);
+  }
+
+  function mergeConfigDraft(base, local, remote) {
+    const conflicts = [], object = (value) => value && typeof value === "object" && !Array.isArray(value);
+    const own = (value, key) => Object.hasOwn(value, key) ? value[key] : undefined;
+    function merge(before, mine, latest, path) {
+      if (canonical(mine) === canonical(before)) return latest;
+      if (canonical(latest) === canonical(before) || canonical(mine) === canonical(latest)) return mine;
+      if (object(before) && object(mine) && object(latest)) {
+        return Object.fromEntries([...new Set([...Object.keys(before), ...Object.keys(mine), ...Object.keys(latest)])]
+          .map((key) => [key, merge(own(before, key), own(mine, key), own(latest, key), path ? path + "." + key : key)])
+          .filter(([, value]) => value !== undefined));
+      }
+      conflicts.push(path); return mine;
+    }
+    const merged = merge(base, local, remote, "");
+    if (conflicts.length) {
+      const labels = conflicts.map((path) => inputs.get(path)?.definition.label || path);
+      throw new Error("以下配置在两边都已修改，未覆盖任何内容：" + labels.join("、") + "。请先保留本页修改，再重新载入核对。 ");
+    }
+    return merged;
+  }
+  async function refreshConfigDraft() {
+    if (!state.authenticated || !state.config || !state.stale || state.pendingOperation) return;
+    const session = state.session;
+    try {
+      if (state.jsonDirty) throw new Error("请先采用或放弃当前 JSON 编辑，再刷新版本；当前 JSON 已保留。");
+      if (Object.values(secretChanges()).some((change) => change.action !== "keep")) {
+        throw new Error("密钥有尚未保存的修改，无法自动核对是否冲突。当前密钥输入已保留；请先保留并撤销密钥修改，再刷新版本。");
+      }
+      const local = readForm();
+      configSaveFeedback("正在读取最新版本并核对修改。", "", "正在核对…");
+      const latest = await api("/api/config");
+      if (session !== state.session || !state.authenticated) return;
+      validateConfigSnapshot(latest);
+      const merged = mergeConfigDraft(state.config, local, latest.config);
+      validatePersonaMap(merged.plugins.ai.personas); validateAutoReply(merged); validateLearning(merged); validateContext(merged); validateSearch(merged);
+      requirePersona(merged, merged.plugins.ai.defaults.persona, "合并后的默认人设", latest.persona_templates || {});
+      await loadConfig(latest, merged);
+      if (session === state.session) configSaveFeedback("已取得最新版本，并保留本页修改。请核对后点击保存；尚未写入或应用。", "success");
+    } catch (error) {
+      if (session === state.session && state.authenticated) { showConfigProblem(error); configSaveFeedback(error.message, "error"); }
+      throw error;
+    } finally { if (session === state.session) { state.configSave.phase = ""; updateControls(); } }
   }
 
   function badge(id, text, kind) { $(id).textContent = text; $(id).className = "badge " + kind; }
@@ -1760,7 +1848,7 @@
     notice(stop ? "已提交断开请求。" : "配置已保存，已提交应用请求；生效状态会自动更新。"); await refreshStatus(); return true;
   }
   async function saveConfig(apply) {
-    if (state.pendingOperation || state.stale) { updateControls(); return; }
+    if (state.pendingOperation || state.stale) { configSaveFeedback("请先核对当前操作或刷新配置版本，当前修改仍保留。", "warning"); return; }
     const session = state.session; let saved = false, refreshed = false;
     configSaveFeedback("正在校验并保存配置，请稍候。", "", "正在保存…");
     try {
@@ -1786,6 +1874,7 @@
       if (session === state.session) {
         if (saved && !refreshed) { state.stale = true; error.message = "配置已保存，但读取保存结果失败。请重新载入核对后再继续。" + error.message; }
         const message = error.code === "reauth_required" ? "请完成密码重新验证，再点击保存。当前编辑已保留。" : error.message || "保存未完成，请检查配置。";
+        showConfigProblem(error);
         configSaveFeedback(message, "error");
       }
       throw error;
@@ -2392,7 +2481,10 @@
   document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeDialog(dialog.id); }));
   $("dismiss-notice").addEventListener("click", () => { $("notice").hidden = true; });
   $("check-operation").addEventListener("click", () => { void runAction(checkOperation); });
-  $("config-check-operation").addEventListener("click", () => { void runAction(async () => { try { await checkOperation(); configSaveFeedback($("notice-text").textContent, state.pendingOperation || state.stale ? "warning" : "success"); } catch (error) { configSaveFeedback(error.message, "error"); throw error; } }); });
+  for (const suffix of ["", "-top"]) {
+    $("config-check-operation" + suffix).addEventListener("click", () => { void runAction(async () => { try { await checkOperation(); configSaveFeedback($("notice-text").textContent, state.pendingOperation || state.stale ? "warning" : "success"); } catch (error) { configSaveFeedback(error.message, "error"); throw error; } }); });
+    $("config-refresh-draft" + suffix).addEventListener("click", () => { void runAction(refreshConfigDraft); });
+  }
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelectorAll("[data-config-category]").forEach((button) => button.addEventListener("click", () => filterConfig(button.dataset.configCategory)));
   document.querySelectorAll("[data-config-section]").forEach((button) => button.addEventListener("click", () => openConfigSection(button.dataset.configSection)));

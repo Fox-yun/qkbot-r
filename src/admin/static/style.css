@@ -490,3 +490,4 @@ code{background:#f0f4eb;color:#697d5e}
 @media(max-width:780px){.navigation,.config-categories{scrollbar-width:none}
 .navigation::-webkit-scrollbar,.config-categories::-webkit-scrollbar{display:none}
 }
+.config-save-feedback .config-save-message{max-width:none;margin:0 0 10px;white-space:pre-line}.config-save-feedback .text-button{margin:0 14px 12px 0}#config-refresh-draft{margin-top:6px;font-size:12px}.field [aria-invalid="true"]{border-color:#a24432}.field>.inline-error{margin:7px 0 0;font-size:12px}

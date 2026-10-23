@@ -485,6 +485,72 @@ async fn http_config_save_preserves_clears_sets_secrets_and_rejects_external_rev
 }
 
 #[tokio::test]
+async fn search_limits_save_together_and_stale_revision_cannot_overwrite_them() {
+    let panel = Panel::start().await;
+    panel.phase("waiting_login", None).await;
+    let original = panel.snapshot().await;
+    let mut edited = original.clone();
+    let limits = json!({
+        "max_results": 4,
+        "request_timeout_secs": 10,
+        "max_response_bytes": 524288,
+        "max_output_bytes": 8192,
+        "max_concurrent_requests": 4,
+        "max_calls_per_turn": 2,
+        "user_per_hour": 20,
+        "conversation_per_hour": 60,
+        "global_per_hour": 120
+    });
+    for (key, value) in limits.as_object().unwrap() {
+        edited["config"]["plugins"]["web_search"][key] = value.clone();
+    }
+
+    let response = panel.save(&edited, json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: Value = response.json().await.unwrap();
+    let latest = panel.snapshot().await;
+    assert_ne!(latest["revision"], original["revision"]);
+    assert_eq!(latest["revision"], saved["revision"]);
+    assert_eq!(latest["config"], edited["config"]);
+    assert_eq!(latest["config"]["llm"], original["config"]["llm"]);
+    assert_eq!(
+        latest["config"]["plugins"]["ai"],
+        original["config"]["plugins"]["ai"]
+    );
+    let stored_search = serde_json::to_value(panel.stored().plugins.web_search).unwrap();
+    for (key, value) in limits.as_object().unwrap() {
+        assert_eq!(&stored_search[key], value, "stored search limit {key}");
+    }
+
+    let before_conflict = std::fs::read(&panel.path).unwrap();
+    let mut stale = original.clone();
+    stale["config"]["plugins"]["web_search"]["global_per_hour"] = json!(300);
+    let response = panel.save(&stale, json!({})).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(std::fs::read(&panel.path).unwrap(), before_conflict);
+    let refreshed = panel.snapshot().await;
+    assert_eq!(refreshed["revision"], latest["revision"]);
+    assert_eq!(refreshed["config"], latest["config"]);
+
+    let mut retry = refreshed;
+    retry["config"]["plugins"]["web_search"]["global_per_hour"] = json!(240);
+    let response = panel.save(&retry, json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let retried: Value = response.json().await.unwrap();
+    let final_snapshot = panel.snapshot().await;
+    assert_ne!(final_snapshot["revision"], latest["revision"]);
+    assert_eq!(final_snapshot["revision"], retried["revision"]);
+    assert_eq!(final_snapshot["config"], retry["config"]);
+    assert_eq!(final_snapshot["config"]["llm"], original["config"]["llm"]);
+    assert_eq!(
+        final_snapshot["config"]["plugins"]["ai"],
+        original["config"]["plugins"]["ai"]
+    );
+    assert_eq!(panel.stored().plugins.web_search.global_per_hour, 240);
+    panel.shutdown().await;
+}
+
+#[tokio::test]
 async fn automatic_reply_policy_roundtrips_through_admin_save_and_apply() {
     let panel = Panel::start().await;
     panel.phase("waiting_login", None).await;

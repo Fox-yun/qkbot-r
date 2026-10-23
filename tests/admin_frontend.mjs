@@ -603,6 +603,210 @@ test("successful config write followed by reload failure is not reported as an u
   assert.equal(h.calls.filter((call) => call.options.method === "PUT").length, 1);
 });
 
+async function editConfigFields(h, fields) {
+  for (const [path, value] of Object.entries(fields)) {
+    const input = h.app.inputs.get(path).control; input.value = String(value); await input.emit("input");
+  }
+}
+async function clickConfig(h, id) { await h.ids.get(id).emit("click"); await new Promise(setImmediate); }
+const plainForm = (h) => JSON.parse(JSON.stringify(h.app.readForm()));
+
+test("multiple search limits save together after all visible field errors are corrected", async () => {
+  for (const advanced of [false, true]) {
+    const h = harness(); h.sample.limits.tool_timeout_secs = 15; await h.login(); h.app.openConfigSection("tools");
+    h.ids.get("advanced").open = advanced;
+    const prefix = "plugins.web_search.";
+    await editConfigFields(h, { [prefix + "max_results"]: 6, [prefix + "max_calls_per_turn"]: 3, [prefix + "request_timeout_secs"]: 13 });
+    const before = h.calls.length; await clickConfig(h, "save-config");
+    assert.equal(h.calls.length, before, "all invalid limits are rejected before a PUT");
+    for (const [key, range] of [["max_results", /1–5/u], ["max_calls_per_turn", /1–2/u], ["request_timeout_secs", /1–12/u]]) {
+      const input = h.app.inputs.get(prefix + key).control;
+      assert.equal(input.attrs["aria-invalid"], "true", key);
+      const error = h.ids.get(input.id + "-error"); assert.ok(error, key + " has an inline error");
+      assert.equal(error.hidden, false); assert.match(error.textContent, range);
+    }
+    const values = { max_results: 5, max_calls_per_turn: 2, request_timeout_secs: 12, max_response_bytes: 1048576, max_output_bytes: 8192,
+      max_concurrent_requests: 16, user_per_hour: 120, conversation_per_hour: 600, global_per_hour: 3000 };
+    await editConfigFields(h, Object.fromEntries(Object.entries(values).map(([key, value]) => [prefix + key, value])));
+    let saved;
+    h.setHandler(async (_path, options) => {
+      if (options.method === "PUT") { saved = JSON.parse(options.body); return { body: {} }; }
+      return { body: { ...h.snapshot(), config: saved.config, revision: "r2" } };
+    });
+    await clickConfig(h, "save-config");
+    assert.equal(h.calls.filter((call) => call.options.method === "PUT").length, 1);
+    for (const [key, value] of Object.entries(values)) assert.equal(saved.config.plugins.web_search[key], value, key);
+    assert.equal(h.app.state.formInvalid, false); assert.equal(h.app.state.busy, false); assert.equal(h.app.state.stale, false);
+    assert.equal(h.ids.get("save-config").disabled, false);
+    assert.match(h.ids.get("config-save-message").textContent, /配置已保存/u);
+    assert.equal(h.ids.get("config-save-message-top").textContent, h.ids.get("config-save-message").textContent);
+  }
+});
+
+test("search timeout cross-check names the search field without inventing hourly quota ordering", async () => {
+  const h = harness(); h.sample.limits.tool_timeout_secs = 8; await h.login();
+  await editConfigFields(h, { "plugins.web_search.request_timeout_secs": 8, "plugins.web_search.user_per_hour": 1000,
+    "plugins.web_search.conversation_per_hour": 2, "plugins.web_search.global_per_hour": 1 });
+  const before = h.calls.length; await clickConfig(h, "save-config"); assert.equal(h.calls.length, before);
+  const input = h.app.inputs.get("plugins.web_search.request_timeout_secs").control;
+  assert.equal(input.attrs["aria-invalid"], "true"); assert.match(h.ids.get(input.id + "-error").textContent, /工具.*超时/u);
+  await editConfigFields(h, { "plugins.web_search.request_timeout_secs": 7 });
+  assert.equal(plainForm(h).plugins.web_search.user_per_hour, 1000);
+  assert.equal(plainForm(h).plugins.web_search.global_per_hour, 1);
+});
+
+test("stale search drafts refresh by GET and merge non-overlapping edits before an explicit new save", async () => {
+  const h = harness(); await h.login(); h.app.openConfigSection("tools");
+  await editConfigFields(h, { "plugins.web_search.max_calls_per_turn": 2 });
+  h.setHandler(async () => ({ status: 409, body: { error: "配置已被其他操作修改，请刷新后重试" } }));
+  await clickConfig(h, "save-config"); assert.equal(h.app.state.stale, true);
+  await editConfigFields(h, { "plugins.web_search.global_per_hour": 120 });
+  h.app.state.draft.plugins.ai.personas["本地新增"] = "只保存在当前草稿的人设";
+  assert.equal(h.ids.get("save-config").disabled, true);
+  assert.equal(h.ids.get("config-refresh-draft").hidden, false); assert.equal(h.ids.get("config-refresh-draft-top").hidden, false);
+  const latest = h.snapshot(); latest.revision = "r2"; latest.config.plugins.web_search.max_results = 5;
+  latest.config.llm.model = "synthetic-server-model"; latest.config.plugins.ai.personas["服务器新增"] = "服务器独立更新的人设";
+  const before = h.calls.length; h.setHandler(async () => ({ body: latest }));
+  await clickConfig(h, "config-refresh-draft");
+  assert.equal(h.calls.length, before + 1); assert.equal(h.calls.at(-1).options.method, "GET");
+  assert.equal(h.app.state.revision, "r2"); assert.equal(h.app.state.stale, false); assert.equal(h.app.state.dirty, true);
+  assert.equal(h.ids.get("save-config").disabled, false); assert.equal(h.ids.get("config-refresh-draft").hidden, true);
+  const merged = plainForm(h);
+  assert.equal(merged.plugins.web_search.max_calls_per_turn, 2); assert.equal(merged.plugins.web_search.global_per_hour, 120);
+  assert.equal(merged.plugins.web_search.max_results, 5); assert.equal(merged.llm.model, "synthetic-server-model");
+  assert.equal(merged.plugins.ai.personas["本地新增"], "只保存在当前草稿的人设");
+  assert.equal(merged.plugins.ai.personas["服务器新增"], "服务器独立更新的人设");
+  assert.equal(h.app.state.config.plugins.web_search.max_calls_per_turn, latest.config.plugins.web_search.max_calls_per_turn, "new baseline remains the server config");
+  let saved;
+  h.setHandler(async (_path, options) => {
+    if (options.method === "PUT") { saved = JSON.parse(options.body); return { body: {} }; }
+    return { body: { ...latest, config: saved.config, revision: "r3" } };
+  });
+  await clickConfig(h, "save-config"); assert.equal(saved.revision, "r2"); assert.deepEqual(saved.config, merged);
+  assert.equal(h.calls.some((call) => call.path === "/api/runtime/apply"), false);
+});
+
+test("conflicting stale fields reject the entire refresh and preserve every local draft value", async () => {
+  const h = harness(); await h.login();
+  await editConfigFields(h, { "plugins.web_search.global_per_hour": 120, "plugins.web_search.max_calls_per_turn": 2 });
+  h.app.state.draft.plugins.ai.personas["本地新增"] = "不能丢失";
+  h.app.state.stale = true; h.app.updateControls();
+  const before = plainForm(h), baseline = JSON.stringify(h.app.state.config), draft = JSON.stringify(h.app.state.draft);
+  const latest = h.snapshot(); latest.revision = "r2"; latest.config.plugins.web_search.global_per_hour = 240;
+  latest.config.llm.model = "must-not-partially-apply";
+  h.setHandler(async () => ({ body: latest })); await clickConfig(h, "config-refresh-draft-top");
+  assert.equal(h.app.state.revision, "r1"); assert.equal(h.app.state.stale, true); assert.equal(h.app.state.dirty, true);
+  assert.deepEqual(plainForm(h), before); assert.equal(JSON.stringify(h.app.state.config), baseline); assert.equal(JSON.stringify(h.app.state.draft), draft);
+  assert.match(h.ids.get("config-save-message").textContent, /两边都已修改.*未覆盖任何内容/u);
+  assert.equal(h.ids.get("config-save-message-top").textContent, h.ids.get("config-save-message").textContent);
+  assert.equal(h.calls.some((call) => call.options.method === "PUT"), false);
+});
+
+test("stale refresh treats tool grants as an atomic array and accepts identical concurrent changes", async () => {
+  for (const same of [false, true]) {
+    const h = harness(); h.sample.plugins.ai.defaults.allowed_tools = ["clock_now"]; await h.login();
+    const picker = h.app.inputs.get("plugins.ai.defaults.allowed_tools").control.toolPicker;
+    picker.rows.get("reminder_create").checkbox.checked = true; await picker.rows.get("reminder_create").checkbox.emit("change");
+    h.app.state.stale = true; h.app.updateControls();
+    const local = plainForm(h).plugins.ai.defaults.allowed_tools;
+    const latest = h.snapshot(); latest.revision = "r2"; latest.config.plugins.ai.defaults.allowed_tools = same ? local : [];
+    h.setHandler(async () => ({ body: latest })); await clickConfig(h, "config-refresh-draft");
+    assert.equal(h.app.state.stale, !same); assert.equal(h.app.state.revision, same ? "r2" : "r1");
+    assert.deepEqual(plainForm(h).plugins.ai.defaults.allowed_tools, local);
+    assert.equal(h.calls.some((call) => call.options.method === "PUT"), false);
+    if (!same) assert.match(h.ids.get("config-save-message").textContent, /两边都已修改.*未覆盖任何内容/u);
+  }
+});
+
+test("stale refresh never rebases pending secret changes or loses them on failure", async () => {
+  for (const action of ["set", "clear"]) {
+    const h = harness(); await h.login(); await editConfigFields(h, { "plugins.web_search.max_calls_per_turn": 2 });
+    const secret = h.app.secretInputs.get("search_api_key"); secret.value.value = action === "set" ? "synthetic-pending-secret" : ""; secret.clear = action === "clear";
+    h.app.state.stale = true; h.app.updateControls(); const before = plainForm(h), actions = JSON.stringify(h.app.secretChanges());
+    h.setHandler(async () => ({ body: { ...h.snapshot(), revision: "r2" } })); await clickConfig(h, "config-refresh-draft");
+    assert.equal(h.app.state.revision, "r1"); assert.equal(h.app.state.stale, true); assert.deepEqual(plainForm(h), before);
+    assert.equal(JSON.stringify(h.app.secretChanges()), actions); assert.match(h.ids.get("config-save-message").textContent, /密钥/u);
+    assert.equal(h.calls.some((call) => call.options.method === "PUT"), false);
+    assert.doesNotMatch(h.ids.get("config-save-message").textContent, /synthetic-pending-secret/u);
+  }
+});
+
+test("stale refresh read failure preserves the draft and other pending writes remain explained", async () => {
+  const h = harness(); await h.login(); await editConfigFields(h, { "plugins.web_search.global_per_hour": 120 });
+  h.app.state.stale = true; h.app.updateControls(); const before = plainForm(h);
+  h.setHandler(async () => ({ error: new Error("synthetic connection lost") })); await clickConfig(h, "config-refresh-draft");
+  assert.equal(h.app.state.revision, "r1"); assert.equal(h.app.state.stale, true); assert.deepEqual(plainForm(h), before);
+  assert.equal(h.app.state.busy, false); assert.equal(h.ids.get("config-refresh-draft").disabled, false);
+  assert.match(h.ids.get("config-save-message").textContent, /连接|失败/u);
+  for (const kind of ["memory", "learning"]) {
+    h.app.state.pendingOperation = { kind, label: "其他页面待确认操作", requestId: "synthetic-pending" }; h.app.updateControls();
+    assert.equal(h.ids.get("save-config").disabled, true); assert.equal(h.ids.get("config-check-operation").hidden, false);
+    const refresh = h.ids.get("config-refresh-draft"); assert.ok(refresh.hidden || refresh.disabled, "pending writes do not offer a usable refresh action");
+    const count = h.calls.length; await clickConfig(h, "config-refresh-draft"); assert.equal(h.calls.length, count, "the handler also refuses a refresh while any write is unresolved");
+    assert.match(h.ids.get("config-save-message").textContent, /其他页面待确认操作/u);
+    assert.equal(h.ids.get("config-save-message-top").textContent, h.ids.get("config-save-message").textContent);
+  }
+});
+
+test("late stale-refresh responses cannot restore a signed-out page or overwrite a new session save", async () => {
+  for (const relogin of [false, true]) {
+    const h = harness(); await h.login(); await editConfigFields(h, { "plugins.web_search.global_per_hour": 120 });
+    h.app.state.stale = true; h.app.updateControls(); let finishRefresh;
+    h.setHandler(() => new Promise((resolve) => { finishRefresh = resolve; }));
+    await clickConfig(h, "config-refresh-draft"); assert.equal(h.app.state.busy, true);
+    h.app.clearSession();
+    let finishSave, newSave;
+    if (relogin) {
+      await h.login(); await editConfigFields(h, { "plugins.web_search.max_calls_per_turn": 2 });
+      h.setHandler(() => new Promise((resolve) => { finishSave = resolve; }));
+      newSave = h.app.runAction(() => h.app.saveConfig(false)); await new Promise(setImmediate);
+      assert.equal(h.app.state.configSave.phase, "正在保存…"); assert.equal(h.app.state.busy, true);
+    }
+    const stale = h.snapshot(); stale.revision = "old-session-r99"; stale.config.plugins.web_search.global_per_hour = 999;
+    finishRefresh({ body: stale }); await new Promise(setImmediate);
+    if (!relogin) {
+      assert.equal(h.app.state.config, null); assert.equal(h.app.state.authenticated, false);
+      assert.equal(h.ids.get("app").hidden, true); assert.equal(h.app.state.configSave.message, "");
+    } else {
+      assert.equal(h.app.state.revision, "r1"); assert.equal(h.app.state.configSave.phase, "正在保存…");
+      assert.equal(h.app.state.busy, true); assert.equal(h.ids.get("save-config").attrs["aria-busy"], "true");
+      assert.equal(plainForm(h).plugins.web_search.max_calls_per_turn, 2);
+      assert.notEqual(plainForm(h).plugins.web_search.global_per_hour, 999);
+      const saved = { ...h.snapshot(), revision: "new-session-r2", config: plainForm(h) };
+      h.setHandler(async () => ({ body: saved })); finishSave({ body: {} }); await newSave;
+      assert.equal(h.app.state.revision, "new-session-r2"); assert.equal(h.app.state.busy, false);
+      assert.match(h.ids.get("config-save-message").textContent, /配置已保存/u);
+    }
+  }
+  // An independent sign-out can run after api's final session check, before
+  // refreshConfigDraft resumes. Schedule that exact Promise reaction boundary.
+  const h = harness(); await h.login(); await editConfigFields(h, { "plugins.web_search.global_per_hour": 120 });
+  h.app.state.stale = true; h.app.updateControls();
+  const latest = { ...h.snapshot(), revision: "microtask-r2", config: plainForm(h) };
+  h.setHandler(async () => ({ body: { toJSON() {
+    let next = Promise.resolve(); for (let step = 0; step < 3; step++) next = next.then(() => {});
+    void next.then(() => h.app.clearSession()); return latest;
+  } } }));
+  await clickConfig(h, "config-refresh-draft");
+  assert.equal(h.app.state.authenticated, false); assert.equal(h.app.state.config, null); assert.equal(h.app.state.draft, null);
+  assert.equal(h.app.inputs.size, 0); assert.equal(h.ids.get("app").hidden, true);
+});
+
+test("stale refresh rejects a merged persona reference deleted remotely without replacing the draft", async () => {
+  const h = harness(); h.sample.plugins.ai.personas.Custom = "本地可选的人设"; await h.login();
+  await editConfigFields(h, { "plugins.ai.defaults.persona": "Custom", "plugins.web_search.max_calls_per_turn": 2 });
+  h.app.state.stale = true; h.app.updateControls();
+  const before = plainForm(h), baseline = JSON.stringify(h.app.state.config), draft = JSON.stringify(h.app.state.draft);
+  const latest = h.snapshot(); latest.revision = "r2"; delete latest.config.plugins.ai.personas.Custom;
+  assert.equal(latest.config.plugins.ai.defaults.persona, "默认");
+  h.setHandler(async () => ({ body: latest })); await clickConfig(h, "config-refresh-draft");
+  assert.equal(h.app.state.revision, "r1"); assert.equal(h.app.state.stale, true); assert.equal(h.app.state.dirty, true);
+  assert.deepEqual(plainForm(h), before); assert.equal(JSON.stringify(h.app.state.config), baseline); assert.equal(JSON.stringify(h.app.state.draft), draft);
+  assert.equal(h.app.inputs.get("plugins.ai.defaults.persona").control.value, "Custom");
+  assert.match(h.ids.get("config-save-message").textContent, /人设/u);
+  assert.equal(h.calls.some((call) => call.options.method === "PUT"), false);
+});
+
 test("static UI removes admin-token entry and every literal DOM ID resolves", () => {
   const h = harness();
   for (const match of script.matchAll(/\$\("([^"]+)"\)/gu)) assert.ok(h.ids.has(match[1]), match[1]);
