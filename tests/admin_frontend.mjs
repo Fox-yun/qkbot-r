@@ -524,6 +524,85 @@ test("search preview is single flight and discards stale responses after editing
   }
 });
 
+test("search limit rejection is visible beside the save button and names the allowed range", async () => {
+  const h = harness(); await h.login(); h.app.openConfigSection("tools");
+  const input = h.app.inputs.get("plugins.web_search.max_calls_per_turn").control;
+  input.value = "3"; await input.emit("input"); const before = h.calls.length;
+  await h.ids.get("save-config").emit("click"); await new Promise(setImmediate);
+  assert.equal(h.calls.length, before, "out-of-range search limit never reaches the save endpoint");
+  const feedback = h.ids.get("config-save-message");
+  assert.equal(feedback.hidden, false); assert.match(feedback.textContent, /每轮搜索上限.*1–2.*整数/u);
+  assert.ok(feedback.parentElement.children.includes(h.ids.get("dirty-label")), "feedback stays in the same sticky save bar");
+  assert.match(h.app.inputs.get("plugins.web_search.max_calls_per_turn").wrapper.textContent, /允许范围：1–2/u);
+  assert.equal(input.value, "3"); assert.equal(h.app.state.dirty, true);
+  assert.equal(h.app.state.busy, false); assert.equal(h.ids.get("save-config").disabled, false);
+  assert.equal(h.ids.get("save-config").attrs["aria-busy"], "false");
+});
+
+test("all config save buttons show progress and preserve search credentials and hidden persona edits", async () => {
+  for (const id of ["save-config", "save-config-top", "save-apply"]) {
+    const h = harness(); await h.login(); h.app.openConfigSection("tools");
+    const input = h.app.inputs.get("plugins.web_search.max_calls_per_turn").control;
+    input.value = "2"; await input.emit("input");
+    h.app.secretInputs.get("search_api_key").value.value = "synthetic-search-key";
+    let finish, saved, applies = 0;
+    h.setHandler((path, options) => {
+      if (path === "/api/config" && options.method === "PUT") { saved = JSON.parse(options.body); return new Promise((resolve) => { finish = resolve; }); }
+      if (path === "/api/config") return { body: { ...h.snapshot(), config: saved.config, revision: "r2" } };
+      if (path === "/api/runtime/apply") applies++;
+      return { body: { phase: "running", applied_revision: "r2", loaded_plugins: [] } };
+    });
+    await h.ids.get(id).emit("click"); await new Promise(setImmediate);
+    assert.equal(h.ids.get(id).textContent, "正在保存…"); assert.equal(h.ids.get(id).disabled, true);
+    assert.equal(h.ids.get(id).attrs["aria-busy"], "true");
+    assert.match(h.ids.get("config-save-message").textContent, /正在校验并保存/u);
+    assert.equal(saved.config.plugins.web_search.max_calls_per_turn, 2);
+    assert.deepEqual(saved.config.plugins.ai.personas, h.sample.plugins.ai.personas);
+    assert.deepEqual(saved.secrets.search_api_key, { action: "set", value: "synthetic-search-key" });
+    await h.ids.get(id).emit("click"); assert.equal(h.calls.filter((call) => call.options.method === "PUT").length, 1);
+    finish({ body: {} }); await new Promise(setImmediate);
+    assert.equal(h.app.state.busy, false); assert.equal(h.ids.get(id).disabled, false);
+    assert.equal(h.ids.get(id).attrs["aria-busy"], "false"); assert.equal(h.app.state.revision, "r2");
+    assert.match(h.ids.get("config-save-message").textContent, /已保存|已提交/u);
+    assert.equal(applies, id === "save-apply" ? 1 : 0);
+  }
+});
+
+test("server rejection and uncertain config save show local recovery without losing the draft", async () => {
+  for (const uncertain of [false, true]) {
+    const h = harness(); await h.login(); h.app.openConfigSection("tools");
+    const input = h.app.inputs.get("plugins.web_search.max_calls_per_turn").control;
+    input.value = "2"; await input.emit("input");
+    h.setHandler(async () => uncertain ? { error: Object.assign(new Error("timeout"), { name: "TimeoutError" }) }
+      : { status: 400, body: { error: "搜索超时必须短于工具总超时" } });
+    await h.ids.get("save-config").emit("click"); await new Promise(setImmediate);
+    assert.equal(h.app.state.busy, false); assert.equal(input.value, "2"); assert.equal(h.app.state.dirty, true);
+    assert.equal(h.ids.get("config-save-message").hidden, false);
+    assert.match(h.ids.get("config-save-message").textContent, uncertain ? /响应未确认.*查询结果/u : /搜索超时必须短于工具总超时/u);
+    assert.equal(h.ids.get("config-check-operation").hidden, !uncertain);
+    assert.equal(h.ids.get("save-config").disabled, uncertain);
+    if (uncertain) {
+      const before = h.calls.length; await h.ids.get("save-config").emit("click"); await new Promise(setImmediate);
+      assert.equal(h.calls.length, before, "the save handler also refuses duplicate uncertain writes");
+      h.setHandler(async () => ({ body: h.snapshot() }));
+      await h.ids.get("config-check-operation").emit("click"); await new Promise(setImmediate);
+      assert.equal(h.calls.at(-1).options.method, "GET");
+      assert.match(h.ids.get("config-save-message").textContent, /无法确认这次保存/u);
+      assert.equal(h.calls.length, before + 1);
+    }
+  }
+});
+
+test("successful config write followed by reload failure is not reported as an unsaved retry", async () => {
+  const h = harness(); await h.login();
+  h.setHandler(async (_path, options) => options.method === "PUT" ? { body: {} } : { error: new Error("connection lost") });
+  await h.ids.get("save-config").emit("click"); await new Promise(setImmediate);
+  assert.equal(h.app.state.busy, false); assert.equal(h.app.state.stale, true);
+  assert.equal(h.ids.get("save-config").disabled, true);
+  assert.match(h.ids.get("config-save-message").textContent, /配置已保存.*读取保存结果失败.*重新载入/u);
+  assert.equal(h.calls.filter((call) => call.options.method === "PUT").length, 1);
+});
+
 test("static UI removes admin-token entry and every literal DOM ID resolves", () => {
   const h = harness();
   for (const match of script.matchAll(/\$\("([^"]+)"\)/gu)) assert.ok(h.ids.has(match[1]), match[1]);

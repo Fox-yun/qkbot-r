@@ -37,6 +37,7 @@ const TOOL_USE_RULE: &str =
 const FINAL_REPLY_RULE: &str =
     "本轮仅reply_message或文字结束，禁调历史工具；据已有结果作答，不虚构。";
 const FINAL_TEXT_RULE: &str = "本轮仅文字结束，禁调历史工具；据已有结果作答，不虚构。";
+const SEARCH_RECOVERY_RULE: &str = "\n[宿主纠正]检索已完成，刚才重复请求的搜索未执行。现在只输出文字答案，使用已有检索结果并保留出处标注；资料不足就明确说明，不再调用任何工具。";
 const REPLY_USE_RULE: &str = "reply_message无需确认，合并引用/@/正文/表情后结束，不追加“已发送”；仅用宿主message_ref/sender_ref/mentions.user_ref，目标不明先问；普通回应可直接文字。";
 const TEXT_REPLY_RULE: &str = "最终直接输出正文；本轮不支持引用、@或表情发送，不伪造这些发送结果。";
 const STICKER_USE_RULE: &str = "表情先search_stickers，以本轮status为准；要图且预览候选合适就用reply_message.sticker_ref。仅empty可称空库并提示引用图片/save，其他状态照实解释，不沿用历史结论。";
@@ -848,6 +849,8 @@ impl Chat {
             .any(|d| d["function"]["name"] == "web_search");
         let mut search_citations = crate::search::citations::Citations::default();
         let mut search_operations: Vec<String> = Vec::new();
+        let mut search_succeeded = false;
+        let mut search_text_recovery = false;
         let stickers_enabled = host.embedding.is_some()
             && host.config.llm.vision
             && job.key.scope.scene == crate::types::Scene::Group
@@ -1037,6 +1040,9 @@ impl Chat {
             if search_operations.len() >= host.config.plugins.web_search.max_calls_per_turn {
                 tools.retain(|definition| definition["function"]["name"] != "web_search");
             }
+            if search_text_recovery {
+                tools.clear();
+            }
             let mut turn_visual = visual.clone();
             if let Some(sheet) = sticker_turn.image() {
                 if sticker_turn.check(host, &job.key.scope).await.is_ok() {
@@ -1047,9 +1053,13 @@ impl Chat {
                     current.push_str("\n[表情候选已失效，请直接文字回复。]");
                 }
             }
+            let mut round_system = round_system_prompt(&system, &tools, search_enabled);
+            if search_text_recovery {
+                round_system.push_str(SEARCH_RECOVERY_RULE);
+            }
             let assembled = super::context::assembly::assemble_with_builder(
                 ContextInput {
-                    system: round_system_prompt(&system, &tools, search_enabled),
+                    system: round_system,
                     current: current.clone(),
                     history: history.clone(),
                     memories: memories.clone(),
@@ -1165,6 +1175,27 @@ impl Chat {
                 .await
             };
             let response = match response {
+                Err(error)
+                    if !search_text_recovery
+                        && search_succeeded
+                        && search_operations.len()
+                            >= host.config.plugins.web_search.max_calls_per_turn
+                        && round + 1 < effective_rounds
+                        && error
+                            .downcast_ref::<crate::llm::UnofferedTool>()
+                            .is_some_and(|error| error.is_only_call_to("web_search")) =>
+                {
+                    // The rejected call never enters protocol history or the
+                    // dispatcher. Spend at most one remaining model round on
+                    // text, reusing already admitted search results. The next
+                    // loop retains the normal source, budget and cancel checks.
+                    search_text_recovery = true;
+                    tracing::info!(
+                        round,
+                        "closed search tool requested; allowing one text-only completion"
+                    );
+                    continue;
+                }
                 Err(error)
                     if error.is::<super::sticker_reply::StalePreview>()
                         && round + 1 < effective_rounds =>
@@ -1380,6 +1411,7 @@ impl Chat {
                     return Ok(Some(reply));
                 },
                 Ok(Some(ToolOutcome::Completed { operation_id, result, .. })) if call["function"]["name"] == "web_search" => {
+                    search_succeeded |= serde_json::from_value::<crate::search::SearchResponse>(result.clone()).is_ok();
                     search_citations.add(&result);
                     // Replaying the same admitted operation reuses its result and
                     // must not consume another search from the per-turn quota.
@@ -2600,13 +2632,21 @@ mod tests {
     {
         use axum::{Json, Router, routing::post};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for mode in 0..7 {
+        for mode in 0..16 {
             // 0/1: both reply paths, 2: provider failure, 3/4: search/clock
             // in either order, 5: rejected arguments do not spend quota,
             // 6: a replayed operation does not spend a second search.
+            // 7: a closed search tool gets one text-only completion; 8: a
+            // second rejection ends it. 9/10: model/HTTP limits forbid recovery.
+            // 11/12: another unoffered tool after/before search is not recovered.
+            // 13: provider failure is not a completed search to recover from.
+            // 14: a mixed unoffered batch must not qualify as a search retry.
+            // 15: closing tools with search quota remaining is not recoverable.
             let final_round = match mode {
                 3..=5 => 2,
                 6 => 3,
+                7 => 2,
+                8..=15 => 3,
                 _ => 1,
             };
             let requests = Arc::new(AtomicUsize::new(0));
@@ -2617,7 +2657,38 @@ mod tests {
                     let messages = body["messages"].as_array().unwrap();
                     let system = messages.iter().find(|message| message["role"] == "system").unwrap()["content"].as_str().unwrap();
                     let has_search = body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "web_search"));
-                    let message = if round < final_round {
+                    let message = if mode >= 7 && (round > 0 || mode == 12) {
+                        assert!(round <= 2, "recovery must not loop, mode {mode}");
+                        if round > 0 {
+                            assert!(!has_search);
+                            assert!(system.contains("本轮不可再搜索"));
+                        }
+                        if round == 2 {
+                            assert!(matches!(mode, 7 | 8));
+                            assert!(body.get("tools").is_none());
+                            assert_eq!(body["tool_choice"], "none");
+                            assert!(system.contains(FINAL_TEXT_RULE));
+                            assert!(system.contains(SEARCH_RECOVERY_RULE));
+                            assert!(!serde_json::to_string(messages).unwrap().contains("never-execute-search-again"));
+                            assert_eq!(messages.iter().filter(|m| m["role"] == "tool").count(), 1);
+                        }
+                        if mode == 7 && round == 2 {
+                            let result: Value = serde_json::from_str(messages.iter()
+                                .find(|m| m["tool_call_id"] == "prepare-0").unwrap()["content"].as_str().unwrap()).unwrap();
+                            let text = format!("查到资料[{}]。伪链接 https://invented.invalid/fake",
+                                result["results"][0]["source_id"].as_str().unwrap());
+                            json!({"role":"assistant","content":text})
+                        } else {
+                            let name = if matches!(mode, 11 | 12) { "clock_now" } else { "web_search" };
+                            let mut calls = vec![json!({"id":format!("rejected-recovery-{round}"),"type":"function",
+                                "function":{"name":name,"arguments":json!({"query":"never-execute-search-again"}).to_string()}})];
+                            if mode == 14 {
+                                calls.push(json!({"id":"mixed-unoffered-write","type":"function",
+                                    "function":{"name":"reminder_create","arguments":"{}"}}));
+                            }
+                            json!({"role":"assistant","content":null,"tool_calls":calls})
+                        }
+                    } else if round < final_round {
                         let clock = (mode == 3 && round == 1) || (mode == 4 && round == 0);
                         assert_eq!(has_search, !(mode == 3 && round == 1), "mode {mode}, round {round}");
                         assert_eq!(system.contains("联网或时效问题优先web_search"), has_search);
@@ -2660,7 +2731,13 @@ mod tests {
             config.llm.vision = false;
             config.llm.tool_calling = true;
             config.plugins.ai.defaults.memory_read = false;
-            config.plugins.ai.defaults.allowed_tools = if mode == 1 {
+            config.plugins.ai.defaults.allowed_tools = if mode == 7 {
+                vec![
+                    "clock_now".into(),
+                    "web_search".into(),
+                    "reply_message".into(),
+                ]
+            } else if mode == 1 {
                 vec!["web_search".into(), "reply_message".into()]
             } else if matches!(mode, 3 | 4) {
                 vec!["clock_now".into(), "web_search".into()]
@@ -2670,8 +2747,17 @@ mod tests {
             config.limits.max_model_calls = final_round + 1;
             config.limits.max_http_attempts = final_round + 1;
             config.limits.max_tool_calls = final_round;
+            if mode == 9 {
+                config.limits.max_model_calls = 2;
+            }
+            if mode == 10 {
+                config.limits.max_http_attempts = 2;
+            }
+            if mode == 15 {
+                config.limits.max_tool_calls = 1;
+            }
             config.plugins.web_search = crate::search::tests::config();
-            if mode == 6 {
+            if matches!(mode, 6 | 15) {
                 config.plugins.web_search.max_calls_per_turn = 2;
             }
             let mut host = Host::create(config.clone()).await.unwrap();
@@ -2679,7 +2765,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 entered: Semaphore::new(0),
                 release: Semaphore::new(3),
-                fail: mode == 2,
+                fail: matches!(mode, 2 | 13),
             });
             let mut registry = crate::tools::ToolRegistry::new();
             crate::tools::register_reply(&mut registry).unwrap();
@@ -2722,14 +2808,53 @@ mod tests {
                 guard: conv.guard.clone(),
             };
             let chat = Chat::new(host.clone());
-            let reply = tokio::time::timeout(
+            let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 chat.turn(&turn, &CancellationToken::new()),
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
+            if mode >= 8 {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("mode {mode} must retain the unoffered-tool rejection"),
+                };
+                assert!(
+                    error.is::<crate::llm::UnofferedTool>(),
+                    "mode {mode}: {error}"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    match mode {
+                        8 => 3,
+                        12 => 1,
+                        _ => 2,
+                    },
+                    "mode {mode}"
+                );
+                assert_eq!(
+                    provider.calls.load(Ordering::SeqCst),
+                    usize::from(mode != 12),
+                    "mode {mode}"
+                );
+                let runs: usize = host
+                    .store
+                    .call(|db| {
+                        Ok(db.query_row(
+                            "SELECT count(*) FROM tool_runs WHERE tool_name!='web_search'",
+                            [],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(runs, 0, "no rejected call may reach any executor");
+                host.cancel.cancel();
+                host.store.stop().await.unwrap();
+                server.abort();
+                continue;
+            }
+            let reply = result.unwrap().unwrap();
             let text = reply.message.text_content();
             assert!(!text.contains("https://invented.invalid"));
             if mode == 2 {

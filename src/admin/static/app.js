@@ -6,6 +6,7 @@
     authenticated: false, csrf: "", setupRequired: false, session: 0, config: null, draft: null, revision: null,
     secrets: {}, status: null, qq: null, busy: false, dirty: false, applyError: null, applyFailure: null,
     jsonDirty: false, formInvalid: false, stale: false,
+    configSave: { phase: "", message: "", kind: "" },
     runtimeTimer: null, qqTimer: null, runtimePolling: false, qqPolling: false,
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
     memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
@@ -632,10 +633,11 @@
     else if (definition.type === "json") control.value = JSON.stringify(value ?? {}, null, 2);
     else if (["lines", "ids"].includes(definition.type)) control.value = Array.isArray(value) ? value.join("\n") : "";
     else control.value = value == null ? "" : String(value);
-    const hint = element("p", "hint", definition.hint);
+    const range = definition.path.startsWith("plugins.web_search.") && definition.type === "number" ? `允许范围：${definition.min}–${definition.max}。` : "";
+    const hint = element("p", "hint", range + definition.hint);
     hint.id = `${id}-hint`; control.setAttribute("aria-describedby", hint.id);
     if (definition.type === "check") { const copy = element("div"); copy.append(label, hint); wrapper.append(control, copy); }
-    else { wrapper.append(label, control); if (definition.hint) wrapper.append(hint); }
+    else { wrapper.append(label, control); if (range || definition.hint) wrapper.append(hint); }
     inputs.set(definition.path, { control, definition, wrapper });
     control.addEventListener("input", () => {
       if (definition.path === "llm.chat_completions_url") invalidateModels();
@@ -814,7 +816,10 @@
         if (def.type === "nullableNumber" && value === "") value = null;
         else {
           const numeric = Number(value);
-          if (value === "" || !Number.isSafeInteger(numeric) || !control.validity.valid || (def.min !== undefined && numeric < def.min) || (def.max !== undefined && numeric > def.max)) throw new Error(`「${def.label}」需要填写有效范围内的整数。`);
+          if (value === "" || !Number.isSafeInteger(numeric) || !control.validity.valid || (def.min !== undefined && numeric < def.min) || (def.max !== undefined && numeric > def.max)) {
+            const range = def.min !== undefined && def.max !== undefined ? `${def.min}–${def.max} 范围内` : def.min !== undefined ? `不小于 ${def.min}` : "有效范围内";
+            throw new Error(`「${def.label}」需要填写${range}的整数。`);
+          }
           value = numeric;
         }
       } else if (def.type === "ids") {
@@ -992,6 +997,24 @@
       node.className = "plugin-load-state " + (active ? "loaded" : "not-loaded");
     });
   }
+  function configSaveFeedback(message = "", kind = "", phase = "") {
+    state.configSave = { message, kind, phase }; updateControls();
+  }
+  function renderConfigSave() {
+    const saving = state.configSave, pending = state.pendingOperation;
+    const checking = pending && ["config", "runtime"].includes(pending.kind);
+    const message = checking ? pending.label + "的响应未确认，请查询结果；不会重复提交。" + (saving.kind === "error" ? " " + saving.message : "")
+      : state.stale ? saving.message || "保存状态待核对。请先保留当前编辑，再重新载入服务器配置。" : saving.message;
+    const node = $("config-save-message"); node.textContent = message;
+    node.hidden = !message; node.className = "config-save-message" + (checking || state.stale ? " warning-text" : saving.kind ? " " + saving.kind + "-text" : "");
+    $("config-check-operation").hidden = !checking;
+    $("config-check-operation").disabled = state.busy || !state.authenticated;
+    for (const id of ["save-config", "save-config-top", "save-apply"]) {
+      $(id).textContent = saving.phase || (id === "save-apply" ? "保存并应用" : "保存当前配置");
+      $(id).setAttribute("aria-busy", String(Boolean(saving.phase)));
+      $(id).setAttribute("aria-describedby", "config-save-message");
+    }
+  }
   function updateControls() {
     const unavailable = state.busy || !state.authenticated || !state.config;
     const pending = Boolean(state.pendingOperation);
@@ -1047,6 +1070,7 @@
     updateContactControls();
     updateStickerControls();
     updateLearningControls();
+    renderConfigSave();
   }
 
   async function loadConfig() {
@@ -1063,6 +1087,7 @@
     state.revision = result.revision; state.secrets = result.secrets || {}; state.applyError = result.apply_error || null;
     if (state.applyFailure?.revision !== state.revision) state.applyFailure = null;
     state.dirty = false; state.jsonDirty = false; state.formInvalid = false; state.stale = false;
+    if (!state.configSave.phase) state.configSave = { phase: "", message: "", kind: "" };
     resumeQqPolling(); clearQr();
     $("config-warning").hidden = true;
     $("saved-revision").textContent = "已保存版本：" + state.revision;
@@ -1735,21 +1760,38 @@
     notice(stop ? "已提交断开请求。" : "配置已保存，已提交应用请求；生效状态会自动更新。"); await refreshStatus(); return true;
   }
   async function saveConfig(apply) {
-    if (state.jsonDirty) adoptJson();
-    const config = readForm(), secrets = secretChanges();
-    const logChanged = config.app.log !== state.config.app.log, databaseChanged = config.app.database !== state.config.app.database;
-    try { await api("/api/config", "PUT", { revision: state.revision, config, secrets }); }
-    catch (error) {
-      if (uncertain(error)) { state.stale = true; trackOperation({ kind: "config", label: "保存配置", previousRevision: state.revision, config }); return; }
+    if (state.pendingOperation || state.stale) { updateControls(); return; }
+    const session = state.session; let saved = false, refreshed = false;
+    configSaveFeedback("正在校验并保存配置，请稍候。", "", "正在保存…");
+    try {
+      if (state.jsonDirty) adoptJson();
+      const config = readForm(), secrets = secretChanges();
+      const logChanged = config.app.log !== state.config.app.log, databaseChanged = config.app.database !== state.config.app.database;
+      try { await api("/api/config", "PUT", { revision: state.revision, config, secrets }); }
+      catch (error) {
+        if (uncertain(error)) { state.stale = true; trackOperation({ kind: "config", label: "保存配置", previousRevision: state.revision, config }); return; }
+        throw error;
+      }
+      saved = true; configSaveFeedback("配置已保存，正在读取保存后的版本。", "", "正在核对…");
+      await loadConfig(); refreshed = true;
+      if (databaseChanged) notice("配置已保存。数据库路径已改变，请重启整个程序后再使用；不会在当前进程中应用。", "warning");
+      else if (apply) {
+        configSaveFeedback("配置已保存，正在应用到机器人。", "", "正在应用…");
+        try { if (await applyRuntime() && logChanged) notice("配置已保存并提交应用。日志过滤级别仍需要重启整个程序。", "warning"); }
+        catch (error) { error.message = "配置已保存但未生效。应用失败：" + error.message; throw error; }
+      } else notice(state.applyError ? "配置已保存但未生效。当前不可应用：" + state.applyError
+        : "配置已保存，应用后生效。" + (logChanged ? " 日志过滤级别需要重启整个程序。" : ""), state.applyError || logChanged ? "warning" : "success");
+      configSaveFeedback($("notice-text").textContent, state.applyError || logChanged || databaseChanged ? "warning" : "success");
+    } catch (error) {
+      if (session === state.session) {
+        if (saved && !refreshed) { state.stale = true; error.message = "配置已保存，但读取保存结果失败。请重新载入核对后再继续。" + error.message; }
+        const message = error.code === "reauth_required" ? "请完成密码重新验证，再点击保存。当前编辑已保留。" : error.message || "保存未完成，请检查配置。";
+        configSaveFeedback(message, "error");
+      }
       throw error;
+    } finally {
+      if (session === state.session) { state.configSave.phase = ""; updateControls(); }
     }
-    await loadConfig();
-    if (databaseChanged) notice("配置已保存。数据库路径已改变，请重启整个程序后再使用；不会在当前进程中应用。", "warning");
-    else if (apply) {
-      try { if (await applyRuntime() && logChanged) notice("配置已保存并提交应用。日志过滤级别仍需要重启整个程序。", "warning"); }
-      catch (error) { error.message = "配置已保存但未生效。应用失败：" + error.message; throw error; }
-    } else notice(state.applyError ? "配置已保存但未生效。当前不可应用：" + state.applyError
-      : "配置已保存，应用后生效。" + (logChanged ? " 日志过滤级别需要重启整个程序。" : ""), state.applyError || logChanged ? "warning" : "success");
   }
   async function checkOperation() {
     const operation = state.pendingOperation; if (!operation) return;
@@ -1769,6 +1811,7 @@
         ? "服务器已有匹配的配置。密钥不可回读，请核对密钥状态后重新载入；不会自动应用。"
         : "已取得服务器当前版本，但无法确认这次保存。当前编辑仍保留，请先复制再重新载入核对。";
       notice($("config-warning").textContent, "warning"); updateControls();
+      configSaveFeedback($("config-warning").textContent, "warning");
     } else {
       state.status = await api("/api/status"); renderStatus();
       const done = operation.goal === "stopped" ? state.status.phase === "stopped" : state.status.applied_revision === operation.revision && ["running", "waiting_login"].includes(state.status.phase);
@@ -1905,6 +1948,7 @@
   function clearSession(message = "") {
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
     state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false; state.applyError = null; state.applyFailure = null;
+    state.configSave = { phase: "", message: "", kind: "" };
     state.autoReplyBaseEstimate = null; autoReplyBudgetControl = null;
     state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; state.pluginCatalog = []; pluginControls = null; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
     state.groupPersona = { saving: false, message: "", kind: "" }; $("group-persona-select").replaceChildren(); $("group-persona-select").value = "";
@@ -2348,6 +2392,7 @@
   document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeDialog(dialog.id); }));
   $("dismiss-notice").addEventListener("click", () => { $("notice").hidden = true; });
   $("check-operation").addEventListener("click", () => { void runAction(checkOperation); });
+  $("config-check-operation").addEventListener("click", () => { void runAction(async () => { try { await checkOperation(); configSaveFeedback($("notice-text").textContent, state.pendingOperation || state.stale ? "warning" : "success"); } catch (error) { configSaveFeedback(error.message, "error"); throw error; } }); });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelectorAll("[data-config-category]").forEach((button) => button.addEventListener("click", () => filterConfig(button.dataset.configCategory)));
   document.querySelectorAll("[data-config-section]").forEach((button) => button.addEventListener("click", () => openConfigSection(button.dataset.configSection)));

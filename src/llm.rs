@@ -104,6 +104,14 @@ impl std::error::Error for TruncatedToolResponse {}
 pub(crate) struct UnofferedTool {
     requested: String,
     allowed_names: Vec<String>,
+    call_count: usize,
+}
+
+impl UnofferedTool {
+    /// A narrow recovery predicate; never expose the rejected call or its arguments.
+    pub(crate) fn is_only_call_to(&self, name: &str) -> bool {
+        self.call_count == 1 && self.requested == name
+    }
 }
 
 impl std::fmt::Display for UnofferedTool {
@@ -1068,6 +1076,7 @@ fn parse_response(value: Value, allowed_tools: &HashSet<String>) -> Result<LlmRe
             return Err(UnofferedTool {
                 requested: name.clone(),
                 allowed_names,
+                call_count: calls.len(),
             }
             .into());
         }
@@ -1673,6 +1682,8 @@ mod tests {
         let error = parse_response(response(message.clone()), &HashSet::new()).unwrap_err();
         let unavailable = error.downcast_ref::<UnofferedTool>().unwrap();
         assert_eq!(unavailable.requested, "clock_now");
+        assert!(unavailable.is_only_call_to("clock_now"));
+        assert!(!unavailable.is_only_call_to("web_search"));
         assert!(unavailable.allowed_names.is_empty());
         let allowed = HashSet::from(["clock_now".to_owned()]);
         assert!(parse_response(response(message.clone()), &allowed).is_ok());
@@ -1696,6 +1707,7 @@ mod tests {
             let error = parse_response(value.clone(), &allowed).unwrap_err();
             let typed = error.downcast_ref::<UnofferedTool>().unwrap();
             assert_eq!(typed.requested, "web_search");
+            assert!(!typed.is_only_call_to("web_search"));
             assert_eq!(typed.allowed_names, ["clock_now", "reply_message"]);
             assert_eq!(
                 error.to_string(),
