@@ -238,6 +238,7 @@ impl Host {
     pub(crate) async fn send_ai_reply(
         &self,
         scope: &Scope,
+        plugin: &str,
         guard: ContextGuard,
         inbound_position: i64,
         reply: crate::plugins::ai::reply::PreparedReply,
@@ -258,7 +259,7 @@ impl Host {
         );
         self.send_authorized_message(
             scope,
-            "ai",
+            plugin,
             Some(guard),
             inbound_position,
             reply.message,
@@ -453,6 +454,7 @@ pub struct Router {
     plugin_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     tasks: tokio_util::task::TaskTracker,
     reminder_delivery: tokio::sync::Mutex<()>,
+    learning_account: tokio::sync::Mutex<Option<i64>>,
 }
 impl Router {
     pub fn new(host: Arc<Host>) -> Self {
@@ -471,12 +473,18 @@ impl Router {
             plugin_limits,
             tasks: tokio_util::task::TaskTracker::new(),
             reminder_delivery: tokio::sync::Mutex::new(()),
+            learning_account: tokio::sync::Mutex::new(None),
         }
     }
 
     pub async fn dispatch(&self, msg: crate::types::Incoming) -> Result<()> {
         use crate::plugins::ai;
         let host = &self.host;
+        // Record the enable boundary before saving the first new source. A new
+        // runtime has a fresh cache, so toggles cannot learn the disabled period.
+        if let Err(error) = self.configure_learning().await {
+            tracing::warn!(error_kind=%error, "learning initialization deferred");
+        }
         if msg
             .notification
             .as_ref()
@@ -740,9 +748,45 @@ impl Router {
         self.host.gateway.maintain(seconds).await?;
         crate::plugins::native::maintain(&self.host.store, cutoff).await?;
         crate::plugins::reminder::maintain(&self.host.store, seconds).await?;
-        if self.host.config.plugins.ai.enabled {
-            self.chat.compact_idle().await?;
+        let memory_result = if self.host.config.plugins.ai.enabled {
+            self.chat.compact_idle().await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = self.configure_learning().await {
+            tracing::warn!(error_kind=%error, "learning initialization deferred");
+        } else if let Some(bot_id) = self.host.milky.verified_bot_id()
+            && self.host.config.plugins.ai.enabled
+            && self.host.config.plugins.ai.learning.enabled
+            && let Err(error) =
+                crate::plugins::ai::learning::run(&self.host, bot_id, &self.host.cancel).await
+        {
+            // Learning is an independent best-effort job; failures do not change
+            // existing notes or prevent normal chat and maintenance work.
+            tracing::warn!(error_kind=%error, "learning maintenance deferred");
         }
+        memory_result?;
+        Ok(())
+    }
+
+    async fn configure_learning(&self) -> Result<()> {
+        let Some(bot_id) = self.host.milky.verified_bot_id() else {
+            return Ok(());
+        };
+        let mut account = self.learning_account.lock().await;
+        if *account == Some(bot_id) {
+            return Ok(());
+        }
+        if let Some(previous) = *account {
+            crate::plugins::ai::learning::configure(&self.host.store, previous, false).await?;
+        }
+        crate::plugins::ai::learning::configure(
+            &self.host.store,
+            bot_id,
+            self.host.config.plugins.ai.enabled && self.host.config.plugins.ai.learning.enabled,
+        )
+        .await?;
+        *account = Some(bot_id);
         Ok(())
     }
 

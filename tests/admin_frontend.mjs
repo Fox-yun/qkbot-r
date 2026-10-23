@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -95,6 +95,8 @@ function harness() {
     }
     result.plugins.ai.defaults = { ...result.plugins.ai.defaults, persona: "默认", paused: false, once: false, recent_messages: 24, input_budget: 6000, output_budget: 800 };
     result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
+    result.plugins.ai.learning = { enabled: false, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
+    Object.assign(result.limits, { learning_requests_per_hour: 4, learning_requests_per_day: 24, learning_max_input_budget: 8000, learning_max_output_tokens: 1200 });
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
     result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
     result.app.database = "data/test.db"; return result;
@@ -320,6 +322,129 @@ test("automatic reply budget degrades honestly when fixed overhead metadata is m
     assert.equal(h.app.state.formInvalid, false); assert.doesNotThrow(() => h.app.readForm());
   }
   h.app.clearSession(); assert.equal(h.app.state.autoReplyBaseEstimate, null);
+});
+
+test("learning configuration uses backend defaults and validates limits in forms and JSON", async () => {
+  const h = harness(); await h.login(); const group = h.app.groups.find((group) => group.title === "学习笔记");
+  assert.ok(group); assert.equal(h.app.inputs.get("plugins.ai.learning.enabled").control.checked, false);
+  assert.equal(h.app.inputs.get("plugins.ai.learning.prompt").control.required, false);
+  const text = h.app.inputs.get("plugins.ai.learning.prompt").control;
+  text.value = " \n🐟" + "中".repeat(3999) + "  "; assert.equal([...h.app.readForm().plugins.ai.learning.prompt].length, 4000);
+  text.value += "多"; assert.throws(() => h.app.readForm(), /4000/u);
+  text.value = "  \n "; assert.equal(h.app.readForm().plugins.ai.learning.prompt, "");
+  for (const def of group.fields.filter((def) => def.type === "number")) {
+    const input = h.app.inputs.get(def.path).control, before = input.value;
+    for (const value of ["", "1.5", String(def.min - 1), String(def.max + 1)]) { input.value = value; assert.throws(() => h.app.readForm(), /整数/u); }
+    input.value = before;
+  }
+  const daily = h.app.inputs.get("limits.learning_requests_per_day").control; daily.value = "3"; assert.throws(() => h.app.readForm(), /不能低于每小时/u); daily.value = "24";
+  const injection = h.app.inputs.get("plugins.ai.learning.injection_budget").control; assert.equal(injection.value, "12000");
+  assert.match(h.app.inputs.get("plugins.ai.learning.injection_budget").wrapper.textContent, /普通聊天输入预算.*额外预算.*不占原有问题和历史/u);
+  h.app.inputs.get("limits.learning_max_input_budget").control.value = "2048";
+  for (const value of [0, 12000, 64000]) { injection.value = String(value); assert.equal(h.app.readForm().plugins.ai.learning.injection_budget, value, "chat note budget is independent from background learning input"); }
+  const bad = structuredClone(h.sample); bad.plugins.ai.learning.min_interval_seconds = 1;
+  h.ids.get("config-json").value = JSON.stringify(bad); assert.throws(() => h.app.adoptJson(), /学习间隔/u);
+  const good = structuredClone(h.sample); good.plugins.ai.learning.enabled = true; good.plugins.ai.learning.prompt = "  管理员规则🐟  "; good.limits.learning_requests_per_day = 48;
+  h.ids.get("config-json").value = JSON.stringify(good); h.app.adoptJson();
+  assert.equal(h.app.readForm().plugins.ai.learning.prompt, "管理员规则🐟"); assert.equal(h.app.readForm().limits.learning_requests_per_day, 48);
+  assert.ok(h.ids.get("auto-reply-budget").textContent.includes("输入预算"));
+});
+
+function learningSnapshot() {
+  return { bot_id: "123", revision: 2, max_note_chars: 2000, learning_enabled: false,
+    notes: [{ id: 1, version: 2, kind: "experience", text: "<img>交流时先核对问题", scope: "shared", locked: true, deleted: false, invalidated: false, sources: [{ source_key: "123:group:10:1", quote: "群聊来源", scope: "123:group:10" }], updated_at: 1700000000 }],
+    history: [{ id: 10, note_id: 1, version: 1, kind: "experience", text: "历史版本", scope: "shared", locked: false, deleted: false, rollback_allowed: true, created_at: 1700000000 }, { id: 11, note_id: 1, version: 2, kind: "experience", text: "失效历史", scope: "shared", locked: true, deleted: false, rollback_allowed: false, created_at: 1700000001 }] };
+}
+async function learningPage(h, snapshot = learningSnapshot()) {
+  await h.login(); h.app.state.view = "learning";
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadLearning(); return snapshot;
+}
+
+test("learning page is lazy, account-bound and shows literal notes, provenance and unavailable rollback", async () => {
+  const h = harness(); await h.login(); assert.equal(h.calls.some((call) => call.path.startsWith("/api/learning")), false);
+  h.app.state.view = "learning"; h.setHandler(async () => ({ body: learningSnapshot() })); await h.app.loadLearning();
+  assert.equal(h.ids.get("learning-account").textContent, "QQ 123");
+  assert.match(h.ids.get("learning-list").textContent, /<img>交流时先核对问题.*群聊来源/su);
+  assert.match(h.ids.get("learning-summary").textContent, /自动学习已关闭/u);
+  const rollback = h.document.querySelectorAll("[data-learning-write]").filter((button) => button.textContent.includes("回滚"));
+  assert.equal(rollback[0].disabled, false); assert.equal(rollback[1].disabled, true);
+  await h.app.loadLearning(); assert.equal(h.calls.at(-1).path, "/api/learning?bot_id=123");
+  const wrong = learningSnapshot(); wrong.bot_id = "456";
+  h.setHandler(async () => ({ body: wrong })); await h.app.loadLearning();
+  assert.equal(h.app.state.learning.snapshot, null); assert.equal(h.ids.get("learning-list").children.length, 0);
+  assert.match(h.ids.get("learning-message").textContent, /范围或格式/u);
+});
+
+test("learning manual edits are locked by default and send exact account revisions with CSRF", async () => {
+  const h = harness(), snapshot = await learningPage(h); h.app.openLearningEditor();
+  assert.equal(h.ids.get("edit-learning-locked").checked, true);
+  h.ids.get("edit-learning-text").value = "  新的交流经验🐟  "; await h.ids.get("learning-editor-form").emit("input");
+  let payload;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/learning/mutate") { payload = JSON.parse(options.body); assert.equal(options.headers["X-CSRF-Token"], "csrf-test"); snapshot.revision++; return { body: { bot_id: "123", request_id: payload.request_id, status: "completed", revision: snapshot.revision } }; }
+    assert.equal(path, "/api/learning?bot_id=123"); return { body: snapshot };
+  });
+  await h.app.saveLearning();
+  assert.equal(payload.bot_id, "123"); assert.equal(payload.revision, 2); assert.ok(payload.request_id);
+  assert.deepEqual(payload.action, { op: "add", text: "新的交流经验🐟", kind: "experience", scope: "shared", locked: true });
+  assert.equal(h.ids.get("learning-editor").hidden, true); assert.equal(h.app.state.learning.dirty, false);
+  assert.match(h.ids.get("learning-message").textContent, /已保存/u);
+  await h.app.mutateLearning({ op: "lock", id: 1, version: 2, locked: false });
+  assert.equal(payload.revision, 3); assert.deepEqual(payload.action, { op: "lock", id: 1, version: 2, locked: false });
+  assert.equal(h.calls.some((call) => /llm|embedding|runtime\/apply/u.test(call.path)), false);
+});
+
+test("learning conflicts preserve edits and uncertain mutations query the receipt without resubmitting", async () => {
+  const h = harness(), snapshot = await learningPage(h); h.app.openLearningEditor(snapshot.notes[0]);
+  h.ids.get("edit-learning-text").value = "保留编辑"; await h.ids.get("learning-editor-form").emit("input");
+  h.setHandler(async () => ({ status: 409, body: { error: "版本已变化", code: "learning_conflict" } }));
+  await assert.rejects(h.app.saveLearning(), /版本/u);
+  assert.equal(h.ids.get("edit-learning-text").value, "保留编辑"); assert.equal(h.app.state.learning.conflict, true); assert.equal(h.ids.get("save-learning").disabled, true);
+  h.app.cancelLearningEdit(); h.setHandler(async () => ({ body: snapshot })); await h.app.loadLearning(); h.app.openLearningEditor(); h.ids.get("edit-learning-text").value = "超时新笔记";
+  let payload;
+  h.setHandler(async (path, options) => { payload = JSON.parse(options.body); return { error: new Error("connection lost") }; });
+  await h.app.saveLearning(); assert.equal(h.app.state.pendingOperation.kind, "learning");
+  assert.equal(h.ids.get("save-learning").disabled, true);
+  h.setHandler(async (path) => {
+    if (path.startsWith("/api/learning/operations/")) { assert.ok(path.includes(payload.request_id)); assert.ok(path.endsWith("bot_id=123")); return { body: { bot_id: "123", request_id: payload.request_id, status: "completed", revision: 3 } }; }
+    return { body: { ...snapshot, revision: 3 } };
+  });
+  await h.app.checkOperation(); assert.equal(h.app.state.pendingOperation, null); assert.equal(h.ids.get("learning-editor").hidden, true);
+  assert.equal(h.calls.filter((call) => call.path === "/api/learning/mutate").length, 2, "one known conflict and one ambiguous mutation, no repeated write");
+});
+
+test("learning late responses cannot repaint a left page or signed-out session", async () => {
+  const h = harness(); await learningPage(h); let resolve;
+  h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const pending = h.app.loadLearning(); await Promise.resolve(); h.app.showView("overview"); resolve({ body: learningSnapshot() }); await pending;
+  assert.equal(h.app.state.learning.snapshot, null); assert.equal(h.ids.get("learning-list").children.length, 0);
+  h.app.state.view = "learning"; const next = h.app.loadLearning(); await Promise.resolve(); h.app.clearSession(); resolve({ body: learningSnapshot() }); await next;
+  assert.equal(h.app.state.learning.snapshot, null); assert.equal(h.ids.get("learning-list").children.length, 0);
+});
+
+test("learning editors enforce the shared total character cap without counting replaced or invalidated text", async () => {
+  const h = harness(), snapshot = learningSnapshot(); snapshot.max_note_chars = 100;
+  snapshot.notes[0].text = "鱼".repeat(80);
+  snapshot.notes.push({ ...snapshot.notes[0], id: 2, text: "旧".repeat(100), invalidated: true });
+  await learningPage(h, snapshot); h.app.openLearningEditor();
+  h.ids.get("edit-learning-text").value = "🐟".repeat(21);
+  await assert.rejects(h.app.saveLearning(), /全部有效笔记.*100.*80/u);
+  const requests = h.calls.length; assert.equal(h.calls.some((call) => call.path === "/api/learning/mutate"), false);
+  h.app.openLearningEditor(snapshot.notes[0]); h.ids.get("edit-learning-text").value = "🐟".repeat(100);
+  let action;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/learning/mutate") { const payload = JSON.parse(options.body); action = payload.action; return { body: { bot_id: "123", request_id: payload.request_id, status: "completed", revision: 3 } }; }
+    return { body: { ...snapshot, revision: 3 } };
+  });
+  await h.app.saveLearning(); assert.equal([...action.text].length, 100); assert.equal(action.id, 1); assert.equal(action.version, 2);
+  assert.equal(h.calls.length, requests + 2);
+});
+
+test("learning uses the third budget pool with hourly and rolling-day limits", async () => {
+  const h = harness(); await h.login();
+  h.setHandler(async () => ({ body: { used: { foreground: 1, background: 2, learning: 3, learning_day: 12 }, limits: { model_global_per_hour: 100, memory_requests_per_hour: 30, learning_requests_per_hour: 4, learning_requests_per_day: 24 }, usage: [] } }));
+  await h.app.loadBudget();
+  assert.match(h.ids.get("budget-usage").textContent, /学习笔记3 \/ 4.*第三个独立额度池.*24 小时 12 \/ 24/u);
 });
 
 test("search configuration and network-read catalog retain explicit grants and independent secrets", async () => {

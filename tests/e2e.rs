@@ -248,6 +248,283 @@ fn recall_message(seq: i64) -> Incoming {
     incoming
 }
 
+async fn add_learning_note(host: &Host, text: &str, scope: &str) -> i64 {
+    use qkbot::plugins::ai::learning;
+    learning::configure(&host.store, 123, true).await.unwrap();
+    let snapshot = learning::snapshot(&host.store, 123).await.unwrap();
+    learning::mutate(&host.store, 123, json!({
+        "revision":snapshot["revision"], "op":"add",
+        "request_id":uuid::Uuid::new_v4().to_string(), "admin_id":"test-admin", "session_id":"test-session",
+        "kind":"experience", "text":text, "scope":scope, "locked":true,
+        "_max_note_chars":2000,
+    })).await.unwrap()["id"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn learning_notes_are_optional_group_data_separate_from_private_and_personal_memory() {
+    for (enabled, read) in [(true, true), (false, true), (true, false)] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.learning.enabled = enabled;
+            config.plugins.ai.defaults.memory_read = read;
+            config.plugins.ai.defaults.summary = false;
+        })
+        .await;
+        add_learning_note(
+            &host,
+            "shared-learning-marker：解释错误先说明现象。",
+            "shared",
+        )
+        .await;
+        add_learning_note(
+            &host,
+            "scoped-learning-marker：本群术语应结合上下文。",
+            "123:group:456",
+        )
+        .await;
+        for (index, scene, peer) in [
+            (1, Scene::Group, 456),
+            (2, Scene::Group, 654),
+            (3, Scene::Friend, 789),
+        ] {
+            let mut incoming = message(index, "请回答当前问题");
+            incoming.key.scope.scene = scene;
+            incoming.key.scope.peer_id = peer;
+            router.dispatch(incoming).await.unwrap();
+            let request = mock.model().await;
+            let messages = request.body["messages"].as_array().unwrap();
+            assert!(
+                !messages[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("learning-marker"),
+                "notes must never become system policy"
+            );
+            let prompt = request.body["messages"].to_string();
+            let expected = enabled && read && scene == Scene::Group;
+            assert_eq!(prompt.contains("shared-learning-marker"), expected);
+            assert_eq!(
+                prompt.contains("scoped-learning-marker"),
+                expected && peer == 456
+            );
+            assert!(prompt.contains("请回答当前问题"));
+            request.reply.send(answer("当前问题已处理")).unwrap();
+            assert_eq!(mock.sent().await, "当前问题已处理");
+        }
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn learning_note_changes_cancel_both_text_and_structured_stale_answers() {
+    use qkbot::plugins::ai::learning;
+    for structured in [false, true] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.learning.enabled = true;
+            config.plugins.ai.defaults.allowed_tools = vec!["reply_message".into()];
+        })
+        .await;
+        let id = add_learning_note(&host, "old-learning-marker", "shared").await;
+        router.dispatch(message(1, "第一问")).await.unwrap();
+        let stale = mock.model().await;
+        assert!(
+            stale.body["messages"]
+                .to_string()
+                .contains("old-learning-marker")
+        );
+        let snapshot = learning::snapshot(&host.store, 123).await.unwrap();
+        let note = snapshot["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|note| note["id"] == id)
+            .unwrap();
+        learning::mutate(&host.store, 123, json!({
+            "revision":snapshot["revision"], "op":"update", "id":id, "version":note["version"],
+            "request_id":"edit-note", "admin_id":"test-admin", "session_id":"test-session",
+            "kind":"experience", "text":"new-learning-marker", "scope":"shared", "_max_note_chars":2000,
+        })).await.unwrap();
+        let response = if structured {
+            json!({"model":"mock","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"old-reply","type":"function","function":{"name":"reply_message","arguments":json!({"text":"旧笔记生成的回复不得发送"}).to_string()}}]}}]})
+        } else {
+            answer("旧笔记生成的回复不得发送")
+        };
+        stale.reply.send(response).unwrap();
+        router.dispatch(message(2, "第二问")).await.unwrap();
+        let fresh = mock.model().await;
+        assert!(
+            fresh.body["messages"]
+                .to_string()
+                .contains("new-learning-marker")
+        );
+        assert!(
+            !fresh.body["messages"]
+                .to_string()
+                .contains("old-learning-marker")
+        );
+        fresh.reply.send(answer("新笔记回复")).unwrap();
+        assert_eq!(mock.sent().await, "新笔记回复");
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn learning_has_an_extra_twelve_thousand_budget_without_evicting_the_current_question() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.learning.enabled = true;
+        config.plugins.ai.defaults.allowed_tools.clear();
+        config.plugins.ai.defaults.input_budget = 6000;
+    })
+    .await;
+    assert_eq!(host.config.plugins.ai.learning.injection_budget, 12_000);
+    let note = format!("independent-learning-marker:{}", "经".repeat(1800));
+    add_learning_note(&host, &note, "shared").await;
+    let question = format!("current-question-marker:{}", "question ".repeat(80));
+    router.dispatch(message(1, &question)).await.unwrap();
+    let request = mock.model().await;
+    let serialized = request.body["messages"].to_string();
+    assert!(serialized.contains(&note));
+    assert!(serialized.contains(&question));
+    assert!(
+        serialized.len() > 6000,
+        "the extra note must not be squeezed into the old allowance"
+    );
+    assert!(serialized.len() + 72 <= 6000 + 12_000);
+    request.reply.send(answer("两份预算均生效")).unwrap();
+    assert_eq!(mock.sent().await, "两份预算均生效");
+    within(router.shutdown()).await.unwrap();
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn learning_background_uses_its_quota_and_recall_invalidates_cross_group_reply_and_history() {
+    use qkbot::plugins::ai::learning;
+    for forget_personal_memory in [false, true] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.learning.enabled = true;
+            config.plugins.ai.learn_all_group_messages = true;
+            config.plugins.ai.defaults.summary = false;
+            config.plugins.ai.defaults.allowed_tools.clear();
+        })
+        .await;
+        // This background-only source must be eligible without entering chat history.
+        router
+            .dispatch(ordinary_message(
+                1,
+                "learning-evidence-marker：检查报错时先确认输入类型。",
+            ))
+            .await
+            .unwrap();
+        let worker_host = host.clone();
+        let worker =
+            tokio::spawn(
+                async move { learning::run(&worker_host, 123, &worker_host.cancel).await },
+            );
+        let request = mock.model().await;
+        assert!(
+            request
+                .body
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        let input: Value = serde_json::from_str(
+            request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let source = &input["messages"][0]["source_key"];
+        request.reply.send(answer(&json!({"changes":[{"op":"add","kind":"experience","text":"learned-note-marker：先核对输入类型。","scope":"shared","evidence":[{"source_key":source,"quote":"检查报错时先确认输入类型"}]}]}).to_string())).unwrap();
+        within(worker).await.unwrap().unwrap();
+        let snapshot = learning::snapshot(&host.store, 123).await.unwrap();
+        assert_eq!(snapshot["notes"].as_array().unwrap().len(), 1);
+        let budget = qkbot::budget::Budget::new(host.store.clone(), host.config.limits.clone())
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(budget["used"]["learning"], 1);
+        assert_eq!(budget["used"]["foreground"], 0);
+        assert_eq!(budget["used"]["background"], 0);
+        let mut question = message(1, "跨群应用经验");
+        question.key.scope.peer_id = 654;
+        router.dispatch(question.clone()).await.unwrap();
+        let stale = mock.model().await;
+        assert!(
+            stale.body["messages"]
+                .to_string()
+                .contains("learned-note-marker")
+        );
+        if forget_personal_memory {
+            let source_message =
+                ordinary_message(1, "learning-evidence-marker：检查报错时先确认输入类型。");
+            let conversation = qkbot::plugins::ai::conversation(&host, &source_message)
+                .await
+                .unwrap();
+            let id = host
+                .memory
+                .remember(
+                    &conversation.guard,
+                    789,
+                    &source_message.key.key(),
+                    "检查报错时先确认输入类型",
+                    qkbot::plugins::ai::memory::MemoryKind::Fact,
+                    None,
+                )
+                .await
+                .unwrap();
+            let returned = host
+                .memory
+                .forget(&conversation.guard, 789, id)
+                .await
+                .unwrap();
+            assert!(
+                host.valid(&returned).await.unwrap(),
+                "forget must return the actual epoch after learning invalidation"
+            );
+        } else {
+            router.dispatch(recall_message(1)).await.unwrap();
+        }
+        stale
+            .reply
+            .send(answer("撤回来源的旧回复不得发送"))
+            .unwrap();
+        let snapshot = learning::snapshot(&host.store, 123).await.unwrap();
+        assert!(!snapshot.to_string().contains("learned-note-marker"));
+        assert!(
+            snapshot["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["rollback_allowed"] == false)
+        );
+        question.key.message_seq = 2;
+        question.text = "撤回后的问题".into();
+        router.dispatch(question).await.unwrap();
+        let fresh = mock.model().await;
+        assert!(
+            !fresh.body["messages"]
+                .to_string()
+                .contains("learned-note-marker")
+        );
+        fresh.reply.send(answer("撤回后的正常回答")).unwrap();
+        assert_eq!(mock.sent().await, "撤回后的正常回答");
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
 #[tokio::test]
 async fn auto_reply_custom_policy_and_zero_cooldown_take_effect_in_real_turns() {
     let mut mock = MockServer::start().await;

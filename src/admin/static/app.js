@@ -18,6 +18,7 @@
     search: { version: 0, loading: false, message: "", kind: "" },
     stickers: { version: 0, groupRequest: 0, itemRequest: 0, groupsLoading: false, loading: false, groups: [], groupPage: 1, totalGroupPages: 1, scope: "", rows: [], page: 1, totalPages: 1, total: 0, index: null, running: false, message: "", kind: "", operation: null, preview: null },
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
+    learning: { version: 0, loading: false, saving: false, snapshot: null, editing: null, dirty: false, conflict: false, message: "" },
   };
   const inputs = new Map();
   const secretInputs = new Map();
@@ -55,6 +56,19 @@
     field("plugins.ai.auto_reply.max_wait_ms", "最长合并等待（毫秒）", "number", "持续有新消息时，最迟在这段时间后判断是否接话；不能短于消息合并等待。", { min: 100, max: 30000 }),
     field("plugins.ai.auto_reply.max_messages", "每批最多新消息数", "number", "单批最多合并这么多条新消息，后续消息进入下一批。", { min: 1, max: 32 }),
     field("plugins.ai.auto_reply.max_age_seconds", "待接话消息有效期（秒）", "number", "超过有效期的批次不再主动回复；应覆盖最长合并等待。只限制待接话的新消息，不截断完整聊天上下文、摘要或长期记忆。", { min: 5, max: 600, full: true }),
+  ];
+  const learningFields = [
+    field("plugins.ai.learning.enabled", "启用学习笔记", "check", "默认关闭。开启后仅从同一机器人账号的群聊取材，在群聊间共享交流经验；保存并应用后生效。", { full: true }),
+    field("plugins.ai.learning.prompt", "管理员学习规则", "textarea", "规定可以学习的交流经验和常用术语，最多 4000 个字符，可留空。群聊内容只作为素材，不能修改管理员规则。", { full: true, rows: 5, optional: true }),
+    field("plugins.ai.learning.min_interval_seconds", "最短学习间隔（秒）", "number", "每个机器人账号的后台学习间隔，默认 900 秒。", { min: 60, max: 86400 }),
+    field("plugins.ai.learning.max_batch_messages", "每批最多素材消息数", "number", "只读取符合条件的群聊消息。", { min: 1, max: 100 }),
+    field("plugins.ai.learning.max_changes_per_run", "每轮最多笔记变更数", "number", "限制一次自动学习可新增、修改或删除的笔记数量。", { min: 1, max: 20 }),
+    field("plugins.ai.learning.max_note_chars", "整份笔记字符上限", "number", "当前账号全部有效笔记的总字符上限，人工编辑和自动学习共用。", { min: 100, max: 10000 }),
+    field("plugins.ai.learning.injection_budget", "聊天笔记独立额外预算（估算）", "number", "默认 12000。只在开启记忆读取的群聊中提供笔记；普通聊天输入预算加上这份额外预算共同组成最终请求，不占原有问题和历史空间。设为 0 暂停注入，后台仍可学习。", { min: 0, max: 64000, full: true }),
+    field("limits.learning_requests_per_hour", "每小时学习请求上限", "number", "第三个独立额度池，与前台聊天、后台个人记忆整理分别计数。", { min: 1, max: 1000 }),
+    field("limits.learning_requests_per_day", "每 24 小时学习请求上限", "number", "滚动 24 小时统计，不能低于每小时上限。", { min: 1, max: 10000 }),
+    field("limits.learning_max_input_budget", "学习输入预算（估算）", "number", "后台学习规则、群聊素材与已有笔记共用的输入上限。", { min: 2048, max: 65536 }),
+    field("limits.learning_max_output_tokens", "学习输出 token 上限", "number", "限制后台模型输出的笔记变更内容。", { min: 256, max: 8192 }),
   ];
   const groups = [
     { title: "模型接口", description: "兼容 Chat Completions 的远程 API；获取模型列表不会保存密钥或发送聊天请求。", models: true, fields: [
@@ -95,6 +109,7 @@
       field("plugins.ai.defaults.mode", "新群默认会话模式", "select", "已有会话在「记忆与上下文」中单独管理。", { choices: [["group", "群共享上下文"], ["user", "群内按用户隔离"]] }),
     ] },
     { title: "自动接话", description: "全局策略仅用于已在「群与好友」单独开启自动接话的聊天；每个群聊和私聊默认关闭。保存并应用后生效。真实 @、关键词和引用机器人消息的明确触发仍优先，不受自动接话的合并等待与冷却限制。", autoReply: true, fields: autoReplyFields },
+    { title: "学习笔记", description: "独立记录同一机器人账号的群聊交流经验，不替代个人记忆，也不从私聊取材。可在「学习笔记」页人工管理、锁定和查看历史；来源被遗忘的内容不能通过回滚复活。", fields: learningFields },
     { title: "人设", description: "从列表选择默认人设，也可编辑自定义内容。会话可单独选择已保存的人设。", personas: true, fields: [
       field("plugins.ai.defaults.persona", "默认人设", "persona", "选择后随配置一起保存；下方可预览模板和编辑自定义人设。", { full: true }),
     ] },
@@ -577,7 +592,7 @@
       control = document.createElement("textarea");
       control.rows = definition.rows ?? (definition.type === "json" ? 5 : 3);
       control.spellcheck = false;
-      if (definition.type === "textarea") control.required = true;
+      if (definition.type === "textarea") control.required = !definition.optional;
     } else if (definition.type === "persona") {
       control = document.createElement("select"); control.required = true;
       fillPersonaSelect(control, get(state.draft, definition.path), state.draft);
@@ -801,7 +816,7 @@
       put(config, def.path, value);
     }
     readPluginConfig(config);
-    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config);
+    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config); validateLearning(config);
     return config;
   }
 
@@ -816,6 +831,17 @@
     if (policy.max_wait_ms < policy.debounce_ms) throw new Error("「最长合并等待」不能短于「消息合并等待」。");
     if (policy.max_age_seconds * 1000 < policy.max_wait_ms) throw new Error("「待接话消息有效期」不能短于「最长合并等待」，请注意秒与毫秒的单位。");
     policy.prompt = policy.prompt.trim();
+  }
+  function validateLearning(config) {
+    const learning = get(config, "plugins.ai.learning");
+    if (!learning || typeof learning !== "object" || Array.isArray(learning)) throw new Error("学习笔记配置不完整，请重新载入配置。");
+    if (typeof learning.prompt !== "string" || [...learning.prompt.trim()].length > 4000) throw new Error("「管理员学习规则」最多 4000 个字符。");
+    for (const def of learningFields.filter((entry) => entry.type === "number")) {
+      const value = get(config, def.path);
+      if (!Number.isSafeInteger(value) || value < def.min || value > def.max) throw new Error(`「${def.label}」需要填写 ${def.min}–${def.max} 范围内的整数。`);
+    }
+    if (config.limits.learning_requests_per_day < config.limits.learning_requests_per_hour) throw new Error("「每 24 小时学习请求上限」不能低于每小时上限。");
+    learning.prompt = learning.prompt.trim();
   }
 
   function validateImmutable(config) {
@@ -876,7 +902,7 @@
       if (!valid) throw new Error(`JSON 字段 ${def.path} 的类型不正确。`);
       if (def.type === "select" && !def.choices.some(([key]) => key === value)) throw new Error(`JSON 字段 ${def.path} 的选项无效。`);
     }
-    validateAutoReply(config);
+    validateAutoReply(config); validateLearning(config);
     const pending = secretSnapshot();
     state.draft = config; state.jsonDirty = false; state.formInvalid = false; state.dirty = true;
     renderFields(pending); syncJson();
@@ -968,6 +994,7 @@
     for (const control of [inputs.get("plugins.ai.defaults.allowed_tools")?.control, settingInputs.get("allowed_tools")?.input]) if (control) updateToolPicker(control);
     updateContactControls();
     updateStickerControls();
+    updateLearningControls();
   }
 
   async function loadConfig() {
@@ -1004,6 +1031,7 @@
   function renderStatus() {
     if (!state.status) { updateControls(); return; }
     const status = state.status;
+    if (state.learning.snapshot && status.online && status.bot_id != null && state.learning.snapshot.bot_id !== String(status.bot_id)) { invalidateLearning(); state.learning.conflict = Boolean(state.learning.dirty); state.learning.message = "机器人账号已变化，请刷新学习笔记。"; renderLearning(); }
     const contacts = state.contacts;
     if ((contacts.botId || contacts.loading) && ((contacts.generation != null && status.runtime_generation != null && contacts.generation !== status.runtime_generation) || (contacts.botId && status.online && status.bot_id != null && String(status.bot_id) !== contacts.botId))) {
       invalidateContacts("机器人连接或账号已变化，请刷新联系人列表。");
@@ -1026,6 +1054,7 @@
     for (const [title, value, hint] of [
       ["前台请求", String(result.used?.foreground ?? 0) + " / " + String(result.limits?.model_global_per_hour ?? "—"), "最近 1 小时 · 全局上限"],
       ["后台整理", String(result.used?.background ?? 0) + " / " + String(result.limits?.memory_requests_per_hour ?? "—"), "最近 1 小时 · 独立预算"],
+      ["学习笔记", String(result.used?.learning ?? 0) + " / " + String(result.limits?.learning_requests_per_hour ?? "—"), "最近 1 小时 · 第三个独立额度池；滚动 24 小时 " + String(result.used?.learning_day ?? 0) + " / " + String(result.limits?.learning_requests_per_day ?? "—")],
       ["输入 token", total("input_tokens"), "最近 7 天 · 服务商实际用量"],
       ["输出 token", total("output_tokens"), "最近 7 天 · 服务商实际用量"],
     ]) { const item = element("div", "budget-item"); item.append(element("span", "section-label", title), element("strong", "", value), element("p", "hint", hint)); box.append(item); }
@@ -1496,6 +1525,133 @@
     } finally { if (state.session === operation.session) { if (s.operation === operation) operation.sending = false; renderStickerStatus(); } }
   }
 
+  const learningKinds = { experience: "交流经验", correction: "纠正记录", term: "用语解释" };
+  function updateLearningControls() {
+    const s = state.learning, blocked = state.busy || !state.authenticated || s.loading || s.saving || Boolean(state.pendingOperation);
+    $("refresh-learning").disabled = blocked;
+    $("new-learning").disabled = blocked || !s.snapshot || s.conflict;
+    $("save-learning").disabled = blocked || !s.snapshot || s.conflict || !s.editing;
+    $("cancel-learning-edit").disabled = state.busy || s.saving || Boolean(state.pendingOperation);
+    document.querySelectorAll("[data-learning-write]").forEach((node) => { node.disabled = blocked || !s.snapshot || s.conflict || node.dataset.learningUnavailable === "true"; });
+    document.querySelectorAll("#learning-editor-form input,#learning-editor-form textarea,#learning-editor-form select").forEach((node) => { node.disabled = blocked; });
+  }
+  function invalidateLearning(clear = false) {
+    const s = state.learning; s.version++; s.loading = false; s.snapshot = null; s.message = "";
+    $("learning-list").replaceChildren(); $("learning-history").replaceChildren();
+    $("learning-account").textContent = "尚未读取"; $("learning-summary").textContent = "刷新后读取服务器确认的账号。";
+    if (clear) { s.saving = false; s.editing = null; s.dirty = false; s.conflict = false; $("edit-learning-text").value = ""; $("learning-editor").hidden = true; }
+    $("learning-message").textContent = ""; updateLearningControls();
+  }
+  function learningCurrent(version, session) { return state.authenticated && state.view === "learning" && state.learning.version === version && state.session === session; }
+  function validateLearningSnapshot(value, expected) {
+    const integer = (n, min = 0) => Number.isSafeInteger(n) && n >= min;
+    const scope = (s) => s === "shared" || (typeof s === "string" && new RegExp("^" + value.bot_id + ":group:[1-9][0-9]*$").test(s));
+    const note = (n) => n && integer(n.id, 1) && integer(n.version, 1) && Object.hasOwn(learningKinds, n.kind) && typeof n.text === "string" && scope(n.scope) && typeof n.locked === "boolean" && typeof n.deleted === "boolean";
+    if (!contactId(value.bot_id) || (expected && value.bot_id !== expected) || !integer(value.revision) || !integer(value.max_note_chars, 100) || value.max_note_chars > 10000 || typeof value.learning_enabled !== "boolean"
+      || !Array.isArray(value.notes) || !Array.isArray(value.history) || value.notes.some((n) => !note(n) || typeof n.invalidated !== "boolean" || !Array.isArray(n.sources) || n.sources.some((source) => typeof source.source_key !== "string" || typeof source.quote !== "string" || !scope(source.scope)))
+      || value.history.some((n) => !note(n) || !integer(n.note_id, 1) || typeof n.rollback_allowed !== "boolean") || new Set(value.notes.map((n) => n.id)).size !== value.notes.length) throw new Error("学习笔记范围或格式无效，请刷新核对。");
+  }
+  function learningButton(label, action, unavailable = false) {
+    const button = element("button", "text-button accent", label); button.type = "button";
+    button.dataset.learningWrite = ""; button.dataset.learningUnavailable = String(unavailable);
+    button.addEventListener("click", () => { if (!button.disabled) void runAction(action); }); return button;
+  }
+  function renderLearning() {
+    const s = state.learning, snapshot = s.snapshot;
+    $("learning-message").textContent = s.message || (s.loading ? "正在读取学习笔记…" : "");
+    if (!snapshot) { updateLearningControls(); return; }
+    $("learning-account").textContent = "QQ " + snapshot.bot_id;
+    const used = snapshot.notes.filter((note) => !note.deleted && !note.invalidated).reduce((sum, note) => sum + [...note.text].length, 0);
+    $("learning-summary").textContent = `自动学习${snapshot.learning_enabled ? "已开启" : "已关闭"} · 版本 ${snapshot.revision} · 有效笔记共 ${used} / ${snapshot.max_note_chars} 个字符。人工管理即时生效。最多保留 128 条有效笔记、512 条含已删除记录，每条保留最近 32 个版本；超出记录容量时，会清理最旧的已删除或来源失效记录及其历史。`;
+    const list = $("learning-list"), history = $("learning-history"); list.replaceChildren(); history.replaceChildren();
+    if (!snapshot.notes.length) list.append(element("p", "empty-state", "当前账号还没有学习笔记。可人工新增，或在配置中开启自动学习。"));
+    for (const note of snapshot.notes) {
+      const card = element("article", "memory-record"), top = element("div", "memory-record-top");
+      top.append(element("strong", "", `${learningKinds[note.kind]} #${note.id}`), element("span", "hint", `版本 ${note.version} · ${note.scope === "shared" ? "同账号群聊共享" : "群 " + note.scope.split(":")[2]} · ${note.invalidated ? "来源已失效" : note.deleted ? "已删除" : note.locked ? "已锁定" : "可自动更新"}`));
+      card.append(top, element("p", "memory-text", note.text));
+      if (note.sources.length) {
+        const details = element("details", "evidence-details"); details.append(element("summary", "", "学习来源（" + note.sources.length + "）"));
+        for (const source of note.sources) details.append(element("p", "hint learning-source", `${source.scope} · ${source.source_key}\n${source.quote}`));
+        card.append(details);
+      }
+      const actions = element("div", "button-row");
+      actions.append(learningButton("编辑", () => openLearningEditor(note), note.deleted || note.invalidated), learningButton(note.locked ? "解除锁定" : "锁定", () => mutateLearning({ op: "lock", id: note.id, version: note.version, locked: !note.locked }), note.deleted || note.invalidated), learningButton("删除", async () => { if (window.confirm(`删除笔记 #${note.id}？记录和历史按页面所示容量保留，可恢复的历史可以回滚；超过容量后，旧的已删除记录及其历史会被清理。`)) await mutateLearning({ op: "delete", id: note.id, version: note.version }); }, note.deleted || note.invalidated));
+      card.append(actions); list.append(card);
+    }
+    if (!snapshot.history.length) history.append(element("p", "empty-state", "尚无修改历史。"));
+    for (const entry of snapshot.history) {
+      const card = element("article", "memory-record");
+      const current = snapshot.notes.find((note) => note.id === entry.note_id);
+      card.append(element("strong", "", `笔记 #${entry.note_id} · 版本 ${entry.version}`), element("p", "hint", `${dateText(entry.created_at)} · ${learningKinds[entry.kind]} · ${entry.deleted ? "删除版本" : entry.locked ? "已锁定" : "未锁定"}`), element("p", "memory-text", entry.text));
+      card.append(learningButton("回滚到此版本", async () => { if (window.confirm(`将笔记 #${entry.note_id} 回滚到版本 ${entry.version}？这会创建一个新版本。`)) await mutateLearning({ op: "rollback", id: entry.note_id, version: current.version, history_id: entry.id }); }, !entry.rollback_allowed || !current));
+      if (!entry.rollback_allowed) card.append(element("p", "hint", "此历史不可回滚，来源可能已遗忘或撤回。"));
+      history.append(card);
+    }
+    updateLearningControls();
+  }
+  async function loadLearning() {
+    if (!state.authenticated || state.view !== "learning" || state.learning.loading) return;
+    const s = state.learning, version = ++s.version, session = state.session, expected = s.snapshot?.bot_id;
+    s.loading = true; s.message = ""; renderLearning();
+    try {
+      const result = await api("/api/learning" + (expected ? "?" + new URLSearchParams({ bot_id: expected }) : ""));
+      if (!learningCurrent(version, session)) return;
+      validateLearningSnapshot(result, expected);
+      if (s.dirty && s.editing && (s.editing.bot_id !== result.bot_id || s.editing.revision !== result.revision)) s.conflict = true;
+      else if (!s.dirty) s.conflict = false;
+      s.snapshot = result; s.message = s.conflict ? "笔记已变化，编辑仍保留。请复制内容，取消编辑后重新选择笔记。" : "";
+    } catch (error) {
+      if (!learningCurrent(version, session)) return;
+      s.snapshot = null; s.conflict = Boolean(s.dirty); s.message = error.message;
+      $("learning-list").replaceChildren(); $("learning-history").replaceChildren();
+      $("learning-account").textContent = "账号待核对"; $("learning-summary").textContent = "刷新后重新读取服务器确认的账号与笔记。";
+      if (["reauth_required", "csrf_invalid"].includes(error.code)) report(error);
+    } finally { if (learningCurrent(version, session)) { s.loading = false; renderLearning(); } }
+  }
+  function openLearningEditor(note = null) {
+    const s = state.learning;
+    if (!s.snapshot || s.loading || s.saving || s.conflict || state.pendingOperation || (s.dirty && !window.confirm("放弃尚未保存的笔记编辑？"))) return;
+    s.editing = { ...(note ? clone(note) : {}), bot_id: s.snapshot.bot_id, revision: s.snapshot.revision }; s.dirty = false;
+    $("learning-editor-title").textContent = note ? `编辑笔记 #${note.id}` : "新增笔记";
+    $("learning-editor-scope").textContent = `机器人 ${s.snapshot.bot_id} · ${note?.scope && note.scope !== "shared" ? "群 " + note.scope.split(":")[2] : "同账号群聊共享"}。人工笔记默认锁定，不含聊天来源。已有来源依赖会保留。`;
+    $("edit-learning-kind").value = note?.kind || "experience"; $("edit-learning-text").value = note?.text || ""; $("edit-learning-locked").checked = note?.locked ?? true;
+    $("learning-editor-error").textContent = ""; $("learning-editor").hidden = false; updateLearningControls();
+  }
+  function cancelLearningEdit() {
+    const s = state.learning; if (s.saving || state.pendingOperation || (s.dirty && !window.confirm("放弃尚未保存的笔记编辑？"))) return;
+    s.editing = null; s.dirty = false; s.conflict = false; $("learning-editor").hidden = true; $("edit-learning-text").value = ""; updateLearningControls();
+  }
+  async function saveLearning() {
+    const s = state.learning, edit = s.editing, text = $("edit-learning-text").value.trim();
+    if (!edit || !s.snapshot || !text || [...text].length > s.snapshot.max_note_chars) throw new Error(`笔记内容需要填写 1–${s.snapshot?.max_note_chars ?? 2000} 个字符。`);
+    const otherChars = s.snapshot.notes.filter((note) => !note.deleted && !note.invalidated && note.id !== edit.id).reduce((sum, note) => sum + [...note.text].length, 0);
+    if (otherChars + [...text].length > s.snapshot.max_note_chars) throw new Error(`全部有效笔记不能超过 ${s.snapshot.max_note_chars} 个字符；其他笔记已占 ${otherChars} 个。`);
+    const action = { op: edit.id ? "update" : "add", kind: $("edit-learning-kind").value, text, locked: $("edit-learning-locked").checked, scope: edit.scope || "shared" };
+    if (edit.id) Object.assign(action, { id: edit.id, version: edit.version });
+    await mutateLearning(action, true);
+  }
+  async function mutateLearning(action, closeEditor = false) {
+    const s = state.learning;
+    if (!s.snapshot || s.loading || s.saving || s.conflict || state.pendingOperation) throw new Error("请先刷新笔记并核对未完成操作。");
+    if (closeEditor && (s.editing?.bot_id !== s.snapshot.bot_id || s.editing?.revision !== s.snapshot.revision)) throw new Error("编辑版本已变化，请重新载入笔记。");
+    const version = s.version, session = state.session;
+    const payload = { bot_id: s.snapshot.bot_id, revision: s.snapshot.revision, request_id: requestId(), action };
+    const validate = (result) => { if (result.request_id !== payload.request_id || result.bot_id !== payload.bot_id || result.status !== "completed" || !Number.isSafeInteger(result.revision) || result.revision <= payload.revision) throw new ApiError("学习操作响应范围无效，请查询原操作结果。", 200, "invalid_response"); };
+    const complete = async () => {
+      if (!learningCurrent(version, session)) return;
+      if (closeEditor) { s.editing = null; s.dirty = false; $("learning-editor").hidden = true; $("edit-learning-text").value = ""; }
+      await loadLearning(); s.message = s.snapshot ? "笔记已保存。" : "笔记已保存，但刷新列表失败：" + s.message; renderLearning();
+    };
+    s.saving = true; updateLearningControls();
+    try { const result = await api("/api/learning/mutate", "POST", payload); validate(result); await complete(); }
+    catch (error) {
+      if (state.session !== session) return;
+      if (uncertain(error)) { trackOperation({ kind: "learning", label: "学习笔记操作", requestId: payload.request_id, botId: payload.bot_id, validate, complete }); return; }
+      if (learningCurrent(version, session)) { s.conflict = error.status === 409; s.message = error.status === 409 ? "笔记已变化，编辑仍保留；请刷新后核对。" : error.message; $("learning-editor-error").textContent = s.message; renderLearning(); }
+      throw error;
+    } finally { if (state.session === session) { s.saving = false; updateLearningControls(); } }
+  }
+
   async function runAction(action) {
     if (state.busy) return;
     const session = state.session; state.busy = true; updateControls();
@@ -1544,7 +1700,11 @@
   }
   async function checkOperation() {
     const operation = state.pendingOperation; if (!operation) return;
-    if (operation.kind === "memory") {
+    if (operation.kind === "learning") {
+      const result = await api("/api/learning/operations/" + encodeURIComponent(operation.requestId) + "?" + new URLSearchParams({ bot_id: operation.botId }));
+      if (result.status === "completed") { operation.validate(result); clearOperation(); await operation.complete(result); }
+      else notice("尚未查到学习笔记操作的完成记录，请稍后再次查询；不会重复提交。", "warning");
+    } else if (operation.kind === "memory") {
       const result = await api("/api/memory/operations/" + encodeURIComponent(operation.requestId));
       if (result.status === "completed") { if (operation.validate) operation.validate(result); clearOperation(); await operation.complete(result); }
       else notice("尚未查到完成记录。请稍后再次查询，不要重新提交。操作号：" + operation.requestId, "warning");
@@ -1567,19 +1727,21 @@
     }
   }
   function showView(view) {
-    if (!["overview", "qq", "contacts", "config", "memory", "stickers"].includes(view)) return;
+    if (!["overview", "qq", "contacts", "config", "memory", "learning", "stickers"].includes(view)) return;
     if (state.view === "contacts" && view !== "contacts") invalidateContacts();
     if (state.view === "stickers" && view !== "stickers") invalidateStickers();
+    if (state.view === "learning" && view !== "learning") invalidateLearning();
     state.view = view;
     document.querySelectorAll(".view").forEach((node) => { node.hidden = node.id !== "view-" + view; });
     document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
-    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "配置管理", memory: "记忆与上下文", stickers: "图库管理" }[view];
+    $("page-name").textContent = { overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "配置管理", memory: "记忆与上下文", learning: "学习笔记", stickers: "图库管理" }[view];
     if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
     if (view === "qq") scheduleQq(0);
     if (view === "contacts" && state.contacts.phase !== "ready") void loadContacts();
     if (view === "stickers") void refreshStickers();
+    if (view === "learning") void loadLearning();
   }
-  const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty;
+  const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty || state.learning.dirty;
   function authView(result) {
     state.authenticated = Boolean(result.authenticated); state.csrf = result.csrf_token || ""; state.setupRequired = Boolean(result.setup_required);
     $("setup-code-field").hidden = !state.setupRequired; $("setup-confirm-field").hidden = !state.setupRequired;
@@ -1599,6 +1761,7 @@
     state.secrets = {}; state.dirty = false; state.jsonDirty = false; state.pendingOperation = null; resumeQqPolling();
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     invalidateStickers(true);
+    invalidateLearning(true);
     $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
     invalidateModels(); invalidateEmbeddingTest(); invalidateSearchTest();
@@ -2128,6 +2291,11 @@
     event.preventDefault(); void runAction(async () => { try { await saveMemory(); } catch (error) { $("memory-editor-error").textContent = error.status === 409 ? "记录已变化。编辑仍保留，请复制后关闭并重新载入会话。" : error.message; throw error; } });
   });
   $("confirm-forget").addEventListener("click", () => { void runAction(async () => { try { await confirmForget(); } catch (error) { $("forget-error").textContent = error.message; throw error; } }); });
+  $("refresh-learning").addEventListener("click", () => { void loadLearning(); });
+  $("new-learning").addEventListener("click", () => { if (!state.busy) openLearningEditor(); });
+  $("cancel-learning-edit").addEventListener("click", cancelLearningEdit);
+  $("learning-editor-form").addEventListener("input", () => { state.learning.dirty = true; });
+  $("learning-editor-form").addEventListener("submit", (event) => { event.preventDefault(); void runAction(async () => { try { await saveLearning(); } catch (error) { $("learning-editor-error").textContent = error.message; throw error; } }); });
   $("context-details").addEventListener("toggle", () => { if ($("context-details").open) void runAction(loadContext); });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { stopTimers(); $("poll-state").textContent = "页面隐藏，已暂停轮询"; }

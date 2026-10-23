@@ -367,6 +367,36 @@ impl Llm {
         .await
     }
 
+    /// Revalidate versioned text sources after waiting for model capacity and
+    /// immediately before HTTP, just as visual sources are revalidated.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_checked_admitted(
+        &self,
+        messages: Vec<Value>,
+        tools: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        admission: crate::budget::Admission,
+        revalidate_sources: impl std::future::Future<Output = Result<()>> + Send,
+    ) -> Result<LlmResponse> {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("model request cancelled"),
+            p = self.requests.clone().acquire_owned() => p.context("model request scheduler closed")?,
+        };
+        self.request(
+            messages,
+            tools,
+            max_output,
+            cancel,
+            permit,
+            Some(crate::budget::RequestAdmission::Chat(admission)),
+            None,
+            Some(Box::pin(revalidate_sources)),
+        )
+        .await
+    }
+
     /// Visual inputs are tied to the QQ login that supplied their pixels,
     /// including while waiting for an available model request slot. Revalidate
     /// the source messages after that wait, before submitting any pixels.
@@ -446,6 +476,64 @@ impl Llm {
             }),
         )
         .await
+    }
+
+    /// Learning has its own persisted quota but shares background capacity so
+    /// it never queues ahead of normal chats or invokes tools.
+    pub async fn complete_learning_admitted(
+        &self,
+        messages: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        guard: crate::types::ContextGuard,
+        plugin_epoch: i64,
+    ) -> Result<Option<LlmResponse>> {
+        self.background_request(
+            messages,
+            max_output,
+            cancel,
+            Some(crate::budget::RequestAdmission::Learning {
+                guard,
+                plugin_epoch,
+            }),
+        )
+        .await
+    }
+
+    /// Learning sources may change while their persisted quota is reserved.
+    /// Validate them and the optional QQ session again before sending the body.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_learning_checked_admitted(
+        &self,
+        messages: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        guard: crate::types::ContextGuard,
+        plugin_epoch: i64,
+        account: Option<(&crate::milky::Milky, u64)>,
+        revalidate_sources: impl std::future::Future<Output = Result<()>> + Send,
+    ) -> Result<Option<LlmResponse>> {
+        let Ok(_background) = self.background.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        let Ok(permit) = self.requests.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        self.request(
+            messages,
+            Vec::new(),
+            max_output,
+            cancel,
+            permit,
+            Some(crate::budget::RequestAdmission::Learning {
+                guard,
+                plugin_epoch,
+            }),
+            account,
+            Some(Box::pin(revalidate_sources)),
+        )
+        .await
+        .map(Some)
     }
 
     async fn background_request(
@@ -1114,6 +1202,65 @@ mod tests {
         drop(held);
         let error = request.await.unwrap_err();
         assert_eq!(error.to_string(), "quoted source revoked");
+        assert!(checked.load(Ordering::SeqCst));
+        assert_eq!(client.requests.available_permits(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_text_sources_are_revalidated_after_waiting_for_a_model_slot() {
+        use crate::types::{ContextGuard, Scene, Scope};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = config(format!("http://{}", listener.local_addr().unwrap()));
+        cfg.max_concurrent_requests = 1;
+        let client = Llm::new(cfg, reqwest::Client::new()).unwrap();
+        let held = client.requests.clone().acquire_owned().await.unwrap();
+        let revoked = AtomicBool::new(false);
+        let checked = AtomicBool::new(false);
+        let cancel = CancellationToken::new();
+        let request = client.complete_checked_admitted(
+            vec![
+                json!({"role":"system","content":"previous learning note"}),
+                json!({"role":"user","content":"hello"}),
+            ],
+            vec![],
+            128,
+            &cancel,
+            crate::budget::Admission {
+                scope: Scope {
+                    bot_id: 123,
+                    scene: Scene::Group,
+                    peer_id: 456,
+                },
+                actor: 789,
+                guard: ContextGuard {
+                    conversation_id: "learning-source-test".into(),
+                    epoch: 1,
+                },
+                plugin_epoch: 1,
+            },
+            async {
+                checked.store(true, Ordering::SeqCst);
+                ensure!(!revoked.load(Ordering::SeqCst), "learning source revoked");
+                Ok(())
+            },
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request bypassed held permit: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert!(!checked.load(Ordering::SeqCst));
+        revoked.store(true, Ordering::SeqCst);
+        drop(held);
+        let error = request.await.unwrap_err();
+        assert_eq!(error.to_string(), "learning source revoked");
         assert!(checked.load(Ordering::SeqCst));
         assert_eq!(client.requests.available_permits(), 1);
         assert!(
@@ -2284,5 +2431,157 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn learning_skips_busy_capacity_and_reserves_its_own_quota_before_http() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = crate::store::Store::open(":memory:", 32).await.unwrap();
+        store.activate_plugins(vec!["ai".into()]).await.unwrap();
+        let plugin_epoch = store.epoch("ai").await.unwrap();
+        store.call(|db| {
+            db.execute("INSERT INTO ai_conversations(id,scope,mode) VALUES('learning','1:group:2','group')", [])?;
+            Ok(())
+        }).await.unwrap();
+        let budget = crate::budget::Budget::new(
+            store.clone(),
+            crate::config::Limits {
+                learning_requests_per_hour: 1,
+                learning_requests_per_day: 2,
+                ..Default::default()
+            },
+        );
+        budget.init().await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/",
+            post({
+                let budget = budget.clone();
+                let calls = calls.clone();
+                move |Json(body): Json<Value>| {
+                    let budget = budget.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(body.get("tools").is_none());
+                        assert_eq!(body["max_tokens"], 256);
+                        assert_eq!(budget.snapshot().await.unwrap()["used"]["learning"], 1);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error":{"message":"temporary failure"}})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Llm::new(
+            config(format!("http://{}/", listener.local_addr().unwrap())),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap()
+        .with_budget(budget.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let guard = crate::types::ContextGuard {
+            conversation_id: "learning".into(),
+            epoch: 1,
+        };
+        let input = vec![json!({"role":"user","content":"learning evidence"})];
+        let cancel = CancellationToken::new();
+        let held = client.requests.clone().acquire_many_owned(2).await.unwrap();
+        assert!(
+            client
+                .complete_learning_admitted(
+                    input.clone(),
+                    256,
+                    &cancel,
+                    guard.clone(),
+                    plugin_epoch
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        let held = client.background.clone().acquire_owned().await.unwrap();
+        assert!(
+            client
+                .complete_learning_admitted(
+                    input.clone(),
+                    256,
+                    &cancel,
+                    guard.clone(),
+                    plugin_epoch
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            client
+                .complete_learning_admitted(
+                    input.clone(),
+                    256,
+                    &cancelled,
+                    guard.clone(),
+                    plugin_epoch
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .complete_learning_admitted(
+                    input.clone(),
+                    256,
+                    &cancel,
+                    crate::types::ContextGuard {
+                        epoch: 2,
+                        ..guard.clone()
+                    },
+                    plugin_epoch
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.snapshot().await.unwrap()["used"]["learning_day"], 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // An HTTP failure remains charged, and a second attempt is rejected
+        // before HTTP without consuming either existing model quota.
+        assert!(
+            client
+                .complete_learning_admitted(
+                    input.clone(),
+                    256,
+                    &cancel,
+                    guard.clone(),
+                    plugin_epoch
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let error = client
+            .complete_learning_admitted(input, 256, &cancel, guard, plugin_epoch)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("每小时请求额度"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            budget.snapshot().await.unwrap()["used"],
+            json!({"foreground":0,"background":0,"learning":1,"learning_day":1})
+        );
+        assert_eq!(client.requests.available_permits(), 2);
+        assert_eq!(client.background.available_permits(), 1);
+        server.abort();
+        store.stop().await.unwrap();
     }
 }

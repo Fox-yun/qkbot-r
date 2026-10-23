@@ -69,6 +69,7 @@ pub(crate) struct Authorization {
     external_operations: Vec<String>,
     requires_reply_tool: bool,
     auto_reply: Option<(super::auto_reply::BatchCheck, CancellationToken)>,
+    learning: Option<super::learning::LearningCheck>,
 }
 impl Authorization {
     pub(crate) fn external(operations: Vec<String>) -> Self {
@@ -78,10 +79,15 @@ impl Authorization {
             external_operations: operations,
             requires_reply_tool: false,
             auto_reply: None,
+            learning: None,
         }
     }
     pub(crate) fn with_external(mut self, operations: Vec<String>) -> Self {
         self.external_operations = operations;
+        self
+    }
+    pub(super) fn with_learning(mut self, check: Option<super::learning::LearningCheck>) -> Self {
+        self.learning = check;
         self
     }
     pub(super) fn with_auto_reply(
@@ -102,6 +108,9 @@ impl Authorization {
         guard: &ContextGuard,
     ) -> Result<()> {
         crate::host::check_guard(db, guard)?;
+        if let Some(learning) = &self.learning {
+            learning.validate(db)?;
+        }
         if let Some((batch, cancel)) = &self.auto_reply {
             ensure!(!cancel.is_cancelled(), "自动接话已取消");
             batch.check(db, guard, scope)?;
@@ -427,6 +436,7 @@ impl References {
             external_operations: vec![],
             requires_reply_tool: true,
             auto_reply: None,
+            learning: None,
         };
         authorization.check(db, &self.scope, guard)?;
         Ok(PreparedReply {

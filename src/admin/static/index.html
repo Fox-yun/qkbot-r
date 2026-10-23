@@ -37,6 +37,7 @@
         <button class="nav-item" type="button" data-view="qq"><span aria-hidden="true">◎</span>QQ 登录</button>
         <button class="nav-item" type="button" data-view="contacts"><span aria-hidden="true">◉</span>群与好友</button>
         <button class="nav-item" type="button" data-view="memory"><span aria-hidden="true">▤</span>记忆与上下文</button>
+        <button class="nav-item" type="button" data-view="learning"><span aria-hidden="true">▥</span>学习笔记</button>
         <button class="nav-item" type="button" data-view="stickers"><span aria-hidden="true">▧</span>图库管理</button>
         <button class="nav-item" type="button" data-view="config"><span aria-hidden="true">≡</span>配置管理</button>
       </nav>
@@ -96,6 +97,13 @@
             </div>
           </div>
         </div>
+      </section>
+
+      <section id="view-learning" class="view" aria-labelledby="learning-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">LEARNING NOTES</p><h1 id="learning-title">学习笔记</h1><p class="muted">同一机器人账号的群聊交流经验，与普通个人记忆分开管理。</p></div><button id="refresh-learning" class="button secondary" type="button">刷新笔记</button></div>
+        <article class="card"><div class="card-top"><div><span class="section-label">当前机器人账号</span><h2 id="learning-account">尚未读取</h2></div><button id="new-learning" class="button primary" type="button" disabled>新增笔记</button></div><p id="learning-summary" class="hint">进入此页后读取服务器确认的账号。</p><p class="hint">默认关闭自动学习。在配置中开启并应用后，仅从群聊取材；笔记仅提供给开启记忆读取的群聊。锁定可防止自动学习覆盖。来源被遗忘或撤回的笔记不能通过回滚恢复。</p><p id="learning-message" class="muted" role="status" aria-live="polite"></p><div id="learning-list"></div></article>
+        <article id="learning-editor" class="card learning-editor" hidden><form id="learning-editor-form"><div class="card-top"><h2 id="learning-editor-title">新增笔记</h2><button id="cancel-learning-edit" class="text-button" type="button">取消编辑</button></div><p id="learning-editor-scope" class="hint"></p><div class="field-grid"><div><label for="edit-learning-kind">笔记类型</label><select id="edit-learning-kind"><option value="experience">交流经验</option><option value="correction">纠正记录</option><option value="term">用语解释</option></select></div><div class="check-field"><input id="edit-learning-locked" type="checkbox" checked><label for="edit-learning-locked">锁定，禁止自动学习覆盖</label></div></div><label for="edit-learning-text">笔记内容</label><textarea id="edit-learning-text" rows="6" required></textarea><p id="learning-editor-error" class="inline-error" role="alert"></p><button id="save-learning" class="button primary" type="submit">保存笔记</button></form></article>
+        <details class="card learning-history"><summary>修改历史与回滚</summary><p class="hint">回滚会产生新版本。已失效来源的历史保留审计信息，不能恢复为有效笔记。</p><div id="learning-history"></div></details>
       </section>
 
       <section id="view-stickers" class="view" aria-labelledby="stickers-title" hidden>

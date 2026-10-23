@@ -714,6 +714,7 @@ impl Chat {
                 self.host
                     .send_ai_reply(
                         &run.key.scope,
+                        reply.plugin,
                         run.guard,
                         run.position,
                         PreparedReply {
@@ -825,6 +826,25 @@ impl Chat {
         } else {
             vec![]
         };
+        let learning = if host.config.plugins.ai.learning.enabled
+            && settings.memory_read
+            && job.key.scope.scene == Scene::Group
+        {
+            Some(
+                super::learning::context(
+                    host,
+                    &job.key.scope,
+                    host.config.plugins.ai.learning.injection_budget,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let learning_check = learning
+            .as_ref()
+            .filter(|context| !context.texts.is_empty())
+            .map(|context| context.check.clone());
         let mut system = system_prompt(&host.config, &settings, &job.key.scope, job.actor)?;
         // Custom participation policy belongs only to observation. A long policy
         // must not crowd out the context of an explicitly requested turn.
@@ -840,7 +860,8 @@ impl Chat {
                 job.received_at,
                 cancel.clone(),
             )
-            .await?;
+            .await?
+            .with_learning(learning_check.clone());
         let mut definitions = if host.config.llm.tool_calling {
             host.gateway.definitions(&ctx).await?
         } else {
@@ -1060,6 +1081,11 @@ impl Chat {
                 settings.input_budget,
                 &turn_visual,
             )?;
+            let input = add_learning_context(
+                input,
+                learning.as_ref(),
+                host.config.plugins.ai.learning.injection_budget,
+            )?;
             references.observe(&input.messages, visible_quote);
             references.observe_batch_quotes(&batch_quotes);
             sticker_turn.observe(&input.messages);
@@ -1104,6 +1130,7 @@ impl Chat {
                     admission,
                     (&host.milky, generation),
                     async {
+                        check_learning(host, &learning_check).await?;
                         check_visual_source(host, job, quoted_visual_key).await?;
                         if let Some(batch) = batch {
                             super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch)
@@ -1117,12 +1144,13 @@ impl Chat {
                 )
                 .await
             } else {
-                llm.complete_admitted(
+                llm.complete_checked_admitted(
                     input.messages,
                     tools.clone(),
                     settings.output_budget,
                     cancel,
                     admission,
+                    check_learning(host, &learning_check),
                 )
                 .await
             };
@@ -1140,6 +1168,7 @@ impl Chat {
                 result => result?,
             };
             host.usage("chat", &response).await?;
+            check_learning(host, &learning_check).await?;
             if let Some(batch) = batch {
                 super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
             }
@@ -1172,8 +1201,11 @@ impl Chat {
                 }
                 let text = search_citations.render(&text, host.config.limits.max_message_bytes)?;
                 let mut reply = Reply::text("ai", text);
-                if !search_operations.is_empty() {
-                    reply.authorization = Some(Authorization::external(search_operations));
+                if !search_operations.is_empty() || learning_check.is_some() {
+                    reply.authorization = Some(
+                        Authorization::external(search_operations)
+                            .with_learning(learning_check.clone()),
+                    );
                 }
                 return Ok(Some(reply));
             };
@@ -1309,7 +1341,8 @@ impl Chat {
                     }.await;
                     match prepared {
                         Ok(mut reply) => {
-                            reply.authorization = reply.authorization.with_external(search_operations.clone());
+                            reply.authorization = reply.authorization.with_external(search_operations.clone())
+                                .with_learning(learning_check.clone());
                             if stickers_enabled {
                                 let image_selected = reply.message.segments.iter().any(|segment| matches!(segment, crate::types::OutgoingSegment::Image { .. }));
                                 tracing::info!(stage = "sticker_reply", status = "prepared", searched = sticker_searched, sticker_requested, image_selected, "model final reply prepared");
@@ -1328,7 +1361,14 @@ impl Chat {
                         },
                     }
                 }
-                Ok(Some(ToolOutcome::Pending { preview, .. })) => return Ok(Some(Reply::text("host", preview))),
+                Ok(Some(ToolOutcome::Pending { preview, .. })) => {
+                    let mut reply = Reply::text("host", preview);
+                    if learning_check.is_some() {
+                        reply.authorization = Some(Authorization::external(vec![])
+                            .with_learning(learning_check.clone()));
+                    }
+                    return Ok(Some(reply));
+                },
                 Ok(Some(ToolOutcome::Completed { operation_id, result, .. })) if call["function"]["name"] == "web_search" => {
                     search_citations.add(&result);
                     // Replaying the same admitted operation reuses its result and
@@ -1776,6 +1816,42 @@ impl Chat {
         }
         Ok(MaintenanceOutcome::Progress)
     }
+}
+
+async fn check_learning(host: &Host, check: &Option<super::learning::LearningCheck>) -> Result<()> {
+    if let Some(check) = check {
+        let check = check.clone();
+        host.store
+            .call(move |db| check.validate(db))
+            .await
+            .map_err(|_| RevokedTrigger)?;
+    }
+    Ok(())
+}
+
+/// Notes have a separate administrator-controlled input allowance. Assemble the
+/// ordinary turn first so notes cannot evict its current question or history.
+fn add_learning_context(
+    mut context: super::memory::BudgetedContext,
+    learning: Option<&super::learning::LearningContext>,
+    budget: usize,
+) -> Result<super::memory::BudgetedContext> {
+    let Some(learning) = learning.filter(|learning| !learning.texts.is_empty()) else {
+        return Ok(context);
+    };
+    let messages: Vec<_> = learning
+        .texts
+        .iter()
+        .map(|text| json!({"role":"user","content":text}))
+        .collect();
+    let added = messages.iter().try_fold(0usize, |cost, message| {
+        Ok::<_, anyhow::Error>(cost.saturating_add(serde_json::to_vec(message)?.len() + 1))
+    })?;
+    ensure!(added <= budget, "学习笔记超过独立输入预算");
+    // Keep the system first and the original current/tool protocol contiguous.
+    context.messages.splice(1..1, messages);
+    context.estimated_tokens = context.estimated_tokens.saturating_add(added);
+    Ok(context)
 }
 
 pub(crate) fn memory_system_prompt(summary_budget: usize, timezone: &str) -> String {

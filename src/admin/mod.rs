@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod contacts;
 pub mod embedding;
+pub mod learning;
 pub mod memory;
 pub mod models;
 pub mod plugins;
@@ -102,6 +103,9 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(scope_plugins).post(toggle_scope_plugin),
         )
         .route("/api/budget", get(budget))
+        .route("/api/learning", get(learning::snapshot))
+        .route("/api/learning/mutate", post(learning::mutate))
+        .route("/api/learning/operations/{id}", get(learning::operation))
         .route("/api/stickers/groups", get(stickers::groups))
         .route("/api/stickers/items", get(stickers::items))
         .route("/api/stickers/items/{id}/image", get(stickers::image))
@@ -200,7 +204,10 @@ async fn protect(
                 );
                 // Passive polling must not keep an abandoned session alive indefinitely.
                 let touch = mutation
-                    || matches!(path.as_str(), "/api/config" | "/api/qq/contacts")
+                    || matches!(
+                        path.as_str(),
+                        "/api/config" | "/api/qq/contacts" | "/api/learning"
+                    )
                     || (path.starts_with("/api/memory/")
                         && !path.starts_with("/api/memory/operations/"));
                 let session = match state.auth.authenticate(request.headers(), touch).await {

@@ -290,6 +290,7 @@ impl MemoryStore {
         self.store.migrate("ai_memory", 2, CURSOR_MIGRATION).await?;
         self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await?;
         self.store.migrate("ai_memory", 4, scope::MIGRATION).await?;
+        super::learning::init(&self.store).await?;
         let enabled = self.global_memory_shared;
         self.store
             .call(move |db| {
@@ -414,12 +415,19 @@ impl MemoryStore {
                         && memory.subject_id == subject_id,
                     "memory is outside this user's memory domain"
                 );
-                revoke_memory(&tx, &memory)?;
                 invalidate_context(&tx, &guard)?;
+                revoke_memory(&tx, &memory)?;
+                // Revoking a source shared with global learning notes can also
+                // invalidate every same-account context in this transaction.
+                let epoch = tx.query_row(
+                    "SELECT epoch FROM ai_conversations WHERE id=?1",
+                    [&guard.conversation_id],
+                    |row| row.get(0),
+                )?;
                 tx.commit()?;
                 Ok(ContextGuard {
                     conversation_id: guard.conversation_id,
-                    epoch: guard.epoch + 1,
+                    epoch,
                 })
             })
             .await
@@ -864,8 +872,13 @@ pub(crate) fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()
         return Ok(());
     }
     let (ids, extra_keys) = revocation_inputs(memories)?;
+    let learning_sources = db
+        .prepare(&format!("{REVOCATION_KEYS} SELECT source_key FROM keys"))?
+        .query_map(params![ids, extra_keys], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     db.execute(&format!("{REVOCATION_KEYS} INSERT OR IGNORE INTO ai_revoked_sources(source_key,revoked_at) SELECT source_key,?3 FROM keys"),params![ids,extra_keys,now()])?;
     db.execute(&format!("{REVOCATION_KEYS} UPDATE messages SET revoked=1,learnable=0 WHERE key IN (SELECT source_key FROM keys)"),params![ids,extra_keys])?;
+    super::learning::invalidate_sources(db, &learning_sources)?;
     for (table, column) in [
         ("ai_memory_search", "memory_id"),
         ("ai_memories", "id"),

@@ -279,6 +279,17 @@ pub struct ToolContext {
     pub received_at: i64,
     pub cancel: CancellationToken,
     pub access_revision: i64,
+    pub(crate) learning_check: Option<crate::plugins::ai::learning::LearningCheck>,
+}
+
+impl ToolContext {
+    pub(crate) fn with_learning(
+        mut self,
+        check: Option<crate::plugins::ai::learning::LearningCheck>,
+    ) -> Self {
+        self.learning_check = check;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +326,8 @@ struct BoundContext {
     provider_epoch: i64,
     #[serde(default)]
     access_revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learning_check: Option<crate::plugins::ai::learning::LearningCheck>,
 }
 
 const MIGRATION: &str = "
@@ -418,6 +431,9 @@ fn plugin_epoch(tx: &rusqlite::Connection, id: &str) -> Result<i64> {
 
 fn authorize(tx: &rusqlite::Connection, ctx: &BoundContext, plugin: &str) -> Result<()> {
     crate::access::check_revision(tx, &ctx.scope.key(), ctx.access_revision)?;
+    if let Some(check) = &ctx.learning_check {
+        check.validate(tx)?;
+    }
     ensure!(
         plugin_epoch(tx, plugin)? == ctx.provider_epoch,
         "plugin changed; operation cancelled"
@@ -555,6 +571,7 @@ impl Gateway {
             received_at,
             cancel,
             access_revision,
+            learning_check: None,
         })
     }
 
@@ -586,6 +603,7 @@ impl Gateway {
                 ai_epoch: Some(ctx.ai_epoch),
                 provider_epoch: *epoch,
                 access_revision: ctx.access_revision,
+                learning_check: ctx.learning_check.clone(),
             };
             if check_runtime(self.epochs()?, &bound, spec.plugin).is_err() {
                 continue;
@@ -638,6 +656,7 @@ impl Gateway {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: *epoch,
             access_revision: ctx.access_revision,
+            learning_check: ctx.learning_check.clone(),
         };
         let normalized = tool.prepare(
             args,
@@ -747,6 +766,7 @@ impl Gateway {
             ai_epoch: None,
             provider_epoch: epoch,
             access_revision,
+            learning_check: None,
         };
         if spec.effect == Effect::NetworkRead {
             let turn = external_source
@@ -806,10 +826,14 @@ impl Gateway {
             ensure!(tool.permits(&bound.scope,bound.actor_id),"tool is not permitted in this context");
             let tx = conn.transaction()?;
             authorize(&tx, &bound, spec.plugin)?;
-            if let Some((status, token, expires, result, receipt)) = tx.query_row(
-                "SELECT status,token,expires_at,result_json,receipt FROM tool_runs WHERE operation_id=?1", [&operation],
-                |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?))
+            if let Some((status, token, expires, result, receipt, saved_context)) = tx.query_row(
+                "SELECT status,token,expires_at,result_json,receipt,context_json FROM tool_runs WHERE operation_id=?1", [&operation],
+                |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?))
             ).optional()? {
+                // Idempotent reuse must retain the dependencies of the original
+                // decision, even if a caller now presents a different context.
+                let saved: BoundContext = serde_json::from_str(&saved_context)?;
+                authorize(&tx, &saved, spec.plugin)?;
                 return match status.as_str() {
                     "succeeded" => Ok(ToolOutcome::Completed { operation_id: operation, result: serde_json::from_str(&result.context("missing result")?)?, receipt: receipt.unwrap_or_default() }),
                     "pending_confirmation" if expires.unwrap_or(0) > now() => {
@@ -960,6 +984,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learning_dependencies_survive_confirmation_storage_and_reject_changed_notes() {
+        for change in ["version", "deleted", "disabled"] {
+            let (store, gateway, plain) = setup().await;
+            crate::plugins::ai::learning::init(&store).await.unwrap();
+            crate::plugins::ai::learning::configure(&store, 1, true)
+                .await
+                .unwrap();
+            store.call(|db| {
+                db.execute("INSERT INTO ai_learning_notes(id,bot_id,kind,text,scope,updated_at) VALUES(1,1,'experience','not copied into tool context','1:group:2',?1)", [now()])?;
+                Ok(())
+            }).await.unwrap();
+            let check = serde_json::from_value(json!({
+                "bot_id":1,"revision":0,"defaults":crate::config::AiSettings::default(),
+                "notes":[[1,1]]
+            }))
+            .unwrap();
+            let ctx = plain.clone().with_learning(Some(check));
+            let args = json!({"after_seconds":3600,"text":"source-bound reminder"});
+            let (_, token) = pending(
+                gateway
+                    .execute(&ctx, "reminder_create", args.clone())
+                    .await
+                    .unwrap(),
+            );
+            let key = token.clone();
+            let stored = store
+                .call(move |db| {
+                    Ok(db.query_row(
+                        "SELECT context_json FROM tool_runs WHERE token=?1",
+                        [key],
+                        |row| row.get::<_, String>(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            let saved: BoundContext = serde_json::from_str(&stored).unwrap();
+            assert!(saved.learning_check.is_some());
+            assert!(!stored.contains("not copied into tool context"));
+            store.call(move |db| {
+                match change {
+                    "version" => db.execute("UPDATE ai_learning_notes SET version=version+1 WHERE id=1", [])?,
+                    "deleted" => db.execute("UPDATE ai_learning_notes SET deleted=1 WHERE id=1", [])?,
+                    _ => db.execute("UPDATE ai_learning_state SET enabled=0,revision=revision+1 WHERE bot_id=1", [])?,
+                };
+                Ok(())
+            }).await.unwrap();
+            // Confirmation reloads serialized dependencies; a local operation
+            // and an idempotent replay may not silently discard those checks.
+            assert!(
+                gateway
+                    .confirm(&ctx.scope, ctx.actor_id, &token)
+                    .await
+                    .is_err()
+            );
+            assert!(gateway.execute(&ctx, "clock_now", json!({})).await.is_err());
+            assert!(
+                gateway
+                    .execute(&plain, "reminder_create", args)
+                    .await
+                    .is_err()
+            );
+            assert!(gateway.definitions(&ctx).await.unwrap().is_empty());
+            let effects = store
+                .call(|db| {
+                    Ok(
+                        db.query_row("SELECT count(*) FROM reminder_jobs", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(effects, 0);
+            // Unrelated native commands and older JSON remain usable.
+            gateway
+                .direct(
+                    plain.scope.clone(),
+                    plain.actor_id,
+                    "clock_now",
+                    json!({}),
+                    now(),
+                )
+                .await
+                .unwrap();
+            let legacy: BoundContext = serde_json::from_value(json!({
+                "scope":plain.scope,"actor_id":plain.actor_id,"guard":plain.guard,
+                "ai_epoch":plain.ai_epoch,"provider_epoch":plain.provider_epochs["clock"],
+                "access_revision":plain.access_revision
+            }))
+            .unwrap();
+            assert!(legacy.learning_check.is_none());
+            store.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn final_reply_is_advertised_but_never_runs_as_a_transaction() {
         let (store, gateway, ctx) = setup().await;
         let definitions = gateway.definitions(&ctx).await.unwrap();
@@ -1004,6 +1124,7 @@ mod tests {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: ctx.provider_epochs["ai"],
             access_revision: ctx.access_revision,
+            learning_check: None,
         };
         let error = gateway
             .run(
@@ -1099,6 +1220,7 @@ mod tests {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: ctx.provider_epochs["ai"],
             access_revision: ctx.access_revision,
+            learning_check: None,
         };
         assert!(
             gateway

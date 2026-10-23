@@ -267,7 +267,7 @@ pub(super) async fn check_host(
 }
 
 /// Persist the exact recalled source, including recalls received before the
-/// original message. Other messages, memories and summaries remain stored.
+/// original message. Dependent learning notes and their derived context are invalidated.
 pub(crate) async fn revoke_source(host: &Host, key: &MessageKey) -> Result<()> {
     ensure!(key.message_seq >= 0, "invalid recalled message sequence");
     let key = key.key();
@@ -282,6 +282,7 @@ pub(crate) async fn revoke_source(host: &Host, key: &MessageKey) -> Result<()> {
                 "UPDATE messages SET revoked=1,learnable=0 WHERE key=?1",
                 [&key],
             )?;
+            super::learning::invalidate_sources(&tx, std::slice::from_ref(&key))?;
             tx.commit()?;
             Ok(())
         })
