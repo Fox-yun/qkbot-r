@@ -67,7 +67,7 @@
         <div class="page-heading"><div><p class="eyebrow">GROUPS & FRIENDS</p><h1 id="contacts-title">群与好友</h1><p class="muted">为每个群和好友单独控制 Bot，修改自动保存并即时生效。</p></div><button id="refresh-contacts" class="button secondary" type="button">刷新列表</button></div>
         <article class="card contacts-card">
           <div class="card-top"><div><span class="section-label">当前 QQ 账号</span><h2 id="contacts-account">尚未读取</h2></div><span id="contacts-updated" class="hint">进入此页后加载</span></div>
-          <p class="hint contacts-help">黑名单机制：所有群和好友默认开启，包括新加入的群和新好友；仅关闭的对象会被拦截。群聊仍由 @ 或关键词触发；关闭后保留既有记忆。QQ 已登录即可管理开关。</p>
+          <p class="hint contacts-help">Bot 默认开启；自动接话默认关闭，需要为每个群或好友单独开启。开启自动接话后，AI 可根据普通消息选择回应或保持安静。关闭自动接话时，群聊仍可通过 @、关键词或引用回复触发，私聊仍可直接对话。Bot 关闭后停止该会话处理，保留既有历史与记忆。</p>
           <div class="contacts-toolbar"><div class="contact-tabs" role="group" aria-label="联系人类型"><button id="contacts-groups" class="contact-tab active" type="button" aria-pressed="true">群聊</button><button id="contacts-friends" class="contact-tab" type="button" aria-pressed="false">好友</button></div><input id="contacts-search" type="search" aria-label="搜索群或好友" placeholder="搜索名称、备注或 ID" autocomplete="off"></div>
           <p id="contacts-message" class="contacts-message muted" role="status" aria-live="polite">正在准备联系人列表。</p>
           <div id="contacts-list" class="contacts-list" aria-label="群与好友开关"></div>

@@ -82,6 +82,13 @@ impl Store {
         store
             .migrate("scope_access", 1, crate::access::MIGRATION)
             .await?;
+        store
+            .migrate(
+                "ai_auto_reply_scopes",
+                1,
+                crate::access::AUTO_REPLY_MIGRATION,
+            )
+            .await?;
         store.call(|c| {
             c.execute("UPDATE outbox SET state='unknown',detail='process stopped after submission' WHERE state='submitted'", [])?;
             c.execute("UPDATE outbox SET state='failed',detail='process stopped before submission' WHERE state='prepared'", [])?;

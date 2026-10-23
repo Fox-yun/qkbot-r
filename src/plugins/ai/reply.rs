@@ -5,6 +5,7 @@ use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 enum Source {
@@ -67,6 +68,7 @@ pub(crate) struct Authorization {
     sticker: Option<(i64, i64, String)>,
     external_operations: Vec<String>,
     requires_reply_tool: bool,
+    auto_reply: Option<(super::auto_reply::BatchCheck, CancellationToken)>,
 }
 impl Authorization {
     pub(crate) fn external(operations: Vec<String>) -> Self {
@@ -75,10 +77,19 @@ impl Authorization {
             sticker: None,
             external_operations: operations,
             requires_reply_tool: false,
+            auto_reply: None,
         }
     }
     pub(crate) fn with_external(mut self, operations: Vec<String>) -> Self {
         self.external_operations = operations;
+        self
+    }
+    pub(super) fn with_auto_reply(
+        mut self,
+        batch: &super::auto_reply::AutoBatch,
+        cancel: CancellationToken,
+    ) -> Self {
+        self.auto_reply = Some((batch.authorization(), cancel));
         self
     }
     pub(crate) fn requires_reply_tool(&self) -> bool {
@@ -91,6 +102,10 @@ impl Authorization {
         guard: &ContextGuard,
     ) -> Result<()> {
         crate::host::check_guard(db, guard)?;
+        if let Some((batch, cancel)) = &self.auto_reply {
+            ensure!(!cancel.is_cancelled(), "自动接话已取消");
+            batch.check(db, guard, scope)?;
+        }
         for operation in &self.external_operations {
             crate::tools::check_external_result(db, operation)?;
         }
@@ -197,6 +212,7 @@ pub(super) struct References {
     user_ids: BTreeMap<i64, String>,
     visible: BTreeSet<String>,
     current: Option<String>,
+    current_sources: BTreeSet<String>,
 }
 
 impl References {
@@ -208,6 +224,7 @@ impl References {
             user_ids: BTreeMap::new(),
             visible: BTreeSet::new(),
             current: None,
+            current_sources: BTreeSet::new(),
         }
     }
 
@@ -301,6 +318,7 @@ impl References {
             mentions,
         );
         if current {
+            self.current_sources.insert(reference.clone());
             self.current = Some(reference);
         }
         Ok(content)
@@ -335,11 +353,23 @@ impl References {
             }
         }
         // build_context never truncates current input or its appended explicit quote.
-        if let Some(current) = &self.current {
-            self.visible.insert(current.clone());
-        }
+        self.visible.extend(self.current_sources.iter().cloned());
         if let Some(quote) = quote {
             self.visible.insert(quote.to_owned());
+        }
+    }
+
+    /// These references came from load_media's quote envelopes appended to
+    /// mandatory current input, not from scanning user-controlled text.
+    pub(super) fn observe_batch_quotes(&mut self, quotes: &[String]) {
+        for reference in quotes {
+            if self
+                .messages
+                .get(reference)
+                .is_some_and(|message| matches!(message.source, Source::Quote { .. }))
+            {
+                self.visible.insert(reference.clone());
+            }
         }
     }
 
@@ -396,6 +426,7 @@ impl References {
             sticker: None,
             external_operations: vec![],
             requires_reply_tool: true,
+            auto_reply: None,
         };
         authorization.check(db, &self.scope, guard)?;
         Ok(PreparedReply {

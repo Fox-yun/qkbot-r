@@ -25,13 +25,12 @@ pub(super) enum Reason {
     Mention,
     Keyword,
     ReplyToBot,
+    Automatic,
 }
 
 pub(super) fn direct_reason(msg: &Incoming, keywords: &[String]) -> Option<Reason> {
     if msg.is_self() || msg.notification.is_some() {
         None
-    } else if msg.key.scope.scene == Scene::Friend {
-        Some(Reason::Private)
     } else if msg.mentions.contains(&msg.key.scope.bot_id) {
         Some(Reason::Mention)
     } else if keywords
@@ -39,6 +38,8 @@ pub(super) fn direct_reason(msg: &Incoming, keywords: &[String]) -> Option<Reaso
         .any(|k| !k.is_empty() && msg.text.contains(k))
     {
         Some(Reason::Keyword)
+    } else if msg.key.scope.scene == Scene::Friend {
+        Some(Reason::Private)
     } else {
         None
     }
@@ -48,6 +49,7 @@ pub(super) fn direct_reason(msg: &Incoming, keywords: &[String]) -> Option<Reaso
 pub(super) struct Decision {
     pub reason: Option<Reason>,
     pub quote: Option<Quote>,
+    pub auto_batch: Option<super::auto_reply::AutoBatch>,
 }
 
 /// Only a bounded, normalized snapshot crosses into the model queue. Raw Milky
@@ -258,8 +260,21 @@ impl Ingress {
         conversation: Conversation,
         access_revision: i64,
     ) -> Result<()> {
+        let explicit = match direct_reason(&message, &chat.host.config.plugins.ai.keywords) {
+            Some(Reason::Private) => {
+                !chat
+                    .host
+                    .access
+                    .auto_reply_enabled(&message.key.scope)
+                    .await?
+            }
+            Some(_) => true,
+            None => false,
+        };
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
-            self.feedback(&chat.host, &message, position);
+            if explicit {
+                self.feedback(&chat.host, &message, position);
+            }
             return Ok(());
         };
         // Keep only bounded image resource identifiers while waiting. Raw
@@ -279,7 +294,9 @@ impl Ingress {
             let mut lanes = self.lanes.lock().unwrap();
             if let Some(lane) = lanes.get_mut(&id) {
                 if lane.queue.len() >= self.per_conversation {
-                    self.feedback(&chat.host, &job.message, position);
+                    if explicit {
+                        self.feedback(&chat.host, &job.message, position);
+                    }
                     return Ok(());
                 }
                 lane.queue.push_back(job);
@@ -330,6 +347,7 @@ impl Ingress {
                                 reason: (quote.sender == Some(job.message.key.scope.bot_id))
                                     .then_some(Reason::ReplyToBot),
                                 quote: Some(quote),
+                                auto_batch: None,
                             }
                         }
                     };
@@ -361,7 +379,15 @@ impl Ingress {
     }
 
     async fn local_decision(&self, host: &Host, job: &Pending) -> Result<Option<Decision>> {
-        let reason = direct_reason(&job.message, &host.config.plugins.ai.keywords);
+        let mut reason = direct_reason(&job.message, &host.config.plugins.ai.keywords);
+        if reason == Some(Reason::Private)
+            && host
+                .access
+                .auto_reply_enabled(&job.message.key.scope)
+                .await?
+        {
+            reason = None;
+        }
         let settings = &job.conversation.settings;
         if reason.is_some()
             || !settings.reply_to_bot
@@ -372,17 +398,20 @@ impl Ingress {
             return Ok(Some(Decision {
                 reason,
                 quote: None,
+                auto_batch: None,
             }));
         }
         let Some(key) = quote_key(&job.message) else {
             return Ok(Some(Decision {
                 reason: None,
                 quote: None,
+                auto_batch: None,
             }));
         };
         Ok(local_quote(host, &key).await?.map(|quote| Decision {
             reason: (quote.sender == Some(key.scope.bot_id)).then_some(Reason::ReplyToBot),
             quote: Some(quote),
+            auto_batch: None,
         }))
     }
 
@@ -519,6 +548,13 @@ impl Ingress {
                 {
                     reason = None;
                 }
+                if reason.is_none()
+                    && !message.is_self()
+                    && message.notification.is_none()
+                    && crate::access::require_auto_reply(&tx, &message.key.scope.key()).is_ok()
+                {
+                    reason = Some(Reason::Automatic);
+                }
                 let trigger = reason.is_some();
                 let keep = trigger || read_background;
                 let learn = settings.memory_write
@@ -550,13 +586,26 @@ impl Ingress {
             return Ok(());
         };
         decision.reason = reason;
-        if reason.is_none() || (settings.paused && !settings.once) || job.cancel.is_cancelled() {
+        if reason.is_none()
+            || (settings.paused && (!settings.once || reason == Some(Reason::Automatic)))
+            || job.cancel.is_cancelled()
+        {
             return Ok(());
         }
         let mut conversation = job.conversation.clone();
         conversation.settings = settings;
+        let automatic = reason == Some(Reason::Automatic);
+        if automatic {
+            decision.auto_batch = Some(super::auto_reply::AutoBatch::new(
+                super::auto_reply::AutoSource::from_message(
+                    &job.message,
+                    job.position,
+                    decision.quote.clone(),
+                ),
+            ));
+        }
         match chat.enqueue_resolved(&job.message, job.position, &conversation, Some(decision)) {
-            Ok(()) if conversation.settings.once => {
+            Ok(()) if conversation.settings.once && !automatic => {
                 let guard = conversation.guard;
                 host.store.call(move |db| {
                     db.execute("UPDATE ai_conversations SET settings=json_set(settings,'$.once',json('false')) WHERE id=?1 AND epoch=?2", params![guard.conversation_id, guard.epoch])?;
@@ -566,7 +615,9 @@ impl Ingress {
             Ok(()) => {}
             Err(error) => {
                 tracing::warn!(%error, "chat rejected at queue boundary");
-                self.feedback(host, &job.message, job.position);
+                if !automatic {
+                    self.feedback(host, &job.message, job.position);
+                }
             }
         }
         Ok(())

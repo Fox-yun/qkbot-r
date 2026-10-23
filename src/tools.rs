@@ -558,6 +558,13 @@ impl Gateway {
         })
     }
 
+    /// Observation has no explicit actor request authorizing a state change.
+    pub(crate) fn permits_observation(&self, name: &str) -> bool {
+        self.registry
+            .get(name)
+            .is_ok_and(|tool| tool.spec().effect != Effect::LocalWrite)
+    }
+
     pub async fn definitions(&self, ctx: &ToolContext) -> Result<Vec<Value>> {
         if ctx.cancel.is_cancelled() {
             return Ok(vec![]);

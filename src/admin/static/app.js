@@ -1072,7 +1072,7 @@
     $("contacts-search").disabled = !state.authenticated || c.loading;
     $("contacts-prev").disabled = blocked || c.loading || c.page <= 1;
     $("contacts-next").disabled = blocked || c.loading || c.page >= c.totalPages;
-    document.querySelectorAll("[data-contact-toggle]").forEach((input) => { input.disabled = blocked || (c.phase !== "ready" && !(c.phase === "cached" && input.checked)) || c.loading || Boolean(c.saving); });
+    document.querySelectorAll("[data-contact-toggle], [data-contact-auto-reply]").forEach((input) => { input.disabled = blocked || (c.phase !== "ready" && !(c.phase === "cached" && input.checked)) || c.loading || Boolean(c.saving); });
     document.querySelectorAll("[data-contact-plugins]").forEach((input) => { input.disabled = blocked || c.phase !== "ready" || c.loading || Boolean(c.saving); });
     updateScopePluginControls();
   }
@@ -1103,11 +1103,16 @@
       input.setAttribute("aria-label", title + "（" + row.id + "）Bot 开关");
       const scene = c.scene, version = c.version;
       input.addEventListener("change", () => { if (version === state.contacts.version) void toggleContact(scene, row.id, input.checked); });
-      label.append(input, element("span", "contact-switch-track"), element("span", "contact-switch-label", c.saving === scene + ":" + row.id ? "保存中…" : row.enabled ? "已开启" : "已关闭"));
+      label.append(input, element("span", "contact-switch-track"), element("span", "contact-switch-label", c.saving === scene + ":" + row.id ? "保存中…" : row.enabled ? "Bot 已开启" : "Bot 已关闭"));
+      const autoLabel = element("label", "contact-switch contact-auto-reply"), autoInput = document.createElement("input");
+      autoInput.type = "checkbox"; autoInput.checked = row.auto_reply_enabled; autoInput.setAttribute("role", "switch"); autoInput.dataset.contactAutoReply = row.id;
+      autoInput.setAttribute("aria-label", title + "（" + row.id + "）自动接话开关");
+      autoInput.addEventListener("change", () => { if (version === state.contacts.version) void toggleContact(scene, row.id, autoInput.checked, true); });
+      autoLabel.append(autoInput, element("span", "contact-switch-track"), element("span", "contact-switch-label", c.saving === "auto:" + scene + ":" + row.id ? "保存中…" : row.auto_reply_enabled ? "自动接话 开" : "自动接话 关"));
       const plugins = element("button", "text-button accent contact-plugins", "插件"); plugins.type = "button"; plugins.dataset.contactPlugins = row.id;
       plugins.setAttribute("aria-label", title + "（" + row.id + "）插件开关");
       plugins.addEventListener("click", () => { if (version === state.contacts.version) void openScopePlugins(scene, row.id, title); });
-      const actions = element("div", "contact-actions"); actions.append(plugins, label);
+      const actions = element("div", "contact-actions"); actions.append(plugins, autoLabel, label);
       item.append(identity, actions); list.append(item);
     }
     $("contacts-page").textContent = `第 ${c.page} / ${c.totalPages} 页 · 共 ${rows.length} 个`;
@@ -1119,7 +1124,7 @@
       if (!Array.isArray(result[key])) throw new Error("联系人列表格式不正确。");
       const seen = new Set();
       for (const row of result[key]) {
-        if (!row || !contactId(row.id) || typeof row.name !== "string" || typeof row.remark !== "string" || typeof row.enabled !== "boolean" || seen.has(row.id)) throw new Error("联系人数据不完整或存在重复 ID，请刷新重试。");
+        if (!row || !contactId(row.id) || typeof row.name !== "string" || typeof row.remark !== "string" || typeof row.enabled !== "boolean" || typeof row.auto_reply_enabled !== "boolean" || seen.has(row.id)) throw new Error("联系人数据不完整或存在重复 ID，请刷新重试。");
         seen.add(row.id);
       }
     }
@@ -1220,27 +1225,28 @@
       c.message = (c.phase === "offline" ? "暂时无法读取 QQ 联系人。请确认 QQ 已登录且 Milky 可连接，再手动刷新。 " : "联系人列表未能加载。 ") + error.message;
       if (previous && previous.generation === c.generation && ([502, 503].includes(error.status) || error.status === 0)) {
         Object.assign(c, previous); c.phase = "cached";
-        c.message = "连接暂不可用，显示该账号的上次列表；仍可关闭 Bot，恢复连接并刷新后才能开启。";
+        c.message = "连接暂不可用，显示该账号的上次列表；仍可关闭 Bot 或自动接话，恢复连接并刷新后才能开启。";
       }
     } finally {
       if (contactsCurrent(version, session)) { c.loading = false; renderContacts(); }
     }
   }
-  async function toggleContact(scene, peerId, enabled) {
+  async function toggleContact(scene, peerId, enabled, autoReply = false) {
     const c = state.contacts;
     if (state.view !== "contacts" || !state.authenticated || state.busy || (c.phase !== "ready" && !(c.phase === "cached" && enabled === false)) || c.loading || c.saving || typeof enabled !== "boolean") { renderContacts(); return; }
     const row = (scene === "group" ? c.groups : scene === "friend" ? c.friends : []).find((item) => item.id === peerId);
-    if (!row || row.enabled === enabled) return;
-    const version = c.version, session = state.session, botId = c.botId, previous = row.enabled;
-    c.saving = scene + ":" + peerId; c.message = ""; row.enabled = enabled; renderContacts();
+    const field = autoReply ? "auto_reply_enabled" : "enabled";
+    if (!row || row[field] === enabled) return;
+    const version = c.version, session = state.session, botId = c.botId, previous = row[field];
+    c.saving = (autoReply ? "auto:" : "") + scene + ":" + peerId; c.message = ""; row[field] = enabled; renderContacts();
     try {
-      const result = await api("/api/qq/contacts/toggle", "POST", { bot_id: botId, scene, peer_id: peerId, enabled });
+      const result = await api(autoReply ? "/api/qq/contacts/auto-reply" : "/api/qq/contacts/toggle", "POST", { bot_id: botId, scene, peer_id: peerId, enabled });
       if (!contactsCurrent(version, session)) return;
       if (result.bot_id !== botId || result.scene !== scene || result.peer_id !== peerId || result.enabled !== enabled) throw new Error("开关响应与当前账号或会话不一致。");
-      c.message = `${row.remark || row.name || row.id} 的 Bot 已${enabled ? "开启" : "关闭"}，即时生效。` + (c.phase === "cached" ? " 当前显示上次列表；恢复连接并刷新后才能开启。" : "");
+      c.message = `${row.remark || row.name || row.id} 的${autoReply ? "自动接话" : " Bot"}已${enabled ? "开启" : "关闭"}，即时生效。` + (autoReply ? (enabled ? " AI 可根据对话选择接话或保持安静；Bot 和 AI 插件也需开启。" : scene === "friend" ? " 私聊仍可正常直接对话。" : " 群聊仍可通过 @、关键词或已开启的引用回复触发。") : "") + (c.phase === "cached" ? " 当前显示上次列表；恢复连接并刷新后才能开启。" : "");
     } catch (error) {
       if (!contactsCurrent(version, session)) return;
-      row.enabled = previous;
+      row[field] = previous;
       if (error.status === 409) { invalidateContacts("QQ 账号或联系人已变化，旧列表已停用，请刷新后再操作。", "error"); return; }
       c.phase = "uncertain"; c.message = "开关未确认，已还原页面显示。请刷新列表核对实际状态。 " + error.message;
       if (error.code === "csrf_invalid") report(error);

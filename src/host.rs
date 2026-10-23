@@ -488,6 +488,10 @@ impl Router {
                     scope: msg.key.scope.clone(),
                     message_seq: sequence,
                 };
+                let gate = host.store.scope_gate(&key.scope.key())?;
+                let _exclusive = gate.write_owned().await;
+                ai::auto_reply::revoke_source(host, &key).await?;
+                self.chat.recall_source(&key);
                 host.stickers.revoke(&key.key()).await?;
             }
             return Ok(());
@@ -545,6 +549,8 @@ impl Router {
         let pos=host.store.call(move|c|{
             let tx=c.transaction()?;
             if crate::access::check_revision(&tx,&incoming.key.scope.key(),access_revision).is_err() { return Ok(None); }
+            let recalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=?1)",[incoming.key.key()],|row|row.get(0))?;
+            if recalled { return Ok(None); }
             let (id,epoch)=context.as_ref().map(|v|(v.guard.conversation_id.clone(),v.guard.epoch)).unwrap_or((String::new(),0));
             // Reserve identity and reception order before any quote lookup. AI
             // preprocessing fills content/retention from one final decision.

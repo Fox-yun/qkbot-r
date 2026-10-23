@@ -222,6 +222,764 @@ fn message(seq: i64, text: &str) -> Incoming {
     }
 }
 
+fn ordinary_message(seq: i64, text: &str) -> Incoming {
+    let mut incoming = message(seq, text);
+    incoming.mentions.clear();
+    incoming
+}
+
+async fn set_auto_reply(host: &Host, router: &Router, scope: &Scope, enabled: bool) {
+    host.access
+        .set_auto_reply_enabled(scope.clone(), enabled)
+        .await
+        .unwrap();
+    router.chat.cancel_scope(scope);
+}
+
+fn recall_message(seq: i64) -> Incoming {
+    let mut incoming = ordinary_message(-seq, "");
+    incoming.quote_seq = Some(seq);
+    incoming.notification = Some(qkbot::types::NudgeEvent {
+        event_type: "message_recall".into(),
+        initiator: incoming.sender_id,
+        target: incoming.sender_id,
+        raw_event: Value::Null,
+    });
+    incoming
+}
+
+#[tokio::test]
+async fn auto_reply_defaults_off_and_opt_in_is_isolated_from_other_groups_and_private_chats() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    let scope = message(0, "").key.scope;
+    router
+        .dispatch(ordinary_message(1, "default-off-background"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1800), mock.models.recv())
+            .await
+            .is_err(),
+        "ordinary group messages must not call the model before opt-in"
+    );
+    set_auto_reply(&host, &router, &scope, true).await;
+    let mut other_group = ordinary_message(2, "other-group-still-disabled");
+    other_group.key.scope.peer_id = 457;
+    router.dispatch(other_group).await.unwrap();
+
+    // The same numeric peer in another scene has its own switch. A private
+    // chat without opt-in keeps its existing immediate, direct-reply behavior.
+    let mut private = ordinary_message(2, "private-legacy-direct-reply");
+    private.key.scope.scene = Scene::Friend;
+    router.dispatch(private).await.unwrap();
+    let private_request = tokio::time::timeout(Duration::from_secs(1), mock.model())
+        .await
+        .expect("unconfigured private chats must not acquire the automatic delay");
+    assert_eq!(
+        current_message_payload(&private_request.body)["text"],
+        "private-legacy-direct-reply"
+    );
+    private_request
+        .reply
+        .send(answer("private-answer"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "private-answer");
+
+    router
+        .dispatch(ordinary_message(3, "enabled-group-background"))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    let context = request.body["messages"].to_string();
+    assert!(context.contains("enabled-group-background"));
+    assert!(!context.contains("other-group-still-disabled"));
+    assert!(!context.contains("private-legacy-direct-reply"));
+    request.reply.send(answer("enabled-group-answer")).unwrap();
+    assert_eq!(mock.sent().await, "enabled-group-answer");
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_batches_messages_and_reuses_model_persona_history_and_memory() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.model = "shared-chat-model".into();
+        config.plugins.ai.defaults.persona = "test-persona".into();
+        config.plugins.ai.personas.insert(
+            "test-persona".into(),
+            "自动接话也应保留这段专用人设 marker-persona".into(),
+        );
+    })
+    .await;
+    let first = message(1, "我喜欢白茶，context-before-auto-reply");
+    router.dispatch(first.clone()).await.unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(answer("confirmed-answer-before-auto-reply"))
+        .unwrap();
+    mock.sent().await;
+    wait_for_outbox(&host, "confirmed", 1).await;
+    let conversation = qkbot::plugins::ai::conversation(&host, &first)
+        .await
+        .unwrap();
+    host.memory
+        .remember(
+            &conversation.guard,
+            first.sender_id,
+            &first.key.key(),
+            "喜欢白茶",
+            qkbot::plugins::ai::memory::MemoryKind::Preference,
+            None,
+        )
+        .await
+        .unwrap();
+    set_auto_reply(&host, &router, &first.key.scope, true).await;
+    let mut other_speaker = ordinary_message(2, "batch-first-fragment");
+    other_speaker.sender_id = 888;
+    router.dispatch(other_speaker).await.unwrap();
+    router
+        .dispatch(ordinary_message(3, "batch-second-fragment"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), mock.models.recv())
+            .await
+            .is_err(),
+        "short adjacent messages should wait for one merged decision"
+    );
+    let request = mock.model().await;
+    assert_eq!(request.body["model"], "shared-chat-model");
+    let context = request.body["messages"].to_string();
+    for expected in [
+        "marker-persona",
+        "context-before-auto-reply",
+        "confirmed-answer-before-auto-reply",
+        "batch-first-fragment",
+        "batch-second-fragment",
+        "喜欢白茶",
+        "关于用户 789",
+    ] {
+        assert!(
+            context.contains(expected),
+            "missing shared context: {expected}"
+        );
+    }
+    request.reply.send(answer(" \n<NO_REPLY>\t ")).unwrap();
+
+    // Silence must neither produce an outbox row nor consume the 30-second
+    // automatic-send cooldown; the next ordinary message may be considered.
+    router
+        .dispatch(ordinary_message(4, "a-new-topic-after-silence"))
+        .await
+        .unwrap();
+    let next = mock.model().await;
+    assert!(
+        next.body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("a-new-topic-after-silence")
+    );
+    assert!(mock.sends.try_recv().is_err());
+    let counts: (i64, i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (1, 1));
+    assert!(
+        !next.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "assistant"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("<NO_REPLY>"))
+            })
+    );
+    next.reply.send(answer("one-new-topic-answer")).unwrap();
+    assert_eq!(mock.sent().await, "one-new-topic-answer");
+    within(router.shutdown()).await.unwrap();
+    assert!(
+        mock.models.try_recv().is_err(),
+        "a batch must use one model decision"
+    );
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_private_opt_in_batches_and_disabling_restores_direct_replies() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    let scope = Scope {
+        bot_id: 123,
+        scene: Scene::Friend,
+        peer_id: 789,
+    };
+    set_auto_reply(&host, &router, &scope, true).await;
+    for (seq, text) in [(1, "private-fragment-one"), (2, "private-fragment-two")] {
+        let mut incoming = ordinary_message(seq, text);
+        incoming.key.scope = scope.clone();
+        router.dispatch(incoming).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), mock.models.recv())
+            .await
+            .is_err()
+    );
+    let request = mock.model().await;
+    let context = request.body["messages"].to_string();
+    assert!(context.contains("private-fragment-one"));
+    assert!(context.contains("private-fragment-two"));
+    request.reply.send(answer("private-merged-answer")).unwrap();
+    assert_eq!(mock.sent().await, "private-merged-answer");
+    wait_for_outbox(&host, "confirmed", 1).await;
+
+    // Disabling is independent of automatic cooldown and preserves history.
+    set_auto_reply(&host, &router, &scope, false).await;
+    let mut direct = ordinary_message(3, "private-direct-after-disabling");
+    direct.key.scope = scope;
+    router.dispatch(direct).await.unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(1), mock.model())
+        .await
+        .expect("disabling auto reply must restore the original private trigger");
+    let context = request.body["messages"].to_string();
+    assert!(context.contains("private-direct-after-disabling"));
+    assert!(context.contains("private-merged-answer"));
+    request.reply.send(answer("private-direct-answer")).unwrap();
+    assert_eq!(mock.sent().await, "private-direct-answer");
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_batch_keeps_earlier_quotes_real_mentions_and_reply_references() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config.llm.vision = false;
+        config.limits.max_model_calls = 1;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    let mut first = image_message(1, "earlier-message-with-quote-and-mention");
+    first.mentions = vec![999];
+    first.quote_seq = Some(77);
+    router.dispatch(first).await.unwrap();
+    router
+        .dispatch(ordinary_message(
+            2,
+            "latest-message-without-quote-or-mention",
+        ))
+        .await
+        .unwrap();
+    let request = mock.model().await;
+    let content = request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("quoted-group-456-77"));
+    assert!(content.contains("识图已关闭"));
+    assert!(!content.contains("untrusted-event-preview.png"));
+    let first_payload = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|payload| payload["text"] == "earlier-message-with-quote-and-mention")
+        .expect("the earlier batch message needs its own identity envelope");
+    assert_eq!(first_payload["mentions"][0]["user_id"], "999");
+    assert!(mock.resources.try_recv().is_err());
+    request
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "reply-to-earlier-batch-source",
+            "reply_message",
+            json!({
+                "reply_to":first_payload["message_ref"],
+                "mention_users":[first_payload["mentions"][0]["user_ref"]],
+                "text":"earlier-source-refs-still-authorized"
+            }),
+        )]))
+        .unwrap();
+    let sent = within(mock.sends.recv()).await.unwrap();
+    assert_eq!(
+        sent["message"],
+        json!([
+            {"type":"reply","data":{"message_seq":1}},
+            {"type":"mention","data":{"user_id":999}},
+            {"type":"text","data":{"text":"earlier-source-refs-still-authorized"}}
+        ])
+    );
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_batch_reads_an_earlier_image_with_its_original_message_key() {
+    let mut mock = MockServer::start().await;
+    mock.control_quotes.store(true, Ordering::Relaxed);
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.vision = true;
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    let mut first = image_message(1, "earlier-image-message");
+    first.mentions.clear();
+    router.dispatch(first).await.unwrap();
+    router
+        .dispatch(ordinary_message(2, "later-text-message"))
+        .await
+        .unwrap();
+    let lookup = within(mock.quote_requests.recv()).await.unwrap();
+    assert_eq!(
+        lookup.body,
+        json!({"message_scene":"group","peer_id":456,"message_seq":1})
+    );
+    assert!(mock.resources.try_recv().is_err());
+    let mut verified = quoted(&lookup.body, 789, "earlier-image-message");
+    verified["data"]["message"]["segments"] = json!([
+        {"type":"text","data":{"text":"earlier-image-message"}},
+        {"type":"image","data":{"resource_id":"pic-one"}}
+    ]);
+    lookup.reply.send(verified).unwrap();
+    let resource = within(mock.resources.recv()).await.unwrap();
+    assert_eq!(resource.body, json!({"resource_id":"pic-one"}));
+    resource
+        .reply
+        .send(json!({"status":"ok","retcode":0,"data":{
+            "url":"https://127.0.0.1/unreadable-batch-image.png"
+        }}))
+        .unwrap();
+    let request = mock.model().await;
+    let context = request.body["messages"].to_string();
+    assert!(context.contains("earlier-image-message"));
+    assert!(context.contains("later-text-message"));
+    assert!(context.contains("新增消息 1") && context.contains("未能读取"));
+    assert!(!context.contains("untrusted-event-preview.png"));
+    assert!(!context.contains("unreadable-batch-image.png"));
+    request
+        .reply
+        .send(answer("batch-image-fallback-answer"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "batch-image-fallback-answer");
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.quote_requests.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_cooldown_does_not_delay_mentions_keywords_or_verified_replies() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    router
+        .dispatch(ordinary_message(1, "first-automatic-topic"))
+        .await
+        .unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(answer("first-automatic-answer"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "first-automatic-answer");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    router
+        .dispatch(ordinary_message(2, "automatic-topic-during-cooldown"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1800), mock.models.recv())
+            .await
+            .is_err(),
+        "the same chat must not start another automatic turn during cooldown"
+    );
+    for incoming in [
+        message(3, "explicit-mention-during-cooldown"),
+        ordinary_message(4, "小鱼 explicit-keyword-during-cooldown"),
+        reply_message(5, 100000, "explicit-quote-during-cooldown"),
+    ] {
+        let text = incoming.text.clone();
+        router.dispatch(incoming).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), mock.model())
+            .await
+            .expect("explicit triggers must bypass automatic cooldown and merging");
+        let current = request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        // Explicit replies append quote context after the current envelope.
+        let envelope: Value = serde_json::from_str(current.lines().next().unwrap()).unwrap();
+        assert_eq!(envelope["text"], text);
+        request.reply.send(answer("explicit-answer")).unwrap();
+        assert_eq!(mock.sent().await, "explicit-answer");
+    }
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_pending_batch_yields_to_an_explicit_message_without_duplicate_reply() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    router
+        .dispatch(ordinary_message(1, "pending-background-fragment"))
+        .await
+        .unwrap();
+    router
+        .dispatch(message(2, "explicit-message-before-batch-deadline"))
+        .await
+        .unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(1), mock.model())
+        .await
+        .expect("a pending automatic batch must not hold an explicit request");
+    let context = request.body["messages"].to_string();
+    assert!(context.contains("pending-background-fragment"));
+    assert_eq!(
+        current_message_payload(&request.body)["text"],
+        "explicit-message-before-batch-deadline"
+    );
+    request
+        .reply
+        .send(answer("single-explicit-answer"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "single-explicit-answer");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1800), mock.models.recv())
+            .await
+            .is_err(),
+        "the superseded batch must not create a duplicate automatic turn"
+    );
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_pending_batches_are_cancelled_by_disable_reset_and_recall() {
+    for change in ["disable", "reset", "recall"] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup(&mock, true).await;
+        let scope = message(0, "").key.scope;
+        set_auto_reply(&host, &router, &scope, true).await;
+        router
+            .dispatch(ordinary_message(1, "cancelled-before-automatic-deadline"))
+            .await
+            .unwrap();
+        match change {
+            "disable" => set_auto_reply(&host, &router, &scope, false).await,
+            "reset" => web_change(&host, &router, qkbot::admin::memory::Action::Reset).await,
+            "recall" => router.dispatch(recall_message(1)).await.unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1800), mock.models.recv())
+                .await
+                .is_err(),
+            "{change} must cancel an unsubmitted automatic batch"
+        );
+        assert!(mock.sends.try_recv().is_err(), "{change}");
+        router
+            .dispatch(message(2, "new-explicit-request"))
+            .await
+            .unwrap();
+        let request = mock.model().await;
+        assert_eq!(
+            current_message_payload(&request.body)["text"],
+            "new-explicit-request"
+        );
+        request.reply.send(answer("new-explicit-answer")).unwrap();
+        assert_eq!(mock.sent().await, "new-explicit-answer");
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err(), "{change}");
+        assert!(mock.sends.try_recv().is_err(), "{change}");
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn auto_reply_inflight_answers_are_cancelled_by_disable_reset_recall_and_account_change() {
+    for change in ["disable", "reset", "recall", "account"] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup(&mock, true).await;
+        let scope = message(0, "").key.scope;
+        set_auto_reply(&host, &router, &scope, true).await;
+        router
+            .dispatch(ordinary_message(1, "obsolete-automatic-question"))
+            .await
+            .unwrap();
+        let old = mock.model().await;
+        match change {
+            "disable" => set_auto_reply(&host, &router, &scope, false).await,
+            "reset" => web_change(&host, &router, qkbot::admin::memory::Action::Reset).await,
+            "recall" => router.dispatch(recall_message(1)).await.unwrap(),
+            "account" => {
+                mock.login_id.store(999, Ordering::Relaxed);
+                assert!(host.milky.login().await.is_err());
+                mock.login_id.store(123, Ordering::Relaxed);
+                host.milky.login().await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let _ = old
+            .reply
+            .send(answer("obsolete-automatic-answer-must-not-send"));
+        // Another chat's explicit request is an ordering barrier under the
+        // single global model slot. It cannot itself cancel the obsolete turn.
+        let mut fresh = message(2, "fresh-explicit-question");
+        fresh.key.scope.peer_id = 457;
+        router.dispatch(fresh).await.unwrap();
+        let request = mock.model().await;
+        assert_eq!(
+            current_message_payload(&request.body)["text"],
+            "fresh-explicit-question"
+        );
+        assert!(
+            mock.sends.try_recv().is_err(),
+            "{change} must suppress the stale answer"
+        );
+        request.reply.send(answer("fresh-explicit-answer")).unwrap();
+        assert_eq!(mock.sent().await, "fresh-explicit-answer", "{change}");
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err(), "{change}");
+        assert!(mock.sends.try_recv().is_err(), "{change}");
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn auto_reply_rechecks_every_batch_source_at_the_final_submission_boundary() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup(&mock, true).await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    for (seq, text) in [
+        (1, "earlier-source-to-revoke"),
+        (2, "current-source-still-valid"),
+    ] {
+        router.dispatch(ordinary_message(seq, text)).await.unwrap();
+    }
+    let request = mock.model().await;
+    host.store
+        .call(|db| {
+            // This is the same deterministic final-boundary race fixture used
+            // for reply and sticker provenance elsewhere in this test suite.
+            db.execute_batch(
+                "CREATE TRIGGER revoke_earlier_auto_source_after_prepare AFTER INSERT ON outbox
+                 WHEN NEW.origin_plugin='ai' AND NEW.state='prepared'
+                 BEGIN
+                   INSERT INTO ai_revoked_sources(source_key,revoked_at)
+                     VALUES('123:group:456:1',1);
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    request
+        .reply
+        .send(answer("must-not-submit-from-partly-revoked-batch"))
+        .unwrap();
+    wait_for_outbox(&host, "failed", 1).await;
+    assert!(mock.sends.try_recv().is_err());
+    let assistants: i64 = host
+        .store
+        .call(|db| {
+            Ok(db.query_row(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(assistants, 0);
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_allows_reads_and_replies_but_rejects_local_writes_without_explicit_trigger() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_reply_with(&mock, |config| {
+        config
+            .plugins
+            .ai
+            .defaults
+            .allowed_tools
+            .extend(["reminder_list".into(), "reminder_cancel".into()]);
+    })
+    .await;
+    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+    let mut earlier = ordinary_message(1, "earlier-speaker-mentions-a-possible-reminder");
+    earlier.sender_id = 888;
+    router.dispatch(earlier).await.unwrap();
+    router
+        .dispatch(ordinary_message(2, "another-speaker-is-only-chatting"))
+        .await
+        .unwrap();
+    let automatic = mock.model().await;
+    let definitions = automatic.body["tools"].as_array().unwrap();
+    for allowed in ["clock_now", "reminder_list", "reply_message"] {
+        assert!(
+            definitions
+                .iter()
+                .any(|tool| tool["function"]["name"] == allowed),
+            "automatic replies should retain {allowed}"
+        );
+    }
+    for forbidden in ["reminder_create", "reminder_cancel"] {
+        assert!(
+            !definitions
+                .iter()
+                .any(|tool| tool["function"]["name"] == forbidden),
+            "automatic observation must not advertise {forbidden}"
+        );
+    }
+    // A provider can still invent a hidden tool call. Neither member's casual
+    // speech may become authorization to create a reminder for the last sender.
+    automatic
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "forged-automatic-write",
+            "reminder_create",
+            json!({"after_seconds":600,"text":"must-not-create-from-observation"}),
+        )]))
+        .unwrap();
+    // The provider validator rejects unoffered tools before the chat loop;
+    // automatic failures end silently instead of requesting a correction.
+    // An explicit request in another chat proves the shared slot was released
+    // without superseding or cancelling the automatic turn under test.
+    let mut barrier = message(1, "separate-chat-completion-barrier");
+    barrier.key.scope.peer_id = 457;
+    router.dispatch(barrier).await.unwrap();
+    let completed = mock.model().await;
+    assert_eq!(
+        current_message_payload(&completed.body)["text"],
+        "separate-chat-completion-barrier"
+    );
+    let counts: (i64, i64) = host
+        .store
+        .call(|db| {
+            Ok((
+                db.query_row("SELECT COUNT(*) FROM reminder_jobs", [], |row| row.get(0))?,
+                db.query_row("SELECT COUNT(*) FROM tool_runs", [], |row| row.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    assert!(mock.sends.try_recv().is_err());
+    completed.reply.send(answer("<NO_REPLY>")).unwrap();
+    router
+        .dispatch(ordinary_message(3, "new-observation-may-read-the-clock"))
+        .await
+        .unwrap();
+    let reading = mock.model().await;
+    assert!(
+        reading.body["messages"]
+            .to_string()
+            .contains("new-observation-may-read-the-clock")
+    );
+    reading
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "automatic-read-clock",
+            "clock_now",
+            json!({}),
+        )]))
+        .unwrap();
+    let final_reply = mock.model().await;
+    assert_eq!(
+        last_model_tool_result(&final_reply.body, "automatic-read-clock")["status"],
+        "succeeded"
+    );
+    final_reply
+        .reply
+        .send(model_tool_response(vec![model_tool_call(
+            "automatic-final-reply",
+            "reply_message",
+            json!({"text":"read-and-reply-still-work"}),
+        )]))
+        .unwrap();
+    assert_eq!(mock.sent().await, "read-and-reply-still-work");
+
+    router
+        .dispatch(message(
+            4,
+            "explicit-request-keeps-the-original-tool-policy",
+        ))
+        .await
+        .unwrap();
+    let explicit = mock.model().await;
+    let definitions = explicit.body["tools"].as_array().unwrap();
+    for allowed in [
+        "clock_now",
+        "reminder_list",
+        "reply_message",
+        "reminder_create",
+        "reminder_cancel",
+    ] {
+        assert!(
+            definitions
+                .iter()
+                .any(|tool| tool["function"]["name"] == allowed),
+            "an explicit request in the opted-in chat should still offer {allowed}"
+        );
+    }
+    explicit.reply.send(answer("<NO_REPLY>")).unwrap();
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.models.try_recv().is_err());
+    assert!(mock.sends.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
 async fn setup(mock: &MockServer, enable_ai: bool) -> (tempfile::TempDir, Arc<Host>, Router) {
     setup_with(mock, enable_ai, |_| {}).await
 }
@@ -4683,6 +5441,70 @@ async fn roll_disabled_globally_or_in_the_chat_retains_command_ownership_without
         assert!(mock.sends.try_recv().is_err());
         assert!(mock.models.try_recv().is_err());
         assert!(mock.quotes.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn auto_reply_waiting_for_a_model_slot_yields_its_queue_capacity_to_mentions() {
+    // Exercise the per-conversation bound independently, then also exhaust the
+    // global queue: cancelling observation must release both permits immediately.
+    for queued_global in [4, 1] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.limits.queued_per_conversation = 1;
+            config.limits.queued_global = queued_global;
+            config.llm.max_concurrent_requests = 1;
+        })
+        .await;
+        set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+
+        let mut occupying = message(1, "another-chat-holds-the-model-slot");
+        occupying.key.scope.peer_id = 654;
+        router.dispatch(occupying).await.unwrap();
+        let held = mock.model().await;
+        router
+            .dispatch(ordinary_message(
+                1,
+                "automatic-observation-awaiting-capacity",
+            ))
+            .await
+            .unwrap();
+        // Let the automatic debounce expire while the first model request is
+        // deliberately held. The automatic worker now owns a waiting queue slot.
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(router.chat.pending(), 1);
+        assert!(mock.models.try_recv().is_err());
+
+        router
+            .dispatch(message(
+                2,
+                "explicit-mention-must-replace-waiting-observation",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(router.chat.pending(), 1, "queued_global={queued_global}");
+        held.reply.send(answer("occupying-chat-complete")).unwrap();
+        assert_eq!(
+            mock.sent().await,
+            "occupying-chat-complete",
+            "the mention must not receive queue-full feedback"
+        );
+        let explicit = mock.model().await;
+        assert_eq!(
+            current_message_payload(&explicit.body)["text"],
+            "explicit-mention-must-replace-waiting-observation"
+        );
+        explicit
+            .reply
+            .send(answer("explicit-mention-complete"))
+            .unwrap();
+        assert_eq!(mock.sent().await, "explicit-mention-complete");
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
         drop(host);
         mock.stop().await;
     }

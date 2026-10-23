@@ -1,4 +1,5 @@
-//! Persistent per-account, per-physical-chat Bot switches. Missing rows are enabled.
+//! Persistent per-account, per-physical-chat switches. Bot access defaults on;
+//! automatic replies default off and require a separate opt-in for each chat.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::OwnedRwLockReadGuard;
@@ -16,6 +17,14 @@ CREATE TABLE scope_access (
 CREATE INDEX scope_access_disabled ON scope_access(bot_id,enabled,scene,peer_id);
 ALTER TABLE messages ADD COLUMN access_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE outbox ADD COLUMN access_revision INTEGER NOT NULL DEFAULT 0;
+"#;
+
+pub(crate) const AUTO_REPLY_MIGRATION: &str = r#"
+CREATE TABLE ai_auto_reply_scopes (
+ scope TEXT PRIMARY KEY, bot_id INTEGER NOT NULL, scene TEXT NOT NULL,
+ peer_id INTEGER NOT NULL, enabled INTEGER NOT NULL
+);
+CREATE INDEX ai_auto_reply_enabled ON ai_auto_reply_scopes(bot_id,enabled,scene,peer_id);
 "#;
 
 #[derive(Debug)]
@@ -37,6 +46,53 @@ impl AccessStore {
     }
     pub async fn enabled(&self, scope: &Scope) -> Result<bool> {
         Ok(self.allowed_revision(scope).await?.is_some())
+    }
+    /// Ordinary messages only wake the AI after this physical chat opts in.
+    pub async fn auto_reply_enabled(&self, scope: &Scope) -> Result<bool> {
+        let key = scope.key();
+        self.store
+            .call(move |db| auto_reply_enabled(db, &key))
+            .await
+    }
+    pub async fn auto_reply_scopes(&self, bot_id: i64) -> Result<Vec<Scope>> {
+        self.store.call(move |db| {
+            let mut statement = db.prepare("SELECT scene,peer_id FROM ai_auto_reply_scopes WHERE bot_id=?1 AND enabled=1 ORDER BY scene,peer_id")?;
+            statement.query_map([bot_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+                .map(|row| {
+                    let (scene, peer_id) = row?;
+                    let scene = match scene.as_str() {
+                        "group" => Scene::Group,
+                        "friend" => Scene::Friend,
+                        _ => anyhow::bail!("invalid stored auto-reply scene"),
+                    };
+                    Ok(Scope { bot_id, scene, peer_id })
+                }).collect()
+        }).await
+    }
+    pub async fn set_auto_reply_enabled(&self, scope: Scope, enabled: bool) -> Result<()> {
+        ensure!(
+            scope.bot_id > 0 && scope.peer_id > 0,
+            "invalid account or chat identifier"
+        );
+        let gate = self.store.scope_gate(&scope.key())?;
+        let _exclusive = gate.write_owned().await;
+        self.store.call(move |db| {
+            let tx = db.transaction()?;
+            let key = scope.key();
+            if auto_reply_enabled(&tx, &key)? == enabled { return Ok(()); }
+            tx.execute("INSERT INTO ai_auto_reply_scopes(scope,bot_id,scene,peer_id,enabled) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(scope) DO UPDATE SET enabled=excluded.enabled", params![key, scope.bot_id, scope.scene.as_str(), scope.peer_id, enabled])?;
+            // Both transitions invalidate in-flight AI work, preserving its raw
+            // context and summaries in the next epoch for every member mode.
+            tx.execute("UPDATE messages SET epoch=epoch+1 WHERE scope=?1 AND EXISTS(SELECT 1 FROM ai_conversations c WHERE c.id=messages.conversation_id AND c.epoch=messages.epoch)", [&key])?;
+            tx.execute("UPDATE ai_conversations SET epoch=epoch+1 WHERE scope=?1", [&key])?;
+            tx.execute("UPDATE outbox SET state='failed',detail='Auto reply setting changed before submission' WHERE scope=?1 AND state='prepared'", [&key])?;
+            let has_tools: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='tool_runs')", [], |row| row.get(0))?;
+            if has_tools {
+                tx.execute("UPDATE tool_runs SET status='rejected' WHERE scope_key=?1 AND status='pending_confirmation'", [&key])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
     }
     pub(crate) async fn allowed_revision(&self, scope: &Scope) -> Result<Option<i64>> {
         let key = scope.key();
@@ -76,6 +132,22 @@ impl AccessStore {
     pub(crate) async fn delivery_guard(&self, scope: &Scope) -> Result<OwnedRwLockReadGuard<()>> {
         Ok(self.store.scope_gate(&scope.key())?.read_owned().await)
     }
+}
+
+pub(crate) fn auto_reply_enabled(db: &Connection, key: &str) -> Result<bool> {
+    Ok(db
+        .query_row(
+            "SELECT enabled FROM ai_auto_reply_scopes WHERE scope=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+pub(crate) fn require_auto_reply(db: &Connection, key: &str) -> Result<()> {
+    ensure!(auto_reply_enabled(db, key)?, "此会话的自动接话已关闭");
+    Ok(())
 }
 
 pub(crate) fn allowed_revision(db: &Connection, key: &str) -> Result<Option<i64>> {
@@ -139,6 +211,98 @@ mod tests {
             scene,
             peer_id: 20,
         }
+    }
+
+    #[tokio::test]
+    async fn auto_reply_defaults_off_isolates_physical_chats_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auto-reply.sqlite3");
+        let store = Store::open(&path, 16).await.unwrap();
+        let access = AccessStore::new(store.clone());
+        let group = scope(1, Scene::Group);
+        let friend = scope(1, Scene::Friend);
+        let other_account = scope(2, Scene::Group);
+        let other_group = Scope {
+            peer_id: 21,
+            ..group.clone()
+        };
+        for target in [&group, &friend, &other_account, &other_group] {
+            assert!(!access.auto_reply_enabled(target).await.unwrap());
+        }
+        access
+            .set_auto_reply_enabled(group.clone(), true)
+            .await
+            .unwrap();
+        assert!(access.auto_reply_enabled(&group).await.unwrap());
+        for target in [&friend, &other_account, &other_group] {
+            assert!(!access.auto_reply_enabled(target).await.unwrap());
+        }
+        access
+            .set_auto_reply_enabled(friend.clone(), true)
+            .await
+            .unwrap();
+        access
+            .set_auto_reply_enabled(group.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            access.auto_reply_scopes(1).await.unwrap(),
+            vec![friend.clone()]
+        );
+        assert!(access.auto_reply_scopes(2).await.unwrap().is_empty());
+        assert!(access.enabled(&group).await.unwrap());
+        store.stop().await.unwrap();
+        let store = Store::open(&path, 16).await.unwrap();
+        let access = AccessStore::new(store.clone());
+        assert!(!access.auto_reply_enabled(&group).await.unwrap());
+        assert!(access.auto_reply_enabled(&friend).await.unwrap());
+        assert!(!access.auto_reply_enabled(&other_account).await.unwrap());
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_reply_transitions_preserve_all_member_contexts_and_invalidate_work() {
+        let store = Store::open(":memory:", 16).await.unwrap();
+        let access = AccessStore::new(store.clone());
+        store.call(|db| {
+            db.execute_batch("INSERT INTO ai_conversations(id,scope,mode,summary) VALUES('shared','1:group:20','group','shared summary'),('member','1:group:20','user','member summary'),('other','1:group:21','group','other summary');
+                INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at) VALUES('current','1:group:20','shared',1,7,'user','raw history',1),('member','1:group:20','member',1,8,'user','member history',1),('stale','1:group:20','shared',0,7,'user','old epoch',1);
+                INSERT INTO outbox(id,scope,origin_plugin,plugin_epoch,conversation_id,context_epoch,body,state,created_at,updated_at) VALUES('send','1:group:20','ai',1,'shared',1,'pending','prepared',1,1);
+                CREATE TABLE tool_runs(scope_key TEXT,status TEXT);
+                INSERT INTO tool_runs VALUES('1:group:20','pending_confirmation'),('1:group:21','pending_confirmation');")?;
+            assert!(require_auto_reply(db, "1:group:20").is_err());
+            Ok(())
+        }).await.unwrap();
+        access
+            .set_auto_reply_enabled(scope(1, Scene::Group), true)
+            .await
+            .unwrap();
+        access
+            .set_auto_reply_enabled(scope(1, Scene::Group), true)
+            .await
+            .unwrap();
+        store.call(|db| {
+            require_auto_reply(db, "1:group:20")?;
+            assert_eq!(db.query_row("SELECT count(*) FROM ai_conversations WHERE scope='1:group:20' AND epoch=2 AND summary <> ''", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE epoch=2 AND content LIKE '%history'", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT epoch FROM messages WHERE key='stale'", [], |row| row.get::<_, i64>(0))?, 0);
+            assert_eq!(db.query_row("SELECT epoch FROM ai_conversations WHERE id='other'", [], |row| row.get::<_, i64>(0))?, 1);
+            assert_eq!(db.query_row("SELECT state FROM outbox WHERE id='send'", [], |row| row.get::<_, String>(0))?, "failed");
+            assert_eq!(db.query_row("SELECT status FROM tool_runs WHERE scope_key='1:group:20'", [], |row| row.get::<_, String>(0))?, "rejected");
+            assert_eq!(db.query_row("SELECT status FROM tool_runs WHERE scope_key='1:group:21'", [], |row| row.get::<_, String>(0))?, "pending_confirmation");
+            Ok(())
+        }).await.unwrap();
+        access
+            .set_auto_reply_enabled(scope(1, Scene::Group), false)
+            .await
+            .unwrap();
+        store.call(|db| {
+            assert!(require_auto_reply(db, "1:group:20").is_err());
+            assert_eq!(db.query_row("SELECT count(*) FROM ai_conversations WHERE scope='1:group:20' AND epoch=3", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE epoch=3", [], |row| row.get::<_, i64>(0))?, 2);
+            Ok(())
+        }).await.unwrap();
+        store.stop().await.unwrap();
     }
 
     #[tokio::test]

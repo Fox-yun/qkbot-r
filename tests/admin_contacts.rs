@@ -82,6 +82,7 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
         .unwrap();
     let list_url = format!("{url}/api/qq/contacts");
     let toggle_url = format!("{url}/api/qq/contacts/toggle");
+    let auto_reply_url = format!("{url}/api/qq/contacts/auto-reply");
 
     assert_eq!(
         client.get(&list_url).send().await.unwrap().status(),
@@ -114,6 +115,13 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
             .header("x-csrf-token", &csrf)
             .json(&json!({"bot_id":bot,"scene":scene,"peer_id":peer,"enabled":enabled}))
     };
+    let auto_reply = |bot: &str, scene: &str, peer: &str, enabled: bool| {
+        client
+            .post(&auto_reply_url)
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({"bot_id":bot,"scene":scene,"peer_id":peer,"enabled":enabled}))
+    };
 
     let list: Value = get_list()
         .send()
@@ -128,6 +136,65 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
     assert_eq!(list["groups"][0]["id"], "202");
     assert_eq!(list["groups"][0]["enabled"], true);
     assert_eq!(list["friends"][0]["enabled"], true);
+    assert_eq!(list["groups"][0]["auto_reply_enabled"], false);
+    assert_eq!(list["friends"][0]["auto_reply_enabled"], false);
+    assert_eq!(
+        client
+            .post(&auto_reply_url)
+            .json(&json!({"bot_id":"101","scene":"group","peer_id":"202","enabled":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&auto_reply_url)
+            .header("cookie", &cookie)
+            .json(&json!({"bot_id":"101","scene":"group","peer_id":"202","enabled":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        auto_reply("101", "group", "202", true)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let list: Value = get_list().send().await.unwrap().json().await.unwrap();
+    assert_eq!(list["groups"][0]["auto_reply_enabled"], true);
+    assert_eq!(list["friends"][0]["auto_reply_enabled"], false);
+    assert_eq!(list["groups"][0]["enabled"], true);
+    assert_eq!(
+        auto_reply("101", "group", "999", true)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        auto_reply("303", "group", "202", true)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        auto_reply("101", "friend", "202", true)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
     assert_eq!(
         client
             .post(&toggle_url)
@@ -201,6 +268,8 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
         .unwrap();
     assert_eq!(list["bot_id"], "303");
     assert_eq!(list["groups"][0]["enabled"], true);
+    assert_eq!(list["groups"][0]["auto_reply_enabled"], false);
+    assert_eq!(list["friends"][0]["auto_reply_enabled"], false);
     account.store(101, Ordering::SeqCst);
     let list: Value = get_list()
         .send()
@@ -214,6 +283,22 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
     assert_eq!(list["groups"][0]["enabled"], false);
 
     account.store(0, Ordering::SeqCst);
+    assert!(
+        auto_reply("101", "group", "202", false)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(
+        !auto_reply("101", "group", "202", true)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
     assert!(
         toggle("101", "group", "202", false)
             .send()
@@ -240,6 +325,36 @@ async fn contact_http_authentication_defaults_isolation_and_persistence() {
     upstream_task.await.unwrap();
     let reopened = Store::open(&database, 16).await.unwrap();
     let access = AccessStore::new(reopened.clone());
+    assert!(
+        !access
+            .auto_reply_enabled(&Scope {
+                bot_id: 101,
+                scene: Scene::Group,
+                peer_id: 202
+            })
+            .await
+            .unwrap()
+    );
+    assert!(
+        access
+            .auto_reply_enabled(&Scope {
+                bot_id: 101,
+                scene: Scene::Friend,
+                peer_id: 202
+            })
+            .await
+            .unwrap()
+    );
+    assert!(
+        !access
+            .auto_reply_enabled(&Scope {
+                bot_id: 303,
+                scene: Scene::Friend,
+                peer_id: 202
+            })
+            .await
+            .unwrap()
+    );
     assert!(
         !access
             .enabled(&Scope {

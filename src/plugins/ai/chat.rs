@@ -23,13 +23,18 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tokio_util::{
     sync::CancellationToken,
     task::{TaskTracker, task_tracker::TaskTrackerToken},
 };
 
 const NO_REPLY: &str = "<NO_REPLY>";
+const AUTO_DEBOUNCE: Duration = Duration::from_millis(1500);
+const AUTO_MAX_WAIT: Duration = Duration::from_secs(5);
+const AUTO_COOLDOWN: Duration = Duration::from_secs(30);
+const PARTICIPATION_RULE: &str = "\n参与方式observe表示自动接话：最新发言未必对你说，按完整上下文、人设、发言者和真实引用/@关系判断是否自然参与。可接续与你的对话或合适闲聊，不抢答他人问答、不重复已解决内容，不凭旁人聊天执行操作。无需参与仅输出<NO_REPLY>；适合则直接回复，不解释接话理由。direct表示明确触发，正常回应。";
 const TOOL_USE_RULE: &str =
     "每次仅用一个已定义工具，不虚构结果或提前称成功；按工具说明确认，不代确认。";
 const FINAL_REPLY_RULE: &str =
@@ -58,7 +63,37 @@ struct Job {
     trigger: Option<Decision>,
     position: i64,
     guard: ContextGuard,
-    _queued: OwnedSemaphorePermit,
+    first_queued: Instant,
+    ready_at: Instant,
+    _queued: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+}
+impl Job {
+    fn automatic(&self) -> bool {
+        self.trigger
+            .as_ref()
+            .is_some_and(|d| d.reason == Some(Reason::Automatic))
+    }
+    fn automatic_sources(&self) -> Vec<MessageKey> {
+        self.trigger
+            .as_ref()
+            .and_then(|d| d.auto_batch.as_ref())
+            .map(|batch| {
+                batch
+                    .sources
+                    .iter()
+                    .flat_map(|source| {
+                        let quote = source.quote.as_ref().map(|q| q.key.clone()).or_else(|| {
+                            source.quote_seq.map(|message_seq| MessageKey {
+                                scope: source.key.scope.clone(),
+                                message_seq,
+                            })
+                        });
+                        [Some(source.key.clone()), quote].into_iter().flatten()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 struct Session {
     queue: VecDeque<Job>,
@@ -66,7 +101,27 @@ struct Session {
     waiting_for_turn: bool,
     cancel: Option<CancellationToken>,
     active_guard: Option<ContextGuard>,
+    active_automatic: bool,
+    active_queued: Option<Arc<Mutex<Option<OwnedSemaphorePermit>>>>,
+    active_auto_sources: Vec<MessageKey>,
+    wake: Arc<Notify>,
     touched: i64,
+}
+#[derive(Default)]
+struct AutomaticActivity {
+    active: bool,
+    last_sent: Option<Instant>,
+}
+struct AutomaticLease<'a> {
+    registry: &'a Mutex<HashMap<String, AutomaticActivity>>,
+    scope: String,
+}
+impl Drop for AutomaticLease<'_> {
+    fn drop(&mut self) {
+        if let Some(activity) = self.registry.lock().unwrap().get_mut(&self.scope) {
+            activity.active = false;
+        }
+    }
 }
 struct BackgroundJob {
     guard: ContextGuard,
@@ -96,6 +151,19 @@ impl Session {
     fn waiting(&self) -> usize {
         self.queue.len() + usize::from(self.waiting_for_turn)
     }
+    fn interrupt_automatic(&mut self) {
+        if self.active_automatic {
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            // Release admission immediately: a direct request must be able to
+            // replace an observer even with a one-element queue.
+            if let Some(lease) = self.active_queued.take() {
+                lease.lock().unwrap().take();
+            }
+            self.waiting_for_turn = false;
+        }
+    }
 
     fn cancel_epoch(&mut self, guard: &ContextGuard) {
         self.queue.retain(|job| {
@@ -103,18 +171,23 @@ impl Session {
         });
         if self.active_guard.as_ref().is_some_and(|active| {
             active.conversation_id == guard.conversation_id && active.epoch == guard.epoch
-        }) && let Some(cancel) = &self.cancel
-        {
-            cancel.cancel();
+        }) {
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            self.interrupt_automatic();
         }
+        self.wake.notify_one();
     }
     fn cancel_before(&mut self, epoch: i64) {
         self.queue.retain(|job| job.guard.epoch >= epoch);
-        if self.active_guard.as_ref().is_some_and(|g| g.epoch < epoch)
-            && let Some(cancel) = &self.cancel
-        {
-            cancel.cancel();
+        if self.active_guard.as_ref().is_some_and(|g| g.epoch < epoch) {
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            self.interrupt_automatic();
         }
+        self.wake.notify_one();
     }
 }
 #[derive(Default)]
@@ -157,6 +230,7 @@ pub struct Chat {
     pub(super) host: Arc<Host>,
     ingress: Arc<Ingress>,
     sessions: Mutex<HashMap<String, Session>>,
+    automatic: Mutex<HashMap<String, AutomaticActivity>>,
     background: Mutex<Option<Arc<BackgroundJob>>>,
     maintenance: Mutex<MaintenanceSchedule>,
     queued: Arc<Semaphore>,
@@ -173,6 +247,7 @@ impl Chat {
             )),
             host,
             sessions: Mutex::new(HashMap::new()),
+            automatic: Mutex::new(HashMap::new()),
             background: Mutex::new(None),
             maintenance: Mutex::new(MaintenanceSchedule::default()),
             tasks: TaskTracker::new(),
@@ -206,13 +281,31 @@ impl Chat {
         conversation: &Conversation,
         trigger: Option<Decision>,
     ) -> Result<()> {
-        let permit = self
-            .queued
-            .clone()
-            .try_acquire_owned()
-            .context("聊天队列已满")?;
         let id = conversation.guard.conversation_id.clone();
+        let automatic = trigger
+            .as_ref()
+            .is_some_and(|d| d.reason == Some(Reason::Automatic));
+        let scope = format!("{}:", msg.key.scope.key());
         let mut sessions = self.sessions.lock().unwrap();
+        if automatic {
+            if self.automatic_cooling(&msg.key.scope)
+                || sessions.iter().any(|(id, s)| {
+                    id.starts_with(&scope)
+                        && ((s.active_guard.is_some() && !s.active_automatic)
+                            || s.queue.iter().any(|job| !job.automatic()))
+                })
+            {
+                return Ok(());
+            }
+        } else {
+            // A direct request supersedes observation throughout the physical chat,
+            // including a group's per-member conversation mode.
+            for (_, state) in sessions.iter_mut().filter(|(id, _)| id.starts_with(&scope)) {
+                state.queue.retain(|job| !job.automatic());
+                state.interrupt_automatic();
+                state.wake.notify_one();
+            }
+        }
         if !sessions.contains_key(&id)
             && sessions.len() >= self.host.config.limits.active_conversations
         {
@@ -233,12 +326,72 @@ impl Chat {
             waiting_for_turn: false,
             cancel: None,
             active_guard: None,
+            active_automatic: false,
+            active_queued: None,
+            active_auto_sources: vec![],
+            wake: Arc::new(Notify::new()),
             touched: now(),
         });
+        if automatic {
+            state.interrupt_automatic();
+            if let Some(pending) = state.queue.back_mut().filter(|job| {
+                job.automatic()
+                    && job.guard.epoch == conversation.guard.epoch
+                    && job
+                        .trigger
+                        .as_ref()
+                        .unwrap()
+                        .auto_batch
+                        .as_ref()
+                        .unwrap()
+                        .sources
+                        .len()
+                        < super::auto_reply::MAX_MESSAGES
+            }) {
+                let batch = pending
+                    .trigger
+                    .as_mut()
+                    .unwrap()
+                    .auto_batch
+                    .as_mut()
+                    .unwrap();
+                let source = trigger
+                    .as_ref()
+                    .unwrap()
+                    .auto_batch
+                    .as_ref()
+                    .unwrap()
+                    .sources[0]
+                    .clone();
+                if !batch.push(source) {
+                    return Ok(());
+                }
+                pending.key = msg.key.clone();
+                pending.actor = msg.sender_id;
+                pending.received_at = msg.received_at;
+                pending.quote_seq = msg.quote_seq;
+                pending.mentions = msg.mentions.clone();
+                pending.images = Images::from_message(msg);
+                pending.position = position;
+                pending.ready_at =
+                    (Instant::now() + AUTO_DEBOUNCE).min(pending.first_queued + AUTO_MAX_WAIT);
+                state.wake.notify_one();
+                return Ok(());
+            }
+            if let Some(full) = state.queue.back_mut().filter(|job| job.automatic()) {
+                full.ready_at = Instant::now();
+            }
+        }
         ensure!(
             state.waiting() < self.host.config.limits.queued_per_conversation,
             "本会话队列已满"
         );
+        let permit = self
+            .queued
+            .clone()
+            .try_acquire_owned()
+            .context("聊天队列已满")?;
+        let queued_at = Instant::now();
         state.queue.push_back(Job {
             key: msg.key.clone(),
             actor: msg.sender_id,
@@ -249,8 +402,16 @@ impl Chat {
             trigger,
             position,
             guard: conversation.guard.clone(),
-            _queued: permit,
+            first_queued: queued_at,
+            ready_at: queued_at
+                + if automatic {
+                    AUTO_DEBOUNCE
+                } else {
+                    Duration::ZERO
+                },
+            _queued: Arc::new(Mutex::new(Some(permit))),
         });
+        state.wake.notify_one();
         state.touched = now();
         if !state.running {
             state.running = true;
@@ -260,6 +421,43 @@ impl Chat {
             });
         }
         Ok(())
+    }
+    fn automatic_cooling(&self, scope: &Scope) -> bool {
+        self.automatic
+            .lock()
+            .unwrap()
+            .get(&scope.key())
+            .is_some_and(|a| {
+                a.last_sent
+                    .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+            })
+    }
+    fn begin_automatic(&self, scope: &Scope) -> Option<AutomaticLease<'_>> {
+        let mut activities = self.automatic.lock().unwrap();
+        activities.retain(|_, a| {
+            a.active
+                || a.last_sent
+                    .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+        });
+        let key = scope.key();
+        if !activities.contains_key(&key)
+            && activities.len() >= self.host.config.limits.active_conversations
+        {
+            return None;
+        }
+        let activity = activities.entry(key.clone()).or_default();
+        if activity.active
+            || activity
+                .last_sent
+                .is_some_and(|sent| sent.elapsed() < AUTO_COOLDOWN)
+        {
+            return None;
+        }
+        activity.active = true;
+        Some(AutomaticLease {
+            registry: &self.automatic,
+            scope: key,
+        })
     }
     pub fn cancel(&self, guard: &ContextGuard) {
         self.ingress.cancel(|active| {
@@ -284,12 +482,25 @@ impl Chat {
         for (key, state) in self.sessions.lock().unwrap().iter_mut() {
             if key.starts_with(&prefix) {
                 state.queue.clear();
+                state.wake.notify_one();
                 if let Some(c) = &state.cancel {
                     c.cancel();
                 }
             }
         }
         self.cancel_background(|guard| guard.conversation_id.starts_with(&prefix));
+    }
+    /// A QQ recall invalidates only observers depending on that source or quote.
+    pub(crate) fn recall_source(&self, key: &MessageKey) {
+        for state in self.sessions.lock().unwrap().values_mut() {
+            state
+                .queue
+                .retain(|job| !job.automatic_sources().contains(key));
+            if state.active_auto_sources.contains(key) {
+                state.interrupt_automatic();
+            }
+            state.wake.notify_one();
+        }
     }
     /// A late web receipt must never cancel work accepted under its new generation.
     pub fn cancel_before(&self, conversation_id: &str, epoch: i64) {
@@ -335,6 +546,7 @@ impl Chat {
         self.cancel_background(|_| true);
         for state in self.sessions.lock().unwrap().values_mut() {
             state.queue.clear();
+            state.wake.notify_one();
             if let Some(c) = &state.cancel {
                 c.cancel();
             }
@@ -345,36 +557,71 @@ impl Chat {
     async fn worker(self: Arc<Self>, id: String) {
         loop {
             let cancel = self.host.cancel.child_token();
-            let job = {
+            let next = {
                 let mut states = self.sessions.lock().unwrap();
                 let state = states.get_mut(&id).unwrap();
-                match state.queue.pop_front() {
-                    Some(job) => {
-                        state.waiting_for_turn = true;
-                        state.cancel = Some(cancel.clone());
-                        state.active_guard = Some(job.guard.clone());
-                        job
+                if let Some(job) = state
+                    .queue
+                    .front()
+                    .filter(|job| job.ready_at > Instant::now())
+                {
+                    Err((job.ready_at, state.wake.clone()))
+                } else {
+                    match state.queue.pop_front() {
+                        Some(job) => {
+                            state.active_automatic = job.automatic();
+                            state.active_auto_sources = job.automatic_sources();
+                            state.active_queued = Some(job._queued.clone());
+                            state.waiting_for_turn = true;
+                            state.cancel = Some(cancel.clone());
+                            state.active_guard = Some(job.guard.clone());
+                            Ok(job)
+                        }
+                        None => {
+                            state.running = false;
+                            state.waiting_for_turn = false;
+                            state.cancel = None;
+                            state.active_guard = None;
+                            state.active_automatic = false;
+                            state.active_queued = None;
+                            state.active_auto_sources.clear();
+                            state.touched = now();
+                            return;
+                        }
                     }
-                    None => {
-                        state.running = false;
-                        state.waiting_for_turn = false;
-                        state.cancel = None;
-                        state.active_guard = None;
-                        state.touched = now();
-                        return;
+                }
+            };
+            let job = match next {
+                Ok(job) => job,
+                Err((until, wake)) => {
+                    tokio::select! {
+                        biased;
+                        _ = self.host.cancel.cancelled() => return,
+                        _ = wake.notified() => {},
+                        _ = tokio::time::sleep_until(until) => {},
                     }
+                    continue;
                 }
             };
             // A popped job still occupies both queue caps until a turn slot is available.
             let turn_permit = tokio::select! {biased;_=cancel.cancelled()=>None,p=self.turns.clone().acquire_owned()=>p.ok()};
-            self.sessions
-                .lock()
-                .unwrap()
-                .get_mut(&id)
-                .unwrap()
-                .waiting_for_turn = false;
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                let state = sessions.get_mut(&id).unwrap();
+                state.waiting_for_turn = false;
+                state.active_queued = None;
+            }
             let Some(_turn_permit) = turn_permit else {
                 continue;
+            };
+            let automatic = job.automatic();
+            let _automatic_lease = if automatic {
+                let Some(lease) = self.begin_automatic(&job.key.scope) else {
+                    continue;
+                };
+                Some(lease)
+            } else {
+                None
             };
             let Job {
                 key,
@@ -387,8 +634,10 @@ impl Chat {
                 position,
                 guard,
                 _queued,
+                first_queued: _,
+                ready_at: _,
             } = job;
-            drop(_queued);
+            _queued.lock().unwrap().take();
             let run = Turn {
                 key,
                 actor,
@@ -416,19 +665,38 @@ impl Chat {
             {
                 continue;
             }
-            let reply = match result {
+            let mut reply = match result {
                 Ok(Some(reply)) => reply,
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(error=%error,"AI turn failed");
+                    if automatic {
+                        continue;
+                    }
                     Reply::text("host", format!("本次请求未完成：{error}"))
                 }
             };
+            if automatic {
+                if cancel.is_cancelled() {
+                    continue;
+                }
+                let batch = run.trigger.as_ref().unwrap().auto_batch.as_ref().unwrap();
+                reply.authorization = Some(
+                    reply
+                        .authorization
+                        .take()
+                        .unwrap_or_else(|| Authorization::external(vec![]))
+                        .with_auto_reply(batch, cancel.clone()),
+                );
+            }
             let reply = if reply
                 .message
                 .validate(self.host.config.limits.max_message_bytes)
                 .is_err()
             {
+                if automatic {
+                    continue;
+                }
                 Reply::text(
                     "host",
                     "模型回复格式无效或超过消息字节上限，未发送。".into(),
@@ -436,6 +704,7 @@ impl Chat {
             } else {
                 reply
             };
+            let scope_key = run.key.scope.key();
             let attempt = format!("ai-turn:{}", run.key.key());
             let delivered = if let Some(authorization) = reply.authorization {
                 self.host
@@ -464,6 +733,17 @@ impl Chat {
             };
             if let Err(error) = delivered {
                 tracing::warn!(error=%error,"AI delivery failed");
+            } else if automatic
+                && matches!(
+                    delivered,
+                    Ok(crate::milky::SendOutcome::Confirmed { .. }
+                        | crate::milky::SendOutcome::Unknown { .. })
+                )
+            {
+                // Ambiguous sends can already be visible on QQ, so also cool down.
+                if let Some(activity) = self.automatic.lock().unwrap().get_mut(&scope_key) {
+                    activity.last_sent = Some(Instant::now());
+                }
             }
         }
     }
@@ -471,8 +751,15 @@ impl Chat {
     async fn turn(&self, job: &Turn, cancel: &CancellationToken) -> Result<Option<Reply>> {
         let host = &self.host;
         let llm = host.llm.as_ref().context("AI disabled")?;
-        let (settings, summary, current, history, mut references) = load_context(host, job).await?;
-        let quote = if let Some(quote) = job
+        let batch = job.trigger.as_ref().and_then(|d| d.auto_batch.as_ref());
+        if let Some(batch) = batch {
+            super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
+        }
+        let (settings, summary, mut current, history, mut references) =
+            load_context(host, job).await?;
+        let quote = if batch.is_some() {
+            None
+        } else if let Some(quote) = job
             .trigger
             .as_ref()
             .and_then(|decision| decision.quote.clone())
@@ -534,7 +821,12 @@ impl Chat {
         } else {
             vec![]
         };
-        let system = system_prompt(&host.config, &settings, &job.key.scope, job.actor)?;
+        let mut system = system_prompt(&host.config, &settings, &job.key.scope, job.actor)?;
+        // Both modes reserve exactly the same system bytes, so observation does
+        // not silently get a smaller history/memory budget than direct chat.
+        if batch.is_some() || host.access.auto_reply_enabled(&job.key.scope).await? {
+            system = participation_system(system, batch.is_some());
+        }
         let ctx = host
             .gateway
             .context(
@@ -553,9 +845,10 @@ impl Chat {
             vec![]
         };
         definitions.retain(|d| {
-            d["function"]["name"]
-                .as_str()
-                .is_some_and(|n| settings.allowed_tools.iter().any(|x| x == n))
+            d["function"]["name"].as_str().is_some_and(|n| {
+                settings.allowed_tools.iter().any(|x| x == n)
+                    && (batch.is_none() || host.gateway.permits_observation(n))
+            })
         });
         let search_enabled = definitions
             .iter()
@@ -572,17 +865,48 @@ impl Chat {
         let mut sticker_turn = super::sticker_reply::StickerTurn::default();
         let mut sticker_searched = false;
         let mut sticker_unavailable = false;
-        // Fetch only after trigger, queue admission and conversation checks.
-        // Keep pixels ephemeral and reuse them for this turn's tool rounds.
-        let visual_generation = if host.config.llm.vision
-            && (stickers_enabled
-                || !job.images.is_empty()
-                || quote.as_ref().is_some_and(|q| q.sender.is_some()))
+        let reply_enabled = definitions
+            .iter()
+            .any(|d| d["function"]["name"] == "reply_message");
+        // Freeze transport identity before reading any source in the batch.
+        let visual_generation = if batch.is_some()
+            || (host.config.llm.vision
+                && (stickers_enabled
+                    || !job.images.is_empty()
+                    || quote.as_ref().is_some_and(|q| q.sender.is_some())))
         {
             Some(host.milky.scope_generation(&job.key.scope)?)
         } else {
             None
         };
+        let batch_media = if let Some(batch) = batch {
+            Some(
+                super::auto_reply::load_media(
+                    host,
+                    &self.ingress,
+                    &job.guard,
+                    batch,
+                    cancel,
+                    &mut references,
+                    reply_enabled,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let batch_quotes = batch_media
+            .as_ref()
+            .map(|m| m.quote_refs.clone())
+            .unwrap_or_default();
+        if let Some(media) = &batch_media {
+            current.push_str(&media.text);
+        }
+        if let Some(generation) = visual_generation {
+            host.milky.check_generation(generation)?;
+        }
+        // Fetch only after trigger, queue admission and conversation checks.
+        // Keep pixels ephemeral and reuse them for this turn's tool rounds.
         let mut quote_image_note = String::new();
         let quote_images = if host.config.llm.vision {
             if let Some(quote) = &quote {
@@ -604,8 +928,11 @@ impl Chat {
             .filter(|(_, images)| !images.is_empty())
             .map(|(quote, images)| (&quote.key, images));
         let quoted_visual_key = quoted_images.map(|(key, _)| key);
-        let has_visual_source = !job.images.is_empty() || quoted_images.is_some();
-        let mut visual = if !host.config.llm.vision && (!job.images.is_empty() || quote.is_some()) {
+        let has_visual_source =
+            batch.is_some() || !job.images.is_empty() || quoted_images.is_some();
+        let mut visual = if let Some(media) = batch_media {
+            media.visual
+        } else if !host.config.llm.vision && (!job.images.is_empty() || quote.is_some()) {
             Loaded {
                 images: vec![],
                 note: "[识图已关闭：仅提供文字，未读取当前消息及引用中的图片，请勿猜测。]".into(),
@@ -636,6 +963,9 @@ impl Chat {
             .max_model_calls
             .min(host.config.limits.max_http_attempts);
         for round in 0..effective_rounds {
+            if let Some(batch) = batch {
+                super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
+            }
             if !search_operations.is_empty() {
                 let operations = search_operations.clone();
                 if host
@@ -729,6 +1059,7 @@ impl Chat {
                 &turn_visual,
             )?;
             references.observe(&input.messages, visible_quote);
+            references.observe_batch_quotes(&batch_quotes);
             sticker_turn.observe(&input.messages);
             if sticker_searched {
                 tracing::info!(
@@ -772,6 +1103,10 @@ impl Chat {
                     (&host.milky, generation),
                     async {
                         check_visual_source(host, job, quoted_visual_key).await?;
+                        if let Some(batch) = batch {
+                            super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch)
+                                .await?;
+                        }
                         sticker_turn
                             .check(host, &job.key.scope)
                             .await
@@ -803,6 +1138,9 @@ impl Chat {
                 result => result?,
             };
             host.usage("chat", &response).await?;
+            if let Some(batch) = batch {
+                super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
+            }
             if has_visual_source {
                 check_visual_source(host, job, quoted_visual_key).await?;
             }
@@ -1483,6 +1821,16 @@ fn system_prompt(
     ))
 }
 
+fn participation_system(mut system: String, automatic: bool) -> String {
+    system.push_str(PARTICIPATION_RULE);
+    system.push_str(if automatic {
+        "\n本轮参与方式：observe"
+    } else {
+        "\n本轮参与方式：direct "
+    });
+    system
+}
+
 fn round_system_prompt(system: &str, tools: &[Value], search_enabled: bool) -> String {
     let has_tool = |name: &str| tools.iter().any(|tool| tool["function"]["name"] == name);
     let can_reply = has_tool("reply_message");
@@ -1933,6 +2281,7 @@ async fn load_context(
     let mentions = job.mentions.clone();
     let tool_calling = host.config.llm.tool_calling;
     let defaults = host.config.plugins.ai.defaults.clone();
+    let batch = job.trigger.as_ref().and_then(|d| d.auto_batch.clone());
     host.store.call(move|c|{
         crate::host::check_guard(c,&g)?;
         let (settings,summary,compacted):(String,String,i64)=c.query_row("SELECT settings,summary,compacted_until FROM ai_conversations WHERE id=?1",[&g.conversation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -1942,12 +2291,15 @@ async fn load_context(
         let (summary,compacted)=if settings.summary {(summary,compacted)} else {(String::new(),0)};
         let (sender,text,nickname,card):(i64,String,Option<String>,Option<String>)=c.query_row("SELECT sender_id,content,sender_nickname,sender_card FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0 AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key)",params![key,g.conversation_id,g.epoch],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         ensure!(sender==actor,"current message sender does not match job actor");
-        let mut current=message_content(sender,nickname.as_deref(),card.as_deref(),&text);
-        if reference_enabled {
-            current=references.local(key,pos,sender,"user",serde_json::from_str(&current)?,&mentions,true)?;
-        }
-        let mut q=c.prepare("SELECT role,sender_id,content,sender_nickname,sender_card,key,inbound_position FROM messages WHERE conversation_id=?1 AND epoch=?2 AND revoked=0 AND role IN('user','assistant') AND COALESCE(origin_plugin,'') NOT IN('control','memory_only') AND inbound_position<?3 AND inbound_position>?4 AND scope=?6 AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key) ORDER BY inbound_position DESC,id DESC LIMIT ?5")?;
-        let rows=q.query_map(params![g.conversation_id,g.epoch,pos,compacted,settings.recent_messages as i64,scope.key()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let current = if let Some(batch) = &batch {
+            super::auto_reply::load_sources(c,&g,&scope,batch,&mut references,reference_enabled)?
+        } else {
+            let content=message_content(sender,nickname.as_deref(),card.as_deref(),&text);
+            if reference_enabled { references.local(key,pos,sender,"user",serde_json::from_str(&content)?,&mentions,true)? } else {content}
+        };
+        let batch_keys=serde_json::to_string(&batch.as_ref().map(|b| b.source_keys()).unwrap_or_default())?;
+        let mut q=c.prepare("SELECT role,sender_id,content,sender_nickname,sender_card,key,inbound_position FROM messages WHERE conversation_id=?1 AND epoch=?2 AND revoked=0 AND role IN('user','assistant') AND COALESCE(origin_plugin,'') NOT IN('control','memory_only') AND inbound_position<?3 AND inbound_position>?4 AND scope=?6 AND key NOT IN(SELECT value FROM json_each(?7)) AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key) ORDER BY inbound_position DESC,id DESC LIMIT ?5")?;
+        let rows=q.query_map(params![g.conversation_id,g.epoch,pos,compacted,settings.recent_messages as i64,scope.key(),batch_keys],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
         let mut history=Vec::new();
         for (role,sender,text,nickname,card,key,position) in rows.into_iter().rev() {
             let content=if reference_enabled {
@@ -1967,6 +2319,43 @@ pub fn triggered(msg: &Incoming, keywords: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_mode_keeps_the_same_history_summary_and_memory_budget_as_direct_mode() {
+        let config = crate::config::Config::default();
+        let scope = Scope {
+            bot_id: 1,
+            scene: Scene::Group,
+            peer_id: 2,
+        };
+        let system = system_prompt(&config, &config.plugins.ai.defaults, &scope, 3).unwrap();
+        let input = |automatic| ContextInput {
+            system: participation_system(system.clone(), automatic),
+            current: "同一份当前输入".into(),
+            history: (0..5)
+                .map(|n| vec![json!({"role":"user","content":format!("{n}{}", "历史".repeat(80))})])
+                .collect(),
+            memories: vec!["偏好白茶".repeat(30), "学习Rust".repeat(30)],
+            summary: "较早的对话摘要".repeat(30),
+            tool_schema: Value::Null,
+            tool_protocol: vec![],
+        };
+        let full = build_context(input(false), usize::MAX)
+            .unwrap()
+            .estimated_tokens;
+        let mut trimmed = false;
+        for budget in [full, full - 300, full - 800, full - 1600] {
+            let direct = build_context(input(false), budget).unwrap();
+            let automatic = build_context(input(true), budget).unwrap();
+            assert_eq!(direct.estimated_tokens, automatic.estimated_tokens);
+            assert_eq!(&direct.messages[1..], &automatic.messages[1..]);
+            trimmed |= direct.estimated_tokens < full;
+        }
+        assert!(
+            trimmed,
+            "exercise actual budget trimming, not just equal config values"
+        );
+    }
 
     #[tokio::test]
     async fn web_search_roundtrip_binds_sources_for_both_reply_paths_and_survives_provider_failure()
@@ -3051,7 +3440,11 @@ mod tests {
                 trigger: None,
                 position: guard.epoch,
                 guard,
-                _queued: permits.clone().try_acquire_owned().unwrap(),
+                first_queued: Instant::now(),
+                ready_at: Instant::now(),
+                _queued: Arc::new(Mutex::new(Some(
+                    permits.clone().try_acquire_owned().unwrap(),
+                ))),
             };
             let cancel = CancellationToken::new();
             let mut session = Session {
@@ -3063,6 +3456,10 @@ mod tests {
                     conversation_id: "chat".into(),
                     epoch: active_epoch,
                 }),
+                active_automatic: false,
+                active_queued: None,
+                active_auto_sources: vec![],
+                wake: Arc::new(Notify::new()),
                 touched: 0,
             };
             // A new epoch was queued/running after a reset committed but before

@@ -96,6 +96,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/qq/qrcode", post(qq_qrcode))
         .route("/api/qq/contacts", get(qq_contacts))
         .route("/api/qq/contacts/toggle", post(toggle_contact))
+        .route("/api/qq/contacts/auto-reply", post(toggle_auto_reply))
         .route(
             "/api/plugins/scope",
             get(scope_plugins).post(toggle_scope_plugin),
@@ -353,6 +354,22 @@ async fn toggle_contact(
             .spawn(async move { Ok(serde_json::to_value(s.contacts.set_enabled(v).await?)?) })
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("开关操作异常，请刷新列表核对状态"))),
+    )
+}
+async fn toggle_auto_reply(
+    State(s): State<Arc<AdminState>>,
+    Json(v): Json<contacts::ToggleRequest>,
+) -> Response {
+    result(
+        s.mutations
+            .clone()
+            .spawn(async move {
+                Ok(serde_json::to_value(
+                    s.contacts.set_auto_reply_enabled(v).await?,
+                )?)
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("自动接话开关操作异常，请刷新列表核对状态"))),
     )
 }
 async fn scope_plugins(

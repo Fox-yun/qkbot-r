@@ -65,6 +65,7 @@ pub struct ContactView {
     pub name: String,
     pub remark: String,
     pub enabled: bool,
+    pub auto_reply_enabled: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactsView {
@@ -233,6 +234,12 @@ impl ContactsService {
             .map_err(|_| ContactsError::Offline)?
             .into_iter()
             .collect();
+        let auto_reply: HashSet<Scope> = access
+            .auto_reply_scopes(bot_id)
+            .await
+            .map_err(|_| ContactsError::Offline)?
+            .into_iter()
+            .collect();
         // Include database wait time inside the account/configuration fence.
         if client
             .current_account()
@@ -249,6 +256,11 @@ impl ContactsService {
             name: contact.name.clone(),
             remark: contact.remark.clone(),
             enabled: !disabled.contains(&Scope {
+                bot_id,
+                scene,
+                peer_id: contact.id,
+            }),
+            auto_reply_enabled: auto_reply.contains(&Scope {
                 bot_id,
                 scene,
                 peer_id: contact.id,
@@ -273,6 +285,14 @@ impl ContactsService {
     }
 
     pub async fn set_enabled(&self, request: ToggleRequest) -> Result<ToggleView> {
+        self.set_switch(request, false).await
+    }
+
+    pub async fn set_auto_reply_enabled(&self, request: ToggleRequest) -> Result<ToggleView> {
+        self.set_switch(request, true).await
+    }
+
+    async fn set_switch(&self, request: ToggleRequest, auto_reply: bool) -> Result<ToggleView> {
         let bot_id = parse_id(&request.bot_id)?;
         let peer_id = parse_id(&request.peer_id)?;
         let scope = Scope {
@@ -290,10 +310,7 @@ impl ContactsService {
                     .await
                     .map_err(|_| ContactsError::Offline)?,
             );
-            access
-                .set_enabled(scope.clone(), false)
-                .await
-                .map_err(|_| ContactsError::Offline)?;
+            persist_switch(&access, scope.clone(), false, auto_reply).await?;
             self.runtime.cancel_scopes(&[scope.key()]).await;
             return Ok(ToggleView {
                 bot_id: bot_id.to_string(),
@@ -335,10 +352,7 @@ impl ContactsService {
         }
         self.unchanged(version).await?;
         // Persistence is keyed by the verified account, never a global peer ID.
-        access
-            .set_enabled(scope.clone(), request.enabled)
-            .await
-            .map_err(|_| ContactsError::Offline)?;
+        persist_switch(&access, scope.clone(), request.enabled, auto_reply).await?;
         self.runtime.cancel_scopes(&[scope.key()]).await;
         state.cached = Some(CachedContacts {
             completed_at: Instant::now(),
@@ -396,6 +410,20 @@ impl ContactsService {
         drop(config);
         result
     }
+}
+
+async fn persist_switch(
+    access: &AccessStore,
+    scope: Scope,
+    enabled: bool,
+    auto_reply: bool,
+) -> Result<()> {
+    if auto_reply {
+        access.set_auto_reply_enabled(scope, enabled).await
+    } else {
+        access.set_enabled(scope, enabled).await
+    }
+    .map_err(|_| ContactsError::Offline.into())
 }
 
 fn parse_id(value: &str) -> Result<i64> {

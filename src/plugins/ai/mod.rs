@@ -1,3 +1,4 @@
+pub(crate) mod auto_reply;
 pub mod chat;
 pub mod memory;
 pub mod memory_rebuild;

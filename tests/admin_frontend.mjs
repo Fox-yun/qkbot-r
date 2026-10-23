@@ -301,13 +301,60 @@ test("true logout calls the server before removing local session", async () => {
 
 const contacts = (botId = "123", count = 1) => ({
   bot_id: botId, fetched_at: 1800000000,
-  groups: Array.from({ length: count }, (_, index) => ({ id: String(1000 + index), name: "群 " + index, remark: index === 0 ? "<img>测试备注" : "", enabled: true })),
-  friends: [{ id: "789", name: "小明", remark: "朋友备注", enabled: true }],
+  groups: Array.from({ length: count }, (_, index) => ({ id: String(1000 + index), name: "群 " + index, remark: index === 0 ? "<img>测试备注" : "", enabled: true, auto_reply_enabled: false })),
+  friends: [{ id: "789", name: "小明", remark: "朋友备注", enabled: true, auto_reply_enabled: false }],
 });
 async function contactPage(h, data = contacts()) {
   await h.login(); h.app.state.view = "contacts";
   h.setHandler(async () => ({ body: data })); await h.app.loadContacts();
 }
+
+test("auto reply is off by default and saves only the selected group or friend", async () => {
+  const h = harness(); await contactPage(h);
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]')[0].checked, false);
+  h.setHandler(async (_path, options) => ({ body: JSON.parse(options.body) }));
+  await h.app.toggleContact("group", "1000", true, true);
+  assert.equal(h.calls.at(-1).path, "/api/qq/contacts/auto-reply");
+  assert.equal(h.calls.at(-1).options.headers["X-CSRF-Token"], "csrf-test");
+  assert.deepEqual(h.calls.at(-1).body, { bot_id: "123", scene: "group", peer_id: "1000", enabled: true });
+  assert.equal(h.app.state.contacts.groups[0].auto_reply_enabled, true);
+  assert.equal(h.app.state.contacts.friends[0].auto_reply_enabled, false);
+  assert.equal(h.app.state.contacts.groups[0].enabled, true);
+  await h.ids.get("contacts-friends").emit("click");
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]')[0].checked, false);
+  await h.app.toggleContact("friend", "789", true, true);
+  assert.equal(h.calls.at(-1).body.scene, "friend");
+  assert.equal(h.app.state.contacts.friends[0].auto_reply_enabled, true);
+  await h.app.toggleContact("friend", "789", false, true);
+  assert.match(h.ids.get("contacts-message").textContent, /私聊仍可正常直接对话/u);
+});
+
+test("auto reply failed and stale responses cannot change a different contact or session", async () => {
+  const h = harness(); await contactPage(h);
+  h.setHandler(async () => ({ body: { bot_id: "123", scene: "friend", peer_id: "1000", enabled: true } }));
+  await h.app.toggleContact("group", "1000", true, true);
+  assert.equal(h.app.state.contacts.groups[0].auto_reply_enabled, false);
+  assert.equal(h.app.state.contacts.phase, "uncertain");
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]')[0].disabled, true);
+  h.setHandler(async () => ({ body: contacts() })); await h.app.loadContacts(true);
+  let finish; h.setHandler(() => new Promise((resolve) => { finish = resolve; }));
+  const pending = h.app.toggleContact("group", "1000", true, true); await Promise.resolve();
+  h.app.clearSession(); finish({ body: { bot_id: "123", scene: "group", peer_id: "1000", enabled: true } }); await pending;
+  assert.equal(h.app.state.contacts.groups.length, 0);
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]').length, 0);
+});
+
+test("cached contacts permit disabling auto reply but require live refresh to enable it", async () => {
+  const h = harness(), data = contacts(); data.groups[0].auto_reply_enabled = true; await contactPage(h, data);
+  h.setHandler(async () => ({ status: 502, body: { code: "contacts_offline", error: "offline" } })); await h.app.loadContacts(true);
+  assert.equal(h.app.state.contacts.phase, "cached");
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]')[0].disabled, false);
+  h.setHandler(async (_path, options) => ({ body: JSON.parse(options.body) }));
+  await h.app.toggleContact("group", "1000", false, true);
+  const count = h.calls.length; await h.app.toggleContact("group", "1000", true, true);
+  assert.equal(h.calls.length, count); assert.equal(h.app.state.contacts.groups[0].auto_reply_enabled, false);
+  assert.equal(h.document.querySelectorAll('[data-contact-auto-reply]')[0].disabled, true);
+});
 
 test("contacts work while bot is stopped, paginate and search without additional polling", async () => {
   const h = harness(); await h.login();
