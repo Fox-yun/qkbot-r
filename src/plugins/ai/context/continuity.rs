@@ -279,6 +279,27 @@ impl ContinuityGuard {
         self.turns.extend(other.turns.iter().cloned());
     }
 
+    fn validate_read_policy(&self, db: &Connection, defaults: &AiSettings) -> Result<()> {
+        let conversations = self
+            .sources
+            .iter()
+            .map(|source| &source.conversation_id)
+            .collect::<BTreeSet<_>>();
+        for id in conversations {
+            let settings: String = db.query_row(
+                "SELECT settings FROM ai_conversations WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            let effective = super::super::resolve_settings(defaults, &settings)?;
+            ensure!(
+                !effective.paused && effective.memory_read,
+                "continuity source read policy is disabled"
+            );
+        }
+        Ok(())
+    }
+
     pub fn add_source_key(&mut self, key: impl Into<String>) {
         self.roots.insert(key.into());
     }
@@ -525,7 +546,12 @@ fn neighbor_keys(
     }
     let seconds = i64::try_from(config.neighbor_seconds).unwrap_or(i64::MAX);
     let low = turn.request.check.received_at.saturating_sub(seconds);
-    let high = turn.request.check.received_at.saturating_add(seconds);
+    let high = turn
+        .request
+        .check
+        .received_at
+        .saturating_add(seconds)
+        .min(request.received_at);
     let mut result = Vec::new();
     for (before, maximum, relation) in [
         (true, config.neighbors_before, "neighbor_before"),
@@ -608,6 +634,9 @@ pub fn recall(
         let Ok(turn) = load_turn(db, &question, &reply, completed, &encoded) else {
             continue;
         };
+        if turn.guard.validate_read_policy(db, defaults).is_err() {
+            continue;
+        }
         if !super::reply_is_valid(db, &reply)? {
             continue;
         }
@@ -670,6 +699,33 @@ pub fn recall(
         });
     }
     Ok(documents)
+}
+
+/// A policy change expires derived output without revoking the original user
+/// evidence used by long-term knowledge. The caller advances only the changed
+/// conversation epoch; explicit overrides in other conversations remain intact.
+pub(super) fn invalidate_conversation_replies(db: &Connection, conversation: &str) -> Result<()> {
+    let affected = db
+        .prepare(
+            "WITH RECURSIVE affected(key) AS (
+                SELECT key FROM messages WHERE conversation_id=?1 AND role='assistant'
+                UNION
+                SELECT d.derived_key FROM ai_context_dependencies d JOIN affected a ON d.source_key=a.key
+            ) SELECT key FROM affected",
+        )?
+        .query_map([conversation], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for key in affected {
+        db.execute(
+            "INSERT OR IGNORE INTO ai_context_invalidated(source_key,invalidated_at) VALUES(?1,?2)",
+            params![key, now()],
+        )?;
+        db.execute(
+            "UPDATE ai_recent_turns SET invalidated=1 WHERE reply_key=?1",
+            [key],
+        )?;
+    }
+    Ok(())
 }
 
 /// Use within the caller's recall/forget transaction. Tombstones and reverse
@@ -863,6 +919,374 @@ mod tests {
             neighbor_budget: 15_000,
             ..ContextConfig::default()
         }
+    }
+
+    fn document(document: &ContinuityDocument) -> Value {
+        serde_json::from_str(document.text.split_once('\n').unwrap().1).unwrap()
+    }
+
+    #[test]
+    fn default_neighbor_counts_are_ten_before_and_five_after_when_budget_fits() {
+        let db = database();
+        for id in 80..100 {
+            message(&db, id, "1:group:10", 8, "短", false);
+        }
+        message(&db, 100, "1:group:10", 7, "问题", true);
+        answer(&db, 101, 100, &ContinuityGuard::default(), "confirmed").unwrap();
+        for id in 102..112 {
+            message(&db, id, "1:group:10", 9, "短", false);
+        }
+        let req = request(&db, 200);
+        let docs = recall(&db, &req, &config(), &AiSettings::default()).unwrap();
+        assert_eq!(docs.len(), 1);
+        let value = document(&docs[0]);
+        let neighbors = value["neighbors"].as_array().unwrap();
+        let positions = neighbors
+            .iter()
+            .map(|n| n["position"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(positions, (90..100).chain(102..107).collect::<Vec<_>>());
+        assert_eq!(
+            neighbors
+                .iter()
+                .filter(|n| n["relation"] == "neighbor_before")
+                .count(),
+            10
+        );
+        assert_eq!(
+            neighbors
+                .iter()
+                .filter(|n| n["relation"] == "neighbor_after")
+                .count(),
+            5
+        );
+        assert!(neighbors.iter().all(|n| n["sender_id"] != 7));
+        assert_eq!(
+            docs[0].estimated_tokens,
+            message_cost(&docs[0].text).unwrap()
+        );
+    }
+
+    #[test]
+    fn default_budget_reports_actual_neighbor_balance_and_complete_turn_coverage() {
+        let db = database();
+        message(&db, 50, "1:group:10", 7, "较早问题", true);
+        answer(&db, 51, 50, &ContinuityGuard::default(), "confirmed").unwrap();
+        for id in 90..100 {
+            message(&db, id, "1:group:10", 8, "短", false);
+        }
+        message(&db, 100, "1:group:10", 7, "问题", true);
+        answer(&db, 101, 100, &ContinuityGuard::default(), "confirmed").unwrap();
+        for id in 102..107 {
+            message(&db, id, "1:group:10", 9, "短", false);
+        }
+        let req = request(&db, 200);
+        let policy = ContextConfig::default();
+        let docs = recall(&db, &req, &policy, &AiSettings::default()).unwrap();
+        let mut before = 0;
+        let mut after = 0;
+        let mut neighbor_bytes = 0;
+        let mut keys = BTreeSet::new();
+        for doc in &docs {
+            let mut value = document(doc);
+            assert_eq!(value["anchor_question"]["role"], "user");
+            assert_eq!(value["anchor_reply"]["role"], "assistant");
+            assert!(
+                !value["anchor_question"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!value["anchor_reply"]["text"].as_str().unwrap().is_empty());
+            for relation in ["anchor_question", "anchor_reply"] {
+                assert!(keys.insert(value[relation]["source_key"].as_str().unwrap().to_owned()));
+            }
+            for neighbor in value["neighbors"].as_array().unwrap() {
+                before += usize::from(neighbor["relation"] == "neighbor_before");
+                after += usize::from(neighbor["relation"] == "neighbor_after");
+                assert!(keys.insert(neighbor["source_key"].as_str().unwrap().to_owned()));
+            }
+            value["neighbors"] = json!([]);
+            let without_neighbors = format!(
+                "{}\n{}",
+                doc.text.split_once('\n').unwrap().0,
+                serde_json::to_string(&value).unwrap()
+            );
+            neighbor_bytes += doc.estimated_tokens - message_cost(&without_neighbors).unwrap();
+            assert_eq!(doc.estimated_tokens, message_cost(&doc.text).unwrap());
+            doc.guard.validate(&db).unwrap();
+        }
+        let total_bytes = docs.iter().map(|doc| doc.estimated_tokens).sum::<usize>();
+        assert!(total_bytes <= policy.recall_budget);
+        assert!(neighbor_bytes <= policy.neighbor_budget);
+        assert!(docs.len() <= policy.max_turns);
+        assert!(before <= policy.neighbors_before * docs.len());
+        assert!(after <= policy.neighbors_after * docs.len());
+        let without_neighbors = ContextConfig {
+            neighbor_budget: 0,
+            ..policy
+        };
+        let pairs = recall(&db, &req, &without_neighbors, &AiSettings::default()).unwrap();
+        assert!(pairs.len() >= docs.len());
+        println!(
+            "synthetic default continuity: selected_turns={}, before={before}, after={after}, total_bytes={total_bytes}, neighbor_bytes={neighbor_bytes}, turns_without_neighbors={}, pair_bytes_without_neighbors={}",
+            docs.len(),
+            pairs.len(),
+            pairs.iter().map(|doc| doc.estimated_tokens).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn neighbor_timestamp_never_exceeds_current_request_or_ingestion_watermark() {
+        let db = database();
+        let timestamp = now();
+        message(&db, 10, "1:group:10", 7, "问题", true);
+        db.execute(
+            "UPDATE messages SET received_at=?1 WHERE id=10",
+            [timestamp - 30],
+        )
+        .unwrap();
+        answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+        message(&db, 12, "1:group:10", 9, "时钟异常邻域", false);
+        db.execute(
+            "UPDATE messages SET received_at=?1 WHERE id=12",
+            [timestamp + 30],
+        )
+        .unwrap();
+        let mut req = request(&db, 100);
+        req.received_at = timestamp;
+        let docs = recall(&db, &req, &config(), &AiSettings::default()).unwrap();
+        assert_eq!(docs.len(), 1);
+        let value = document(&docs[0]);
+        let neighbors = value["neighbors"].as_array().unwrap();
+        assert!(
+            neighbors
+                .iter()
+                .all(|neighbor| neighbor["position"].as_i64().unwrap() < req.request_position)
+        );
+        let future_timestamps = neighbors
+            .iter()
+            .filter(|neighbor| neighbor["received_at"].as_i64().unwrap() > req.received_at)
+            .count();
+        assert_eq!(future_timestamps, 0);
+        println!(
+            "synthetic clock boundary: neighbors_after_current_received_at={future_timestamps}, neighbors={}",
+            neighbors.len()
+        );
+    }
+
+    #[test]
+    fn neighbor_time_endpoints_are_inclusive_and_ingestion_watermark_is_strict() {
+        let db = database();
+        let timestamp = now();
+        for (id, offset) in [(5, -121), (6, -120), (7, 120)] {
+            message(&db, id, "1:group:10", 8, "前文", false);
+            db.execute(
+                "UPDATE messages SET received_at=?1 WHERE id=?2",
+                params![timestamp + offset, id],
+            )
+            .unwrap();
+        }
+        message(&db, 10, "1:group:10", 7, "问题", true);
+        db.execute(
+            "UPDATE messages SET received_at=?1 WHERE id=10",
+            [timestamp],
+        )
+        .unwrap();
+        answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+        for (id, offset) in [(12, 120), (13, 121), (14, -120), (15, -121)] {
+            message(&db, id, "1:group:10", 9, "后文", false);
+            db.execute(
+                "UPDATE messages SET received_at=?1 WHERE id=?2",
+                params![timestamp + offset, id],
+            )
+            .unwrap();
+        }
+        let mut req = request(&db, 100);
+        req.received_at = timestamp + 120;
+        message(&db, 101, "1:group:10", 9, "水位后的消息", false);
+        db.execute(
+            "UPDATE messages SET received_at=?1 WHERE id=101",
+            [timestamp],
+        )
+        .unwrap();
+        let docs = recall(&db, &req, &config(), &AiSettings::default()).unwrap();
+        let value = document(&docs[0]);
+        let neighbors = value["neighbors"].as_array().unwrap();
+        assert_eq!(
+            neighbors
+                .iter()
+                .map(|n| n["position"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![6, 7, 12, 14]
+        );
+        assert!(
+            neighbors
+                .iter()
+                .all(|n| n["position"].as_i64().unwrap() < req.request_position)
+        );
+    }
+
+    #[test]
+    fn source_scope_plugin_mode_display_and_reply_mutations_expire_frozen_documents() {
+        for mutation in [
+            "INSERT INTO scope_access VALUES('1:group:10',1,1)",
+            "INSERT INTO scope_plugin_access VALUES('1:group:10','ai',0,1)",
+            "INSERT INTO scope_plugin_access VALUES('1:group:10','ai',1,1)",
+            "UPDATE ai_scope_modes SET revision=1 WHERE scope='1:group:10'",
+            "UPDATE ai_scope_modes SET mode='user',revision=1 WHERE scope='1:group:10'",
+            "UPDATE ai_conversations SET settings='{\"memory_read\":false}' WHERE scope='1:group:10'",
+            "UPDATE ai_conversations SET settings='{\"paused\":true}' WHERE scope='1:group:10'",
+            "UPDATE messages SET sender_nickname='变化的显示名' WHERE id=10",
+            "UPDATE messages SET revoked=1 WHERE id=11",
+            "UPDATE messages SET sender_id=2 WHERE id=11",
+            "DELETE FROM messages WHERE id=10",
+            "DELETE FROM messages WHERE id=11",
+        ] {
+            let db = database();
+            message(&db, 10, "1:group:10", 7, "问题", true);
+            answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+            let req = request(&db, 100);
+            let docs = recall(&db, &req, &config(), &AiSettings::default()).unwrap();
+            assert_eq!(docs.len(), 1, "before mutation {mutation}");
+            db.execute_batch(mutation).unwrap();
+            assert!(docs[0].guard.validate(&db).is_err(), "{mutation}");
+            assert!(
+                recall(&db, &req, &config(), &AiSettings::default())
+                    .unwrap()
+                    .is_empty(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_memory_read_and_paused_policy_are_applied_before_neighbor_expansion() {
+        for settings in ["{\"memory_read\":false}", "{\"paused\":true}"] {
+            let db = database();
+            db.execute(
+                "UPDATE ai_conversations SET settings=?1 WHERE scope='1:group:10'",
+                [settings],
+            )
+            .unwrap();
+            message(&db, 5, "1:group:10", 8, "不应携带的邻域", false);
+            message(&db, 10, "1:group:10", 7, "不应接续的问题", true);
+            answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+            let req = request(&db, 100);
+            assert!(
+                recall(&db, &req, &config(), &AiSettings::default())
+                    .unwrap()
+                    .is_empty(),
+                "{settings}"
+            );
+        }
+        let db = database();
+        message(&db, 10, "1:group:10", 7, "继承默认读取设置", true);
+        answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+        let req = request(&db, 100);
+        let defaults = AiSettings {
+            memory_read: false,
+            ..AiSettings::default()
+        };
+        assert!(recall(&db, &req, &config(), &defaults).unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_default_memory_read_change_rejects_indirectly_recalled_source_material() {
+        let db = database();
+        // A inherits defaults. B and the destination C explicitly permit reads,
+        // so changing the default must still reach A's inherited dependency.
+        db.execute("UPDATE ai_conversations SET settings='{\"memory_read\":true,\"paused\":false}' WHERE scope IN ('1:group:20','1:group:30')", []).unwrap();
+        message(&db, 10, "1:group:10", 7, "仅用于合成测试的原文A", true);
+        answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+        let first_request = request(&db, 100);
+        let inherited = recall(&db, &first_request, &config(), &AiSettings::default()).unwrap();
+        assert_eq!(inherited.len(), 1);
+        let reply = answer(&db, 101, 100, &inherited[0].guard, "confirmed").unwrap();
+        // Freeze the synthetic B output as if it were a real model response
+        // repeating A. Re-register after replacing the fixture's generic text.
+        db.execute(
+            "UPDATE messages SET content='在B转述：仅用于合成测试的原文A' WHERE key=?1",
+            [&reply],
+        )
+        .unwrap();
+        db.execute("DELETE FROM ai_recent_turns WHERE reply_key=?1", [&reply])
+            .unwrap();
+        assert!(register_reply(&db, 100, &reply, &inherited[0].guard).unwrap());
+        message(&db, 200, "1:group:30", 7, "在C继续", true);
+        let req = RecallRequest {
+            guard: ContextGuard {
+                conversation_id: "1:group:30:v0:user:7".into(),
+                epoch: 1,
+            },
+            scope: Scope {
+                bot_id: 1,
+                scene: Scene::Group,
+                peer_id: 30,
+            },
+            actor_id: 7,
+            request_position: 200,
+            received_at: now(),
+            read_group_background: false,
+        };
+        let defaults = AiSettings {
+            memory_read: false,
+            ..AiSettings::default()
+        };
+        assert!(
+            !super::super::super::resolve_settings(&defaults, "{}")
+                .unwrap()
+                .memory_read
+        );
+        assert!(
+            super::super::super::resolve_settings(&defaults, "{\"memory_read\":true}")
+                .unwrap()
+                .memory_read
+        );
+        for defaults in [
+            defaults,
+            AiSettings {
+                paused: true,
+                ..AiSettings::default()
+            },
+        ] {
+            let docs = recall(&db, &req, &config(), &defaults).unwrap();
+            let carried_disabled_source = docs
+                .iter()
+                .filter(|doc| doc.text.contains("仅用于合成测试的原文A"))
+                .count();
+            println!(
+                "synthetic inherited default-policy boundary: selected_turns={}, carrying_disabled_source={carried_disabled_source}",
+                docs.len()
+            );
+            assert!(
+                docs.is_empty(),
+                "an explicitly allowed intermediary must not carry material from a source whose effective read policy is now disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn current_request_identity_must_match_actor_bot_conversation_and_epoch() {
+        let db = database();
+        message(&db, 10, "1:group:10", 7, "问题", true);
+        answer(&db, 11, 10, &ContinuityGuard::default(), "confirmed").unwrap();
+        let req = request(&db, 100);
+        let mut changed = req.clone();
+        changed.actor_id = 8;
+        assert!(recall(&db, &changed, &config(), &AiSettings::default()).is_err());
+        let mut changed = req.clone();
+        changed.scope.bot_id = 2;
+        assert!(recall(&db, &changed, &config(), &AiSettings::default()).is_err());
+        let mut changed = req.clone();
+        changed.guard.conversation_id = "1:group:10:v0:group".into();
+        assert!(recall(&db, &changed, &config(), &AiSettings::default()).is_err());
+        let mut changed = req.clone();
+        changed.guard.epoch = 2;
+        assert!(recall(&db, &changed, &config(), &AiSettings::default()).is_err());
+        db.execute("UPDATE messages SET revoked=1 WHERE id=100", [])
+            .unwrap();
+        assert!(recall(&db, &req, &config(), &AiSettings::default()).is_err());
     }
 
     #[test]

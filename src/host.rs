@@ -77,6 +77,7 @@ impl Host {
         )
         .with_global_memory_shared(config.plugins.ai.global_memory_shared);
         memory.init().await?;
+        crate::plugins::ai::context::configure_policy(&store, &config.plugins.ai.defaults).await?;
         crate::plugins::ai::semantic::init(&store).await?;
         let embedding = if config.embedding.enabled && config.plugins.ai.enabled {
             Some(crate::embedding::Embedding::new(config.embedding.clone())?)

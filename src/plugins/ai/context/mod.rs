@@ -20,9 +20,80 @@ use tokio_util::sync::CancellationToken;
 const SCHEMA: &str = "CREATE TABLE ai_context_reply_dependencies(reply_key TEXT PRIMARY KEY, dependencies TEXT NOT NULL);
 CREATE TABLE ai_context_summary_dependencies(conversation_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, dependencies TEXT NOT NULL);";
 
+const POLICY_SCHEMA: &str = "CREATE TABLE ai_context_policy(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    memory_read INTEGER NOT NULL CHECK(memory_read IN (0,1)),
+    paused INTEGER NOT NULL CHECK(paused IN (0,1)));";
+
 pub async fn init(store: &Store) -> Result<()> {
     continuity::init(store).await?;
-    store.migrate("ai_context_dependencies", 1, SCHEMA).await
+    store.migrate("ai_context_dependencies", 1, SCHEMA).await?;
+    store
+        .migrate("ai_context_dependencies", 2, POLICY_SCHEMA)
+        .await
+}
+
+/// Global defaults live outside the conversation row. Persist their relevant
+/// policy so application restarts cannot silently reuse a now-forbidden epoch.
+pub async fn configure_policy(store: &Store, defaults: &AiSettings) -> Result<()> {
+    let defaults = defaults.clone();
+    store
+        .call(move |db| configure_policy_in_transaction(db, &defaults))
+        .await
+}
+
+fn configure_policy_in_transaction(db: &mut Connection, defaults: &AiSettings) -> Result<()> {
+    let tx = db.transaction()?;
+    let previous: Option<(bool, bool)> = tx
+        .query_row(
+            "SELECT memory_read,paused FROM ai_context_policy WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let old = previous.unwrap_or((true, false));
+    let current = (defaults.memory_read, defaults.paused);
+    if previous == Some(current) {
+        tx.commit()?;
+        return Ok(());
+    }
+    let conversations = tx
+        .prepare("SELECT id,settings FROM ai_conversations ORDER BY id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, settings) in conversations {
+        let old_effective = effective_read_policy(old, &settings)?;
+        let effective = effective_read_policy(current, &settings)?;
+        if old_effective != effective || (previous.is_none() && (!effective.0 || effective.1)) {
+            continuity::invalidate_conversation_replies(&tx, &id)?;
+            // Do not carry old raw messages into the new epoch. Re-enabling a
+            // default later must not revive a source disabled by this change.
+            tx.execute("UPDATE ai_conversations SET epoch=epoch+1,summary='',compacted_until=0,memory_processed_until=0,memory_revision=memory_revision+1 WHERE id=?1", [&id])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO ai_context_policy(id,memory_read,paused) VALUES(1,?1,?2)
+        ON CONFLICT(id) DO UPDATE SET memory_read=excluded.memory_read,paused=excluded.paused",
+        params![current.0, current.1],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn effective_read_policy(defaults: (bool, bool), settings: &str) -> Result<(bool, bool)> {
+    let settings: serde_json::Value = serde_json::from_str(settings)?;
+    ensure!(settings.is_object(), "conversation policy is invalid");
+    let field = |name: &str, default: bool| -> Result<bool> {
+        settings.get(name).map_or(Ok(default), |value| {
+            value.as_bool().context("conversation policy is invalid")
+        })
+    };
+    Ok((
+        field("memory_read", defaults.0)?,
+        field("paused", defaults.1)?,
+    ))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,7 +239,7 @@ fn dependency_tables_exist(db: &Connection) -> Result<bool> {
 pub fn reply_is_valid(db: &Connection, key: &str) -> Result<bool> {
     let mut guard = ContextDependencyGuard::default();
     Ok(guard
-        .inherit_replies(db, &[key.to_owned()])
+        .include_sources(db, &[key.to_owned()])
         .and_then(|()| guard.validate(db))
         .is_ok())
 }

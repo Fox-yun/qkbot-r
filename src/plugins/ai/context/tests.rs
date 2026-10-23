@@ -656,3 +656,152 @@ async fn malformed_saved_dependencies_fail_closed() {
         .await
         .unwrap();
 }
+
+fn policy_state(db: &Connection, id: &str) -> Result<(i64, String, i64, i64, i64)> {
+    Ok(db.query_row(
+        "SELECT epoch,summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id=?1",
+        [id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    )?)
+}
+
+#[tokio::test]
+async fn first_policy_install_preserves_allowed_history_and_expires_legacy_restrictions() {
+    let (store, _) = database().await;
+    store.call(|db| {
+        db.execute("UPDATE ai_conversations SET summary='allowed',compacted_until=10,memory_processed_until=10 WHERE id=?1",[CONVERSATION])?;
+        for (id, settings) in [("read-disabled", "{\"memory_read\":false}"), ("paused", "{\"paused\":true}")] {
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,settings,summary,compacted_until,memory_processed_until) VALUES(?1,?2,'group',?3,'legacy',10,10)",params![id,SOURCE_SCOPE,settings])?;
+        }
+        Ok(())
+    }).await.unwrap();
+    configure_policy(&store, &AiSettings::default())
+        .await
+        .unwrap();
+    configure_policy(&store, &AiSettings::default())
+        .await
+        .unwrap();
+    store
+        .call(|db| {
+            assert_eq!(
+                policy_state(db, CONVERSATION)?,
+                (1, "allowed".into(), 10, 10, 1)
+            );
+            for id in ["read-disabled", "paused"] {
+                assert_eq!(policy_state(db, id)?, (2, String::new(), 0, 0, 1));
+            }
+            let rows: i64 = db.query_row("SELECT count(*) FROM ai_context_policy", [], |row| {
+                row.get(0)
+            })?;
+            assert_eq!(rows, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn default_policy_changes_expire_only_effective_conversations_and_never_revive_outputs() {
+    let (store, _) = database().await;
+    learning::init(&store).await.unwrap();
+    store.call(|db| {
+        let source=message(db,1,"user",1)?;
+        let original=message(db,2,"assistant",1)?;
+        save_reply_guard(db,&original,&ContextDependencyGuard::default())?;
+        db.execute("INSERT INTO ai_conversations(id,scope,mode,settings,summary) VALUES('explicit','1:group:30','group','{\"memory_read\":true,\"paused\":false}','derived summary')",[])?;
+        db.execute("INSERT INTO messages(id,key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,origin_plugin) VALUES(3,'1:group:30:3','1:group:30','explicit',1,1,'assistant','derived',?1,3,'ai')",[now()])?;
+        save_reply_guard(db,"1:group:30:3",&ContextDependencyGuard::default())?;
+        db.execute("INSERT INTO ai_context_dependencies(derived_key,source_key,bot_id) VALUES('1:group:30:3',?1,1)",[&original])?;
+        let mut summary=ContextDependencyGuard::default();
+        summary.include_sources(db,&[original])?;
+        db.execute("INSERT INTO ai_context_summary_dependencies VALUES('explicit',1,?1)",[serde_json::to_string(&summary)?])?;
+        db.execute("UPDATE ai_conversations SET summary='original summary',compacted_until=2,memory_processed_until=2 WHERE id=?1",[CONVERSATION])?;
+        db.execute("INSERT INTO ai_memory_provenance(memory_id,source_key,quote) VALUES(1,?1,'kept evidence')",[&source])?;
+        db.execute("INSERT INTO ai_learning_notes(id,bot_id,kind,text,scope,locked,updated_at) VALUES(1,1,'experience','kept note','shared',1,1)",[])?;
+        db.execute("INSERT INTO ai_learning_sources(note_id,source_key,detail) VALUES(1,?1,'kept evidence')",[source])?;
+        Ok(())
+    }).await.unwrap();
+    let mut defaults = AiSettings::default();
+    configure_policy(&store, &defaults).await.unwrap();
+    defaults.memory_read = false;
+    configure_policy(&store, &defaults).await.unwrap();
+    store.call(|db| {
+        assert_eq!(policy_state(db,CONVERSATION)?,(2,String::new(),0,0,2));
+        assert_eq!(policy_state(db,"explicit")?,(1,"derived summary".into(),0,0,0));
+        assert!(!reply_is_valid(db,&format!("{SOURCE_SCOPE}:2"))?);
+        assert!(!reply_is_valid(db,"1:group:30:3")?);
+        assert!(summary_guard(db,&ContextGuard{conversation_id:"explicit".into(),epoch:1}).is_err());
+        let mut knowledge=ContextDependencyGuard::default();
+        knowledge.include_memories(db,&[1])?;
+        knowledge.validate(db)?;
+        let note:(String,i64,bool,bool,bool)=db.query_row("SELECT text,version,locked,deleted,invalidated FROM ai_learning_notes WHERE id=1",[],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        assert_eq!(note,("kept note".into(),1,true,false,false));
+        let memory:(String,i64,bool)=db.query_row("SELECT text,version,locked FROM ai_memories WHERE id=1",[],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        assert_eq!(memory,("管理员补充的资料".into(),1,true));
+        let raw:(i64,i64)=db.query_row("SELECT count(*),sum(epoch=1) FROM messages",[],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        assert_eq!(raw,(3,3));
+        let users_invalidated:i64=db.query_row("SELECT count(*) FROM ai_context_invalidated i JOIN messages m ON m.key=i.source_key WHERE m.role='user'",[],|row| row.get(0))?;
+        assert_eq!(users_invalidated,0);
+        Ok(())
+    }).await.unwrap();
+    defaults.memory_read = true;
+    configure_policy(&store, &defaults).await.unwrap();
+    configure_policy(&store, &defaults).await.unwrap();
+    defaults.input_budget *= 2;
+    defaults.persona = "a different persona".into();
+    configure_policy(&store, &defaults).await.unwrap();
+    store
+        .call(|db| {
+            assert_eq!(policy_state(db, CONVERSATION)?, (3, String::new(), 0, 0, 3));
+            assert_eq!(policy_state(db, "explicit")?.0, 1);
+            assert!(!reply_is_valid(db, &format!("{SOURCE_SCOPE}:2"))?);
+            assert!(!reply_is_valid(db, "1:group:30:3")?);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn first_policy_install_honors_new_defaults_and_explicit_overrides() {
+    for defaults in [
+        AiSettings {
+            memory_read: false,
+            ..AiSettings::default()
+        },
+        AiSettings {
+            paused: true,
+            ..AiSettings::default()
+        },
+    ] {
+        let (store, _) = database().await;
+        store.call(|db| {
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,settings) VALUES('explicit','1:group:30','group','{\"memory_read\":true,\"paused\":false}')",[])?;
+            Ok(())
+        }).await.unwrap();
+        configure_policy(&store, &defaults).await.unwrap();
+        configure_policy(&store, &defaults).await.unwrap();
+        store
+            .call(|db| {
+                assert_eq!(policy_state(db, CONVERSATION)?.0, 2);
+                assert_eq!(policy_state(db, "explicit")?.0, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn invalid_policy_data_rolls_back_all_epoch_and_default_changes() {
+    let (store, _) = database().await;
+    store.call(|db| {
+        db.execute("INSERT INTO ai_conversations(id,scope,mode,settings) VALUES('z-invalid','1:group:30','group','{\"memory_read\":\"false\"}')",[])?;
+        let defaults=AiSettings{memory_read:false,..AiSettings::default()};
+        assert!(configure_policy_in_transaction(db,&defaults).is_err());
+        assert_eq!(policy_state(db,CONVERSATION)?.0,1);
+        let rows:i64=db.query_row("SELECT count(*) FROM ai_context_policy",[],|row| row.get(0))?;
+        assert_eq!(rows,0);
+        Ok(())
+    }).await.unwrap();
+}
