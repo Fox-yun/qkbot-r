@@ -987,7 +987,10 @@ mod tests {
     async fn learning_dependencies_survive_confirmation_storage_and_reject_changed_notes() {
         for change in ["version", "deleted", "disabled"] {
             let (store, gateway, plain) = setup().await;
-            crate::plugins::ai::learning::init(&store).await.unwrap();
+            crate::plugins::ai::memory::MemoryStore::new(store.clone(), 100)
+                .init()
+                .await
+                .unwrap();
             crate::plugins::ai::learning::configure(&store, 1, true)
                 .await
                 .unwrap();

@@ -59,6 +59,8 @@
   ];
   const learningFields = [
     field("plugins.ai.learning.enabled", "启用学习笔记", "check", "默认关闭。开启后仅从同一机器人账号的群聊取材，在群聊间共享交流经验；保存并应用后生效。", { full: true }),
+    field("plugins.ai.learning.semantic_recall", "启用笔记向量召回", "check", "默认开启，仅在学习笔记和向量服务同时启用时发出请求。按向量与文字相关性选取笔记；关闭、无索引或服务不可用时回退文字和最近笔记。笔记向量请求独立限额为每小时 120 次。", { full: true }),
+    field("plugins.ai.learning.recall_limit", "每轮最多召回笔记数", "number", "默认 8 条，范围 1–128。向量、文字匹配和最近笔记回退共用此上限，只加入独立预算内的完整条目；锁定只保护编辑，不保证每轮注入。", { min: 1, max: 128, full: true }),
     field("plugins.ai.learning.prompt", "管理员学习规则", "textarea", "规定可以学习的交流经验和常用术语，最多 4000 个字符，可留空。群聊内容只作为素材，不能修改管理员规则。", { full: true, rows: 5, optional: true }),
     field("plugins.ai.learning.min_interval_seconds", "最短学习间隔（秒）", "number", "每个机器人账号的后台学习间隔，默认 900 秒。", { min: 60, max: 86400 }),
     field("plugins.ai.learning.max_batch_messages", "每批最多素材消息数", "number", "只读取符合条件的群聊消息。", { min: 1, max: 100 }),
@@ -80,8 +82,8 @@
       field("llm.tool_calling", "启用原生工具调用", "check", "模型需支持工具调用；工具仍由宿主检查权限和执行结果。"),
       field("llm.vision", "启用图片识别", "check", "识别当前触发消息及其引用中的图片，合计最多 4 张；模型需支持视觉输入。关闭后按文字处理。"),
     ] },
-    { title: "向量接口（Embedding）", description: "独立于聊天模型，用于文字记忆检索和表情图片检索。测试使用两条合成输入，不读取聊天历史。", embedding: true, fields: [
-      field("embedding.enabled", "启用向量服务", "check", "保存并应用后启用。关闭时继续使用原有文字记忆检索。", { full: true }),
+    { title: "向量接口（Embedding）", description: "独立于聊天模型，用于文字记忆、学习笔记和表情图片检索。测试使用两条合成输入，不读取聊天历史。", embedding: true, fields: [
+      field("embedding.enabled", "启用向量服务", "check", "保存并应用后启用。关闭时个人记忆继续使用文字检索，学习笔记回退文字和最近笔记。", { full: true }),
       field("embedding.embeddings_url", "向量 API 地址", "text", "填写完整 embeddings 接口地址；更换地址时需填写该服务的密钥。", { full: true, placeholder: "https://api.siliconflow.cn/v1/embeddings" }),
       { secret: "embedding_api_key", label: "向量 API 密钥" },
       field("embedding.model", "向量模型", "text", "文字和图片需使用同一个支持多模态向量的模型。", { placeholder: "Qwen/Qwen3-VL-Embedding-8B" }),
@@ -835,6 +837,9 @@
   function validateLearning(config) {
     const learning = get(config, "plugins.ai.learning");
     if (!learning || typeof learning !== "object" || Array.isArray(learning)) throw new Error("学习笔记配置不完整，请重新载入配置。");
+    for (const def of learningFields.filter((entry) => entry.type === "check")) {
+      if (typeof get(config, def.path) !== "boolean") throw new Error(`「${def.label}」需要填写 true 或 false。`);
+    }
     if (typeof learning.prompt !== "string" || [...learning.prompt.trim()].length > 4000) throw new Error("「管理员学习规则」最多 4000 个字符。");
     for (const def of learningFields.filter((entry) => entry.type === "number")) {
       const value = get(config, def.path);

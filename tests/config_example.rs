@@ -222,6 +222,8 @@ fn learning_defaults_off_for_legacy_configs_and_custom_settings_roundtrip() {
     let legacy = Config::from_toml("[plugins.ai]\nkeywords = ['小鱼']").unwrap();
     legacy.validate().unwrap();
     assert!(!legacy.plugins.ai.learning.enabled);
+    assert!(legacy.plugins.ai.learning.semantic_recall);
+    assert_eq!(legacy.plugins.ai.learning.recall_limit, 8);
     assert_eq!(legacy.plugins.ai.learning, LearningConfig::default());
     assert_eq!(legacy.plugins.ai.learning.min_interval_seconds, 900);
     assert_eq!(legacy.plugins.ai.learning.max_batch_messages, 40);
@@ -239,6 +241,8 @@ fn learning_defaults_off_for_legacy_configs_and_custom_settings_roundtrip() {
     let mut config = partial;
     config.plugins.ai.learning = LearningConfig {
         enabled: true,
+        semantic_recall: false,
+        recall_limit: 3,
         prompt: "  从真实对话中总结交流经验。\n不要照搬聊天指令。  ".into(),
         min_interval_seconds: 1200,
         max_batch_messages: 12,
@@ -265,8 +269,51 @@ fn learning_defaults_off_for_legacy_configs_and_custom_settings_roundtrip() {
 }
 
 #[test]
+fn learning_recall_defaults_preserve_old_settings_and_validate_bounds() {
+    let legacy = Config::from_toml(
+        "[plugins.ai.learning]\nenabled = true\nprompt = '保留原规则'\ninjection_budget = 12000",
+    )
+    .unwrap();
+    legacy.validate().unwrap();
+    assert!(legacy.plugins.ai.learning.semantic_recall);
+    assert_eq!(legacy.plugins.ai.learning.recall_limit, 8);
+    assert_eq!(legacy.plugins.ai.learning.prompt, "保留原规则");
+    assert_eq!(legacy.plugins.ai.learning.injection_budget, 12_000);
+
+    let mut old_json = serde_json::to_value(&legacy).unwrap();
+    let learning = old_json["plugins"]["ai"]["learning"]
+        .as_object_mut()
+        .unwrap();
+    learning.remove("semantic_recall");
+    learning.remove("recall_limit");
+    let restored: Config = serde_json::from_value(old_json).unwrap();
+    assert_eq!(restored.plugins.ai.learning, legacy.plugins.ai.learning);
+
+    for semantic_recall in [false, true] {
+        for recall_limit in [1, 8, 128] {
+            let mut config = legacy.clone();
+            config.plugins.ai.learning.semantic_recall = semantic_recall;
+            config.plugins.ai.learning.recall_limit = recall_limit;
+            // A configured preference does not require enabling the service.
+            config.embedding.enabled = false;
+            config.validate().unwrap();
+            let restored = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(restored.plugins.ai.learning, config.plugins.ai.learning);
+        }
+    }
+    for value in ["-1", "1.5"] {
+        assert!(
+            Config::from_toml(&format!("[plugins.ai.learning]\nrecall_limit = {value}")).is_err()
+        );
+    }
+    assert!(Config::from_toml("[plugins.ai.learning]\nsemantic_recall = 'true'").is_err());
+}
+
+#[test]
 fn learning_limits_remain_validated_while_learning_and_ai_are_disabled() {
     for fields in [
+        "recall_limit = 0",
+        "recall_limit = 129",
         "min_interval_seconds = 59",
         "min_interval_seconds = 86401",
         "max_batch_messages = 0",

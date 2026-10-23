@@ -429,6 +429,9 @@ impl Runtime {
                                 if crate::plugins::ai::semantic::index_next(&host, &host.cancel).await.is_err() {
                                     tracing::debug!("memory semantic indexing deferred");
                                 }
+                                if crate::plugins::ai::learning::index_next(&host, &host.cancel).await.is_err() {
+                                    tracing::debug!("learning note semantic indexing deferred");
+                                }
                             }
                         },
                     }

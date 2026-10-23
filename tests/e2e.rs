@@ -2915,6 +2915,9 @@ async fn reply_trigger_rejects_other_senders_wrong_keys_and_untrusted_reply_prev
     let (_temp, host, router) = setup_with(&mock, true, |config| {
         config.plugins.ai.defaults.paused = true;
         config.plugins.ai.defaults.once = true;
+        // A one-shot reply remains usable with learning enabled: a paused
+        // conversation skips note recall rather than losing its admitted turn.
+        config.plugins.ai.learning.enabled = true;
     })
     .await;
     for (seq, sender, wrong_key) in [(1, 789, false), (2, 123, true)] {

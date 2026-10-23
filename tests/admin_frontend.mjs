@@ -95,7 +95,7 @@ function harness() {
     }
     result.plugins.ai.defaults = { ...result.plugins.ai.defaults, persona: "默认", paused: false, once: false, recent_messages: 24, input_budget: 6000, output_budget: 800 };
     result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
-    result.plugins.ai.learning = { enabled: false, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
+    result.plugins.ai.learning = { enabled: false, semantic_recall: true, recall_limit: 8, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
     Object.assign(result.limits, { learning_requests_per_hour: 4, learning_requests_per_day: 24, learning_max_input_budget: 8000, learning_max_output_tokens: 1200 });
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
     result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
@@ -327,6 +327,8 @@ test("automatic reply budget degrades honestly when fixed overhead metadata is m
 test("learning configuration uses backend defaults and validates limits in forms and JSON", async () => {
   const h = harness(); await h.login(); const group = h.app.groups.find((group) => group.title === "学习笔记");
   assert.ok(group); assert.equal(h.app.inputs.get("plugins.ai.learning.enabled").control.checked, false);
+  assert.equal(h.app.inputs.get("plugins.ai.learning.semantic_recall").control.checked, true);
+  assert.equal(h.app.inputs.get("plugins.ai.learning.recall_limit").control.value, "8");
   assert.equal(h.app.inputs.get("plugins.ai.learning.prompt").control.required, false);
   const text = h.app.inputs.get("plugins.ai.learning.prompt").control;
   text.value = " \n🐟" + "中".repeat(3999) + "  "; assert.equal([...h.app.readForm().plugins.ai.learning.prompt].length, 4000);
@@ -348,6 +350,38 @@ test("learning configuration uses backend defaults and validates limits in forms
   h.ids.get("config-json").value = JSON.stringify(good); h.app.adoptJson();
   assert.equal(h.app.readForm().plugins.ai.learning.prompt, "管理员规则🐟"); assert.equal(h.app.readForm().limits.learning_requests_per_day, 48);
   assert.ok(h.ids.get("auto-reply-budget").textContent.includes("输入预算"));
+});
+
+test("learning recall controls round-trip independently and reject invalid JSON values", async () => {
+  const h = harness(); await h.login();
+  const semantic = h.app.inputs.get("plugins.ai.learning.semantic_recall").control;
+  const limit = h.app.inputs.get("plugins.ai.learning.recall_limit").control;
+  semantic.checked = false;
+  for (const value of [1, 8, 128]) {
+    limit.value = String(value);
+    const learning = h.app.readForm().plugins.ai.learning;
+    assert.equal(learning.semantic_recall, false);
+    assert.equal(learning.recall_limit, value);
+    assert.equal(learning.injection_budget, 12000);
+  }
+  for (const value of [0, 129, 1.5, "8", null]) {
+    const bad = structuredClone(h.sample); bad.plugins.ai.learning.recall_limit = value;
+    h.ids.get("config-json").value = JSON.stringify(bad);
+    assert.throws(() => h.app.adoptJson(), /召回笔记数.*整数|learning\.recall_limit.*类型/u);
+  }
+  for (const value of ["true", 1, null]) {
+    const bad = structuredClone(h.sample); bad.plugins.ai.learning.semantic_recall = value;
+    h.ids.get("config-json").value = JSON.stringify(bad);
+    assert.throws(() => h.app.adoptJson(), /笔记向量召回.*true.*false|learning\.semantic_recall.*类型/u);
+  }
+  const good = structuredClone(h.sample);
+  good.plugins.ai.learning.semantic_recall = false; good.plugins.ai.learning.recall_limit = 128;
+  h.ids.get("config-json").value = JSON.stringify(good); h.app.adoptJson();
+  assert.equal(h.app.readForm().plugins.ai.learning.semantic_recall, false);
+  assert.equal(h.app.readForm().plugins.ai.learning.recall_limit, 128);
+  assert.match(h.app.groups.find((group) => group.embedding).description, /学习笔记/u);
+  assert.match(h.app.inputs.get("plugins.ai.learning.semantic_recall").wrapper.textContent, /每小时 120 次/u);
+  assert.match(h.app.inputs.get("plugins.ai.learning.recall_limit").wrapper.textContent, /锁定只保护编辑/u);
 });
 
 function learningSnapshot() {

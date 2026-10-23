@@ -828,13 +828,19 @@ impl Chat {
         };
         let learning = if host.config.plugins.ai.learning.enabled
             && settings.memory_read
+            && !settings.paused
             && job.key.scope.scene == Scene::Group
         {
             Some(
-                super::learning::context(
+                super::learning::recall(
                     host,
+                    &job.guard,
                     &job.key.scope,
+                    &job.key.key(),
+                    job.actor,
+                    &current,
                     host.config.plugins.ai.learning.injection_budget,
+                    cancel,
                 )
                 .await?,
             )
