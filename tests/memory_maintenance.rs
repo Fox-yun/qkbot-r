@@ -256,7 +256,7 @@ async fn summary_only_requests_disable_fact_mutations_and_preserve_existing_manu
         },
     )
     .await;
-    host.store
+    let original_memory_revision = host.store
         .call(|db| {
             for position in 1..=3 {
                 seed(db, "summary-only", 1, true, "{}", position)?;
@@ -269,19 +269,23 @@ async fn summary_only_requests_disable_fact_mutations_and_preserve_existing_manu
                 "INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,origin,active,locked,version,edited_by) VALUES('summary-only',7,'preference',?1,'[]',1,1,'manual',1,1,3,'synthetic-admin')",
                 [MEMORY_TEXT],
             )?;
-            Ok(())
+            Ok(db.query_row(
+                "SELECT memory_revision FROM ai_conversations WHERE id='summary-only'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
         })
         .await
         .unwrap();
     chat.compact_idle().await.unwrap();
     host.store
-        .call(|db| {
+        .call(move |db| {
             let state: (i64, i64, String, i64) = db.query_row(
                 "SELECT compacted_until,memory_processed_until,summary,memory_revision FROM ai_conversations WHERE id='summary-only'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-            assert_eq!(state, (1, 0, "用户7谈过喝茶偏好。".into(), 0));
+            assert_eq!(state, (1, 0, "用户7谈过喝茶偏好。".into(), original_memory_revision));
             let saved: (String, String, bool, i64, String, String, i64) = db.query_row(
                 "SELECT text,origin,locked,version,edited_by,evidence,updated_at FROM ai_memories WHERE conversation_id='summary-only'",
                 [],
@@ -482,8 +486,15 @@ const PENDING_REPAIR_OLD_SUMMARY: &str = "已有摘要：用户7喜欢白茶。"
 const PENDING_REPAIR_FINAL_SUMMARY: &str = "用户7喜欢白茶；保留已有喝茶偏好。";
 
 fn pending_repair_candidate() -> String {
-    // Within the 1,500-character ceiling but over the default 1,050-byte budget.
-    "用户7喜欢白茶。".repeat(60)
+    // Stay within the character ceiling while exercising compression at the
+    // configured default byte budget, even when that default is increased.
+    let budget = qkbot::plugins::ai::memory::summary_budget(
+        Config::default().plugins.ai.memory_input_budget,
+    );
+    let unit = "用户7喜欢白茶。";
+    let candidate = unit.repeat(budget / unit.len() + 1);
+    assert!(candidate.chars().count() <= 1500);
+    candidate
 }
 
 fn pending_repair_response(batch: &serde_json::Value, invalid_evidence: bool) -> String {

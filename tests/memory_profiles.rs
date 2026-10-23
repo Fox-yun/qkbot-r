@@ -12,6 +12,8 @@ async fn setup() -> Arc<Host> {
     let mut config = Config::default();
     config.app.database = ":memory:".into();
     config.plugins.ai.enabled = false;
+    // These profile cases retain coverage of the optional conversation-isolated mode.
+    config.plugins.ai.global_memory_shared = false;
     config.plugins.native.enabled.clear();
     Host::create(config).await.unwrap()
 }

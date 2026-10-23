@@ -1,5 +1,6 @@
 //! Bounded lexical memory and context assembly. No embedding model or vector service.
 pub mod rebuild;
+pub mod scope;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ const MAX_CHANGES: usize = 16;
 const MAX_SOURCE_ROWS: usize = 48;
 const MAX_SOURCE_BYTES: usize = 24_000;
 const MAX_MEMORY_CHARS: usize = 180;
+/// Instructions and protocol framing are reserved separately from source data.
+pub(crate) const MEMORY_PROMPT_RESERVE: usize = 2200;
 const MIGRATION: &str = r#"
 CREATE TABLE ai_memories (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,7 +184,7 @@ pub struct SummaryRepair {
 }
 
 pub fn summary_budget(input_budget: usize) -> usize {
-    (input_budget.saturating_sub(1800) / 4).max(128)
+    (input_budget.saturating_sub(MEMORY_PROMPT_RESERVE) / 4).max(128)
 }
 
 pub fn summary_cost(summary: &str) -> Result<usize> {
@@ -267,6 +270,7 @@ pub enum MemoryChange {
 pub struct MemoryStore {
     store: Store,
     max_memories_per_conversation: usize,
+    global_memory_shared: bool,
 }
 
 impl MemoryStore {
@@ -274,12 +278,27 @@ impl MemoryStore {
         Self {
             store,
             max_memories_per_conversation,
+            global_memory_shared: true,
         }
+    }
+    pub fn with_global_memory_shared(mut self, enabled: bool) -> Self {
+        self.global_memory_shared = enabled;
+        self
     }
     pub async fn init(&self) -> Result<()> {
         self.store.migrate("ai_memory", 1, MIGRATION).await?;
         self.store.migrate("ai_memory", 2, CURSOR_MIGRATION).await?;
-        self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await
+        self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await?;
+        self.store.migrate("ai_memory", 4, scope::MIGRATION).await?;
+        let enabled = self.global_memory_shared;
+        self.store
+            .call(move |db| {
+                let tx = db.transaction()?;
+                scope::configure(&tx, enabled)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn is_revoked(&self, source_key: &str) -> Result<bool> {
@@ -287,7 +306,7 @@ impl MemoryStore {
         self.store.call(move |db| is_revoked(db, &key)).await
     }
 
-    /// Only the current subject in the exact conversation is returned. A group output is public.
+    /// Only this QQ subject in the configured memory domain is returned.
     pub async fn retrieve(
         &self,
         guard: &ContextGuard,
@@ -351,14 +370,10 @@ impl MemoryStore {
                     source_key,
                     quote: text.clone(),
                 }];
-                let count: i64 = tx.query_row(
-                    "SELECT count(*) FROM ai_memories WHERE conversation_id=?1",
-                    [&guard.conversation_id],
-                    |r| r.get(0),
-                )?;
+                let count = scope::count(&tx, &guard.conversation_id, subject_id)?;
                 ensure!(
-                    usize::try_from(count)? < maximum,
-                    "当前会话长期记忆已达配置上限（{maximum} 条），请先遗忘旧记忆或提高容量配置"
+                    count < maximum,
+                    "当前记忆范围已达配置上限（{maximum} 条），请先遗忘旧记忆或提高容量配置"
                 );
                 let id = write_memory(
                     &tx,
@@ -395,8 +410,9 @@ impl MemoryStore {
                     |r| r.get(0),
                 )?;
                 ensure!(
-                    owner == guard.conversation_id && memory.subject_id == subject_id,
-                    "memory is outside this user's conversation"
+                    scope::resolve(&tx, &owner)? == scope::resolve(&tx, &guard.conversation_id)?
+                        && memory.subject_id == subject_id,
+                    "memory is outside this user's memory domain"
                 );
                 revoke_memory(&tx, &memory)?;
                 invalidate_context(&tx, &guard)?;
@@ -422,7 +438,7 @@ impl MemoryStore {
             .await
     }
 
-    /// Reserves 1,800 estimated tokens for the summarizer's instructions/framing.
+    /// Reserves MEMORY_PROMPT_RESERVE for summarizer instructions and framing.
     pub async fn prepare_batch_budgeted(
         &self,
         guard: &ContextGuard,
@@ -445,7 +461,10 @@ impl MemoryStore {
                 if batch.sources.is_empty() {
                     return Ok(batch);
                 }
-                fit_batch(batch, max_input_tokens.saturating_sub(1800))
+                fit_batch(
+                    batch,
+                    max_input_tokens.saturating_sub(MEMORY_PROMPT_RESERVE),
+                )
             })
             .await
     }
@@ -600,7 +619,8 @@ fn memory_page(
 ) -> Result<MemoryPage> {
     ensure!(page > 0, "页码从 1 开始");
     purge_expired(db)?;
-    let total = usize::try_from(db.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3)",params![conversation_id,subject_id,now()],|row|row.get::<_,i64>(0))?)?;
+    let domain = scope::resolve(db, conversation_id)?;
+    let total = usize::try_from(db.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3)",params![domain,subject_id,now()],|row|row.get::<_,i64>(0))?)?;
     let total_pages = total.div_ceil(MEMORY_PAGE_SIZE).max(1);
     ensure!(page <= total_pages, "页码超出范围；当前共 {total_pages} 页");
     let offset = i64::try_from(
@@ -608,16 +628,10 @@ fn memory_page(
             .checked_mul(MEMORY_PAGE_SIZE)
             .context("page offset overflow")?,
     )?;
-    let mut stmt = db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4 OFFSET ?5")?;
+    let mut stmt = db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4 OFFSET ?5")?;
     let memories = stmt
         .query_map(
-            params![
-                conversation_id,
-                subject_id,
-                now(),
-                MEMORY_PAGE_SIZE as i64,
-                offset
-            ],
+            params![domain, subject_id, now(), MEMORY_PAGE_SIZE as i64, offset],
             memory_row,
         )?
         .map(|r| decode_memory(r?))
@@ -695,13 +709,14 @@ pub(crate) fn retrieve(
             .context("recall candidate limit overflow")?,
     )?;
     purge_expired(db)?;
+    let domain = scope::resolve(db, &guard.conversation_id)?;
     let query = fts_query(query);
     let mut found = Vec::new();
     if !query.is_empty() {
-        let mut stmt=db.prepare("SELECT m.id,m.subject_id,m.kind,m.text,m.evidence,m.expires_at,m.origin FROM ai_memory_search JOIN ai_memories m ON m.id=ai_memory_search.memory_id WHERE ai_memory_search MATCH ?1 AND m.conversation_id=?2 AND m.subject_id=?3 AND m.active=1 AND (m.expires_at IS NULL OR m.expires_at>?4) ORDER BY bm25(ai_memory_search),m.updated_at DESC,m.id DESC LIMIT ?5")?;
+        let mut stmt=db.prepare("SELECT m.id,m.subject_id,m.kind,m.text,m.evidence,m.expires_at,m.origin FROM ai_memory_search JOIN ai_memories m ON m.id=ai_memory_search.memory_id WHERE ai_memory_search MATCH ?1 AND m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND m.active=1 AND (m.expires_at IS NULL OR m.expires_at>?4) ORDER BY bm25(ai_memory_search),m.updated_at DESC,m.id DESC LIMIT ?5")?;
         found = stmt
             .query_map(
-                params![query, guard.conversation_id, subject_id, now(), candidates],
+                params![query, domain, subject_id, now(), candidates],
                 memory_row,
             )?
             .map(|r| decode_memory(r?))
@@ -709,11 +724,8 @@ pub(crate) fn retrieve(
     }
     // Explicit personal background also helps when the question has no lexical match.
     let mut seen: HashSet<i64> = found.iter().map(|m| m.id).collect();
-    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 AND active=1 AND (kind IN('preference','task') OR (kind='fact' AND substr(trim(text),1,5) IN('人物背景：','人物背景:'))) AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
-    for row in stmt.query_map(
-        params![guard.conversation_id, subject_id, now(), candidates],
-        memory_row,
-    )? {
+    let mut stmt=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id=?2 AND active=1 AND (kind IN('preference','task') OR (kind='fact' AND substr(trim(text),1,5) IN('人物背景：','人物背景:'))) AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT ?4")?;
+    for row in stmt.query_map(params![domain, subject_id, now(), candidates], memory_row)? {
         let memory = decode_memory(row?)?;
         if seen.insert(memory.id) {
             found.push(memory);
@@ -805,7 +817,8 @@ fn write_memory(
     let expires = ttl.map(|days| timestamp + i64::from(days) * 86_400);
     let encoded = serde_json::to_string(evidence)?;
     let id = if let Some(id) = id {
-        ensure!(db.execute("UPDATE ai_memories SET kind=?1,text=?2,evidence=?3,updated_at=?4,expires_at=?5,version=version+1 WHERE id=?6 AND conversation_id=?7 AND subject_id=?8",params![kind.as_str(),text,encoded,timestamp,expires,id,conversation_id,subject_id])?==1,"memory ownership changed");
+        let domain = scope::resolve(db, conversation_id)?;
+        ensure!(db.execute("UPDATE ai_memories SET kind=?1,text=?2,evidence=?3,updated_at=?4,expires_at=?5,version=version+1 WHERE id=?6 AND conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?7) AND subject_id=?8",params![kind.as_str(),text,encoded,timestamp,expires,id,domain,subject_id])?==1,"memory ownership changed");
         id
     } else {
         db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,expires_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,'auto')",params![conversation_id,subject_id,kind.as_str(),text,encoded,timestamp,expires])?;
@@ -821,10 +834,7 @@ fn write_memory(
         "INSERT INTO ai_memory_search(memory_id,terms) VALUES(?1,?2)",
         params![id, lexical_terms(text).join(" ")],
     )?;
-    db.execute(
-        "UPDATE ai_conversations SET memory_revision=memory_revision+1 WHERE id=?1",
-        [conversation_id],
-    )?;
+    // Domain-wide revision triggers invalidate every frozen shared-memory batch.
     Ok(id)
 }
 
@@ -867,8 +877,8 @@ pub(crate) fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()
 }
 
 fn invalidate_context(db: &Connection, guard: &ContextGuard) -> Result<()> {
-    ensure!(db.execute("UPDATE ai_conversations SET epoch=epoch+1,summary='',compacted_until=0,memory_processed_until=0,memory_revision=memory_revision+1 WHERE id=?1 AND epoch=?2",params![guard.conversation_id,guard.epoch])?==1,"conversation changed");
-    Ok(())
+    check_guard(db, guard)?;
+    scope::invalidate(db, &guard.conversation_id)
 }
 
 fn prepare_batch(
@@ -977,9 +987,10 @@ fn prepare_batch_modes(
         .collect();
     let allowed_memories = if memory_write {
         let subjects = serde_json::to_string(&subjects)?;
-        let mut statement=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id=?1 AND subject_id IN (SELECT value FROM json_each(?2)) AND active=1 AND locked=0 AND origin='auto' AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT 16")?;
+        let domain = scope::resolve(db, &guard.conversation_id)?;
+        let mut statement=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id IN (SELECT value FROM json_each(?2)) AND active=1 AND locked=0 AND origin='auto' AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT 16")?;
         statement
-            .query_map(params![guard.conversation_id, subjects, now()], memory_row)?
+            .query_map(params![domain, subjects, now()], memory_row)?
             .map(|row| decode_memory(row?))
             .collect::<Result<Vec<_>>>()?
     } else {
@@ -1219,6 +1230,7 @@ fn commit_batch_inner(
     let tx = db.transaction()?;
     check_guard(&tx, &batch.guard)?;
     purge_expired(&tx)?;
+    let domain = scope::resolve(&tx, &batch.guard.conversation_id)?;
     let (compacted, memory_processed, summary, revision): (i64, i64, String, i64) = tx.query_row(
         "SELECT compacted_until,memory_processed_until,summary,memory_revision FROM ai_conversations WHERE id=?1",
         [&batch.guard.conversation_id],
@@ -1275,7 +1287,7 @@ fn commit_batch_inner(
                 .find(|m| m.id == id && m.subject_id == subject)
                 .context("memory ID was not allowed for this subject")?;
             let current = get_memory(&tx, id)?.context("memory no longer exists")?;
-            let eligible: bool = tx.query_row("SELECT conversation_id=?2 AND origin='auto' AND active=1 AND locked=0 FROM ai_memories WHERE id=?1",params![id,batch.guard.conversation_id],|row|row.get(0))?;
+            let eligible: bool = tx.query_row("SELECT conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND origin='auto' AND active=1 AND locked=0 FROM ai_memories WHERE id=?1",params![id,domain],|row|row.get(0))?;
             ensure!(
                 eligible,
                 "automatic changes cannot modify locked, manual, inactive, or foreign memories"
@@ -1291,12 +1303,6 @@ fn commit_batch_inner(
             );
         }
     }
-    let count: i64 = tx.query_row(
-        "SELECT count(*) FROM ai_memories WHERE conversation_id=?1",
-        [&batch.guard.conversation_id],
-        |r| r.get(0),
-    )?;
-    let mut count = usize::try_from(count)?;
     let mut counts = MemoryCommitCounts::default();
     for change in update.changes {
         match change {
@@ -1308,7 +1314,9 @@ fn commit_batch_inner(
                 evidence,
                 ttl_days,
             } => {
-                if id.is_none() && count >= maximum {
+                if id.is_none()
+                    && scope::count(&tx, &batch.guard.conversation_id, subject_id)? >= maximum
+                {
                     counts.skipped_new += 1;
                     continue;
                 }
@@ -1323,7 +1331,6 @@ fn commit_batch_inner(
                     ttl_days,
                 )?;
                 if id.is_none() {
-                    count += 1;
                     counts.inserted += 1;
                 } else {
                     counts.updated += 1;
@@ -1824,6 +1831,11 @@ mod tests {
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(CURSOR_MIGRATION).unwrap();
         db.execute_batch(ADMIN_MIGRATION).unwrap();
+        db.execute_batch(scope::MIGRATION).unwrap();
+        // The pre-existing tests exercise the explicitly disabled compatibility mode.
+        scope::configure(&db, false).unwrap();
+        db.execute("UPDATE ai_conversations SET epoch=1,memory_revision=0", [])
+            .unwrap();
         db
     }
     fn guard() -> ContextGuard {
@@ -1838,6 +1850,334 @@ mod tests {
         db.execute("UPDATE messages SET inbound_position=id WHERE id=?1", [id])
             .unwrap();
         id
+    }
+
+    fn shared_db() -> Connection {
+        let db = db();
+        scope::configure(&db, true).unwrap();
+        db.execute("UPDATE ai_conversations SET epoch=1,memory_revision=0", [])
+            .unwrap();
+        db.execute(
+            "UPDATE ai_conversations SET scope='1:friend:7' WHERE id='private'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO ai_conversations(id,scope,epoch) VALUES('other-bot','2:group:2',1)",
+            [],
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn global_migration_keeps_legacy_ids_evidence_and_source_conversations() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL,epoch INTEGER NOT NULL DEFAULT 1,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); INSERT INTO ai_conversations(id,scope) VALUES('old-group','1:group:2'),('old-private','1:friend:7');").unwrap();
+        db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(CURSOR_MIGRATION).unwrap();
+        db.execute_batch(ADMIN_MIGRATION).unwrap();
+        let raw_evidence = serde_json::to_string(&evidence("old-source", "喜欢绿茶")).unwrap();
+        db.execute("INSERT INTO ai_memories(id,conversation_id,subject_id,kind,text,evidence,created_at,updated_at) VALUES(91,'old-private',7,'preference','喜欢绿茶',?1,1,1)", [&raw_evidence]).unwrap();
+        db.execute_batch(scope::MIGRATION).unwrap();
+        assert_eq!(scope::resolve(&db, "old-group").unwrap(), "bot:1");
+        assert_eq!(
+            memory_page(&db, "old-group", 7, 1).unwrap().memories[0].id,
+            91
+        );
+        let original: (String, String) = db
+            .query_row(
+                "SELECT conversation_id,evidence FROM ai_memories WHERE id=91",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(original, ("old-private".into(), raw_evidence));
+    }
+
+    #[test]
+    fn shared_memory_includes_old_sources_but_keeps_qq_and_bot_ownership() {
+        let db = db();
+        let group = seed_memories(&db, "group", 7, 1)[0];
+        let private = seed_memories(&db, "private", 7, 1)[0];
+        seed_memories(&db, "group", 8, 1);
+        db.execute(
+            "INSERT INTO ai_conversations(id,scope,epoch) VALUES('other-bot','2:group:2',1)",
+            [],
+        )
+        .unwrap();
+        seed_memories(&db, "other-bot", 7, 1);
+        assert_eq!(memory_page(&db, "group", 7, 1).unwrap().total, 1);
+
+        scope::configure(&db, true).unwrap();
+        let guard = ContextGuard {
+            conversation_id: "private".into(),
+            epoch: 2,
+        };
+        let recalled = retrieve(&db, &guard, 7, "主题", 10, 4000).unwrap();
+        assert_eq!(
+            recalled.iter().map(|m| m.id).collect::<HashSet<_>>(),
+            HashSet::from([group, private])
+        );
+        assert_eq!(memory_page(&db, "private", 7, 1).unwrap().total, 2);
+        db.execute(
+            "INSERT INTO ai_conversations(id,scope,epoch) VALUES('new-group','1:group:99',1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(scope::resolve(&db, "new-group").unwrap(), "bot:1");
+        assert_eq!(memory_page(&db, "new-group", 7, 1).unwrap().total, 2);
+
+        scope::configure(&db, false).unwrap();
+        assert_eq!(
+            memory_page(&db, "group", 7, 1).unwrap().memories[0].id,
+            group
+        );
+        assert_eq!(
+            memory_page(&db, "private", 7, 1).unwrap().memories[0].id,
+            private
+        );
+        assert_eq!(memory_page(&db, "new-group", 7, 1).unwrap().total, 0);
+        assert!(retrieve(&db, &guard, 7, "主题", 10, 4000).is_err());
+    }
+
+    #[test]
+    fn malformed_scope_is_never_joined_to_global_memory() {
+        let db = shared_db();
+        for (index, raw) in [
+            "",
+            "1",
+            "1:group",
+            "1:group:2:extra",
+            "x:group:2",
+            "1:unknown:2",
+            "1:friend:0",
+            "1:friend:x",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = format!("invalid-{index}");
+            db.execute(
+                "INSERT INTO ai_conversations(id,scope,epoch) VALUES(?1,?2,1)",
+                params![id, raw],
+            )
+            .unwrap();
+            assert_eq!(
+                scope::resolve(&db, &id).unwrap(),
+                format!("conversation:{id}")
+            );
+        }
+    }
+
+    #[test]
+    fn shared_batch_updates_same_qq_memory_without_moving_its_source() {
+        let mut db = shared_db();
+        let id = write_memory(
+            &db,
+            "private",
+            None,
+            7,
+            MemoryKind::Preference,
+            "喜欢红茶",
+            &evidence("private-source", "喜欢红茶"),
+            None,
+        )
+        .unwrap();
+        let through = source(&db, "group-source", 7, "现在喜欢绿茶", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        assert_eq!(batch.allowed_memories[0].id, id);
+        commit_batch(
+            &mut db,
+            batch,
+            BatchUpdate {
+                summary: "用户更新了茶偏好".into(),
+                changes: vec![MemoryChange::Upsert {
+                    id: Some(id),
+                    subject_id: 7,
+                    kind: MemoryKind::Preference,
+                    text: "喜欢绿茶".into(),
+                    evidence: evidence("group-source", "喜欢绿茶"),
+                    ttl_days: None,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(get_memory(&db, id).unwrap().unwrap().text, "喜欢绿茶");
+        assert_eq!(
+            db.query_row(
+                "SELECT conversation_id FROM ai_memories WHERE id=?1",
+                [id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "private"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM ai_memory_provenance WHERE memory_id=?1",
+                [id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT summary FROM ai_conversations WHERE id='private'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn shared_revision_rejects_a_batch_after_another_conversation_writes() {
+        let mut db = shared_db();
+        let through = source(&db, "group-source", 7, "喜欢绿茶", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        write_memory(
+            &db,
+            "private",
+            None,
+            7,
+            MemoryKind::Preference,
+            "喜欢红茶",
+            &evidence("private-source", "喜欢红茶"),
+            None,
+        )
+        .unwrap();
+        let result = commit_batch(
+            &mut db,
+            batch,
+            BatchUpdate {
+                summary: "过时摘要".into(),
+                changes: vec![],
+            },
+        );
+        assert_eq!(
+            memory_commit_failure_reason(&result.unwrap_err()),
+            "snapshot_changed"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT summary FROM ai_conversations WHERE id='group'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn shared_capacity_is_per_qq_across_all_sources() {
+        let mut db = shared_db();
+        seed_memories(&db, "private", 7, 1);
+        seed_memories(&db, "group", 8, 1);
+        source(&db, "seven", 7, "喜欢绿茶", "user");
+        let through = source(&db, "nine", 9, "喜欢红茶", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        let changes = [(7, "seven", "喜欢绿茶"), (9, "nine", "喜欢红茶")]
+            .into_iter()
+            .map(|(subject_id, key, text)| MemoryChange::Upsert {
+                id: None,
+                subject_id,
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                evidence: evidence(key, text),
+                ttl_days: None,
+            })
+            .collect();
+        commit_batch_with_limit(
+            &mut db,
+            batch,
+            BatchUpdate {
+                summary: "两人的偏好".into(),
+                changes,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(scope::count(&db, "group", 7).unwrap(), 1);
+        assert_eq!(scope::count(&db, "private", 8).unwrap(), 1);
+        assert_eq!(scope::count(&db, "private", 9).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_global_forget_revokes_original_source_and_all_bot_contexts() {
+        let store = Store::open(":memory:", 8).await.unwrap();
+        let memory = MemoryStore::new(store.clone(), 10);
+        memory.init().await.unwrap();
+        store.call(|db| {
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,epoch,summary) VALUES('group','1:group:2','group',1,'群摘要'),('private','1:friend:7','user',1,'私聊摘要'),('other-bot','2:group:2','group',1,'其他机器人摘要')", [])?;
+            db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,learnable) VALUES('private-source','1:friend:7','private',1,7,'user','喜欢绿茶',1,1,1)", [])?;
+            Ok(())
+        }).await.unwrap();
+        let private = ContextGuard {
+            conversation_id: "private".into(),
+            epoch: 1,
+        };
+        let id = memory
+            .remember(
+                &private,
+                7,
+                "private-source",
+                "喜欢绿茶",
+                MemoryKind::Preference,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            memory
+                .retrieve(&guard(), 7, "喜欢", 10, 1000)
+                .await
+                .unwrap()[0]
+                .id,
+            id
+        );
+        assert!(memory.forget(&guard(), 8, id).await.is_err());
+        assert!(
+            memory
+                .forget(
+                    &ContextGuard {
+                        conversation_id: "other-bot".into(),
+                        epoch: 1
+                    },
+                    7,
+                    id
+                )
+                .await
+                .is_err()
+        );
+        let next = memory.forget(&guard(), 7, id).await.unwrap();
+        assert_eq!(next.epoch, 2);
+        assert!(memory.is_revoked("private-source").await.unwrap());
+        store
+            .call(move |db| {
+                assert!(get_memory(db, id)?.is_none());
+                for name in ["group", "private"] {
+                    let state: (i64, String) = db.query_row(
+                        "SELECT epoch,summary FROM ai_conversations WHERE id=?1",
+                        [name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    assert_eq!(state, (2, String::new()));
+                }
+                let state: (i64, String) = db.query_row(
+                    "SELECT epoch,summary FROM ai_conversations WHERE id='other-bot'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(state, (1, "其他机器人摘要".into()));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.stop().await.unwrap();
     }
 
     #[test]
@@ -3061,7 +3401,7 @@ mod tests {
             let next = source(&db, "next", 7, "继续聊天", "user");
             let mut next_batch = prepare_batch(&db, &guard(), next, false).unwrap();
             next_batch.summary_budget = summary_budget(budget);
-            let next_batch = fit_batch(next_batch, budget - 1800).unwrap();
+            let next_batch = fit_batch(next_batch, budget - MEMORY_PROMPT_RESERVE).unwrap();
             assert_eq!(next_batch.through_position, next);
             if budget == 24_000 {
                 assert_eq!(next_batch.previous_summary.chars().count(), 1500);

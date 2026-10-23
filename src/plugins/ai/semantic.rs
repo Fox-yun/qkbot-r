@@ -63,6 +63,7 @@ struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Boundary {
     scope: String,
+    memory_scope: String,
     mode: String,
     owner: Option<i64>,
     settings: String,
@@ -172,6 +173,7 @@ fn boundary(db: &Connection, request: &Request) -> Result<Boundary> {
     let plugin_revision = crate::catalog::allowed_revision(db, &scope, "ai")?
         .context("semantic AI is disabled for this scope")?;
     Ok(Boundary {
+        memory_scope: memory::scope::resolve(db, &request.guard.conversation_id)?,
         scope,
         mode,
         owner,
@@ -184,7 +186,8 @@ fn boundary(db: &Connection, request: &Request) -> Result<Boundary> {
 }
 
 fn document(db: &Connection, request: &Request, id: i64) -> Result<Document> {
-    let version=db.query_row(&format!("SELECT m.version FROM ai_memories m WHERE m.id=?2 AND m.conversation_id=?3 AND m.subject_id=?4 AND {ELIGIBLE}"),params![now(),id,request.guard.conversation_id,request.subject],|r|r.get(0)).optional()?.context("semantic memory is no longer eligible")?;
+    let memory_scope = memory::scope::resolve(db, &request.guard.conversation_id)?;
+    let version=db.query_row(&format!("SELECT m.version FROM ai_memories m WHERE m.id=?2 AND m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?3) AND m.subject_id=?4 AND {ELIGIBLE}"),params![now(),id,memory_scope,request.subject],|r|r.get(0)).optional()?.context("semantic memory is no longer eligible")?;
     let memory = memory::get_memory(db, id)?.context("semantic memory disappeared")?;
     let input = format!("{}: {}", memory.kind.as_str(), memory.text);
     let hash = format!("{:x}", Sha256::digest(input.as_bytes()));
@@ -301,7 +304,8 @@ fn pending_id(
     namespace: &str,
     dimensions: usize,
 ) -> Result<Option<i64>> {
-    Ok(db.query_row(&format!("SELECT m.id FROM ai_memories m LEFT JOIN ai_memory_vectors v ON v.memory_id=m.id AND v.namespace=?4 AND v.memory_version=m.version AND v.dimensions=?5 AND length(v.vector)=?5*4 LEFT JOIN ai_semantic_attempts a ON a.memory_id=m.id AND a.namespace=?4 WHERE m.conversation_id=?2 AND m.subject_id=?3 AND {ELIGIBLE} AND v.memory_id IS NULL AND (a.retry_after IS NULL OR a.retry_after<=?1) ORDER BY m.id LIMIT 1"),params![now(),request.guard.conversation_id,request.subject,namespace,dimensions],|r|r.get(0)).optional()?)
+    let memory_scope = memory::scope::resolve(db, &request.guard.conversation_id)?;
+    Ok(db.query_row(&format!("SELECT m.id FROM ai_memories m LEFT JOIN ai_memory_vectors v ON v.memory_id=m.id AND v.namespace=?4 AND v.memory_version=m.version AND v.dimensions=?5 AND length(v.vector)=?5*4 LEFT JOIN ai_semantic_attempts a ON a.memory_id=m.id AND a.namespace=?4 WHERE m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND {ELIGIBLE} AND v.memory_id IS NULL AND (a.retry_after IS NULL OR a.retry_after<=?1) ORDER BY m.id LIMIT 1"),params![now(),memory_scope,request.subject,namespace,dimensions],|r|r.get(0)).optional()?)
 }
 
 fn commit_index(
@@ -458,7 +462,7 @@ pub async fn index_next(host: &Host, cancel: &CancellationToken) -> Result<bool>
         .context("semantic AI plugin is disabled")?;
     let pending=host.store.call(move |db| {
         crate::host::check_plugin(db,"ai",plugin_epoch)?;
-        let sql=format!("SELECT c.id,c.epoch,m.subject_id FROM ai_memories m JOIN ai_conversations c ON c.id=m.conversation_id LEFT JOIN ai_scope_modes sm ON sm.scope=c.scope LEFT JOIN scope_access sa ON sa.scope=c.scope LEFT JOIN scope_plugin_access pa ON pa.scope=c.scope AND pa.plugin='ai' LEFT JOIN ai_memory_vectors v ON v.memory_id=m.id AND v.namespace=?3 AND v.memory_version=m.version AND v.dimensions=?4 AND length(v.vector)=?4*4 LEFT JOIN ai_semantic_attempts a ON a.memory_id=m.id AND a.namespace=?3 WHERE {ELIGIBLE} AND c.scope LIKE ?2 AND m.subject_id>0 AND m.subject_id!=?5 AND (c.owner_id IS NULL OR c.owner_id=m.subject_id) AND COALESCE(sa.enabled,1)=1 AND COALESCE(pa.enabled,1)=1 AND COALESCE(json_extract(c.settings,'$.memory_read'),?6)=1 AND COALESCE(json_extract(c.settings,'$.paused'),?7)=0 AND c.id=c.scope||':v'||CASE WHEN c.scope LIKE '%:friend:%' THEN 0 ELSE COALESCE(sm.revision,0) END||CASE WHEN c.owner_id IS NULL THEN ':group' ELSE ':user:'||c.owner_id END AND c.mode=CASE WHEN c.scope LIKE '%:friend:%' THEN 'user' ELSE COALESCE(sm.mode,?8) END AND v.memory_id IS NULL AND (a.retry_after IS NULL OR a.retry_after<=?1) ORDER BY m.id LIMIT 48");
+        let sql=format!("SELECT DISTINCT c.id,c.epoch,m.subject_id FROM ai_memories m JOIN ai_conversations source ON source.id=m.conversation_id JOIN ai_conversations c ON c.memory_scope=source.memory_scope LEFT JOIN ai_scope_modes sm ON sm.scope=c.scope LEFT JOIN scope_access sa ON sa.scope=c.scope LEFT JOIN scope_plugin_access pa ON pa.scope=c.scope AND pa.plugin='ai' LEFT JOIN ai_memory_vectors v ON v.memory_id=m.id AND v.namespace=?3 AND v.memory_version=m.version AND v.dimensions=?4 AND length(v.vector)=?4*4 LEFT JOIN ai_semantic_attempts a ON a.memory_id=m.id AND a.namespace=?3 WHERE {ELIGIBLE} AND c.scope LIKE ?2 AND m.subject_id>0 AND m.subject_id!=?5 AND (c.owner_id IS NULL OR c.owner_id=m.subject_id) AND COALESCE(sa.enabled,1)=1 AND COALESCE(pa.enabled,1)=1 AND COALESCE(json_extract(c.settings,'$.memory_read'),?6)=1 AND COALESCE(json_extract(c.settings,'$.paused'),?7)=0 AND c.id=c.scope||':v'||CASE WHEN c.scope LIKE '%:friend:%' THEN 0 ELSE COALESCE(sm.revision,0) END||CASE WHEN c.owner_id IS NULL THEN ':group' ELSE ':user:'||c.owner_id END AND c.mode=CASE WHEN c.scope LIKE '%:friend:%' THEN 'user' ELSE COALESCE(sm.mode,?8) END AND v.memory_id IS NULL AND (a.retry_after IS NULL OR a.retry_after<=?1) ORDER BY m.id LIMIT 48");
         let candidates=db.prepare(&sql)?.query_map(params![now(),format!("{bot_id}:%"),namespace,dimensions,bot_id,defaults.memory_read,defaults.paused,defaults.mode],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (id,epoch,subject) in candidates {
             let request=Request {guard:ContextGuard {conversation_id:id,epoch},subject,bot_id,plugin_epoch,defaults:defaults.clone()};
@@ -480,12 +484,12 @@ fn semantic_candidates(
     count: usize,
 ) -> Result<Vec<Memory>> {
     let sql = format!(
-        "SELECT m.id,v.memory_version,v.document_hash,v.vector FROM ai_memory_vectors v JOIN ai_memories m ON m.id=v.memory_id WHERE m.conversation_id=?2 AND m.subject_id=?3 AND v.namespace=?4 AND v.dimensions=?5 AND length(v.vector)=?5*4 AND v.memory_version=m.version AND {ELIGIBLE} ORDER BY m.updated_at DESC,m.id DESC LIMIT ?6"
+        "SELECT m.id,v.memory_version,v.document_hash,v.vector FROM ai_memory_vectors v JOIN ai_memories m ON m.id=v.memory_id WHERE m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND v.namespace=?4 AND v.dimensions=?5 AND length(v.vector)=?5*4 AND v.memory_version=m.version AND {ELIGIBLE} ORDER BY m.updated_at DESC,m.id DESC LIMIT ?6"
     );
     let mut statement = db.prepare(&sql)?;
     let mut rows = statement.query(params![
         now(),
-        snapshot.request.guard.conversation_id,
+        snapshot.boundary.memory_scope,
         snapshot.request.subject,
         namespace,
         query.len(),
@@ -614,7 +618,7 @@ pub async fn retrieve(
     let snapshot=host.store.call(move |db| {
         let boundary=boundary(db,&request)?;
         let source=query_source(db,&request,&boundary,&key)?;
-        let exists:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ai_memory_vectors v JOIN ai_memories m ON m.id=v.memory_id WHERE m.conversation_id=?2 AND m.subject_id=?3 AND v.namespace=?4 AND v.dimensions=?5 AND length(v.vector)=?5*4 AND v.memory_version=m.version AND {ELIGIBLE})"),params![now(),request.guard.conversation_id,subject,ns,dimensions],|r|r.get(0))?;
+        let exists:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ai_memory_vectors v JOIN ai_memories m ON m.id=v.memory_id WHERE m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND v.namespace=?4 AND v.dimensions=?5 AND length(v.vector)=?5*4 AND v.memory_version=m.version AND {ELIGIBLE})"),params![now(),boundary.memory_scope,subject,ns,dimensions],|r|r.get(0))?;
         Ok(if exists {Some(QuerySnapshot {request,boundary,source})} else {None})
     }).await?;
     let Some(snapshot) = snapshot else {
@@ -715,6 +719,7 @@ mod tests {
             CREATE TABLE messages(id INTEGER PRIMARY KEY,key TEXT,scope TEXT,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,received_at INTEGER,access_revision INTEGER,revoked INTEGER);
             INSERT INTO messages VALUES(1,'1:group:20:1','1:group:20','1:group:20:v0:group',1,7,'user','我想喝什么',1,0,0);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(memory::scope::MIGRATION).unwrap();
         db
     }
 
@@ -807,6 +812,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before, ("原摘要".into(), 90, 95));
+    }
+
+    #[test]
+    fn shared_semantic_memory_crosses_groups_and_private_chats_but_not_people_or_bots() {
+        let mut db = db();
+        let own = add(&db, 7, "下午喜欢泡铁观音");
+        let other = add(&db, 8, "其他人喜欢乌龙茶");
+        index(&mut db, own, 7, "model-a", 0);
+        index(&mut db, other, 8, "model-a", 0);
+        for (scope, mode, owner, bot) in [
+            ("1:group:21", "group", None, 1),
+            ("1:friend:7", "user", Some(7), 1),
+            ("2:group:20", "group", None, 2),
+        ] {
+            let id = match owner {
+                Some(owner) => format!("{scope}:v0:user:{owner}"),
+                None => format!("{scope}:v0:group"),
+            };
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,owner_id,epoch,settings,summary,compacted_until,memory_processed_until,memory_revision) VALUES(?1,?2,?3,?4,1,'{}','',0,0,0)", params![id,scope,mode,owner]).unwrap();
+            let key = format!("{scope}:1");
+            db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,access_revision,revoked) VALUES(?1,?2,?3,1,7,'user','推荐热饮',1,0,0)",params![key,scope,id]).unwrap();
+            let request = Request {
+                guard: ContextGuard {
+                    conversation_id: id,
+                    epoch: 1,
+                },
+                bot_id: bot,
+                ..request_for(7)
+            };
+            let boundary = boundary(&db, &request).unwrap();
+            let source = query_source(&db, &request, &boundary, &key).unwrap();
+            let snapshot = QuerySnapshot {
+                request,
+                boundary,
+                source,
+            };
+            let found = semantic_candidates(&db, &snapshot, "model-a", &vector(0), 20).unwrap();
+            if bot == 1 {
+                assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), vec![own]);
+                assert_eq!(
+                    pending_id(&db, &snapshot.request, "new-model", 64).unwrap(),
+                    Some(own)
+                );
+                assert!(document(&db, &snapshot.request, other).is_err());
+                assert_eq!(
+                    lexical(&db, &snapshot.request, "铁观音", 5, 1000).unwrap()[0].id,
+                    own
+                );
+            } else {
+                assert!(found.is_empty());
+                assert!(document(&db, &snapshot.request, own).is_err());
+                assert!(
+                    pending_id(&db, &snapshot.request, "new-model", 64)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_edits_and_sharing_switch_invalidate_semantic_snapshots_without_losing_cache() {
+        let mut db = db();
+        let own = add(&db, 7, "下午喜欢泡铁观音");
+        index(&mut db, own, 7, "model-a", 0);
+        db.execute("INSERT INTO ai_conversations(id,scope,mode,owner_id,epoch,settings,summary,compacted_until,memory_processed_until,memory_revision) VALUES('private','1:friend:7','user',7,1,'{}','',0,0,0)", []).unwrap();
+        let before = query_snapshot(&db);
+        // A write in another conversation must invalidate in-flight query/index work.
+        db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,origin) VALUES('private',7,'event','来自私聊的新事实','[]',1,1,'auto')", []).unwrap();
+        assert!(validate_query(&db, &before).is_err());
+        let private_id = db.last_insert_rowid();
+        assert!(document(&db, &request_for(7), private_id).is_ok());
+        let before = query_snapshot(&db);
+        memory::scope::configure(&db, false).unwrap();
+        assert!(validate_query(&db, &before).is_err());
+        assert!(document(&db, &request_for(7), private_id).is_err());
+        assert!(document(&db, &request_for(7), own).is_ok());
+        assert_eq!(cache_count(&db), 1);
+        memory::scope::configure(&db, true).unwrap();
+        assert!(document(&db, &request_for(7), private_id).is_ok());
+        assert_eq!(cache_count(&db), 1);
     }
 
     #[test]

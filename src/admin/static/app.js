@@ -94,7 +94,8 @@
       field("plugins.ai.defaults.recent_messages", "最近历史消息数", "number", "设为 0 时不载入最近原文。", { min: 0, max: 4096 }),
       field("plugins.ai.defaults.allowed_tools", "允许模型使用的工具", "tools", "自动读取已注册工具，保存并应用后生效。不勾选即禁用全部工具；关闭插件会保留已有选择。", { full: true }),
       field("plugins.ai.defaults.summary", "生成并使用历史摘要", "check", "关闭后不生成或注入摘要，按历史条数读取原文。"),
-      field("plugins.ai.defaults.memory_read", "检索长期记忆", "check", "将相关的、属于当前会话和用户的记忆加入回答。"),
+      field("plugins.ai.global_memory_shared", "全域长期记忆共享", "check", "默认开启：同一机器人账号内，同一 QQ 的记忆在所有群聊和私聊共享。关闭后仅在来源会话可用。应用开关变更会重置短期上下文和摘要，保留长期记忆与原始消息。", { full: true }),
+      field("plugins.ai.defaults.memory_read", "检索长期记忆", "check", "将当前用户的相关记忆加入回答；检索范围由全域共享开关控制。"),
       field("plugins.ai.defaults.reply_to_bot", "回复机器人消息时触发 AI", "check", "在群内引用回复当前机器人账号的消息时，无需再次 @ 或输入关键词。插件命令仍优先处理。"),
       field("plugins.ai.defaults.memory_write", "自动提炼长期记忆", "check", "只接受带有效原文证据的事实变更。"),
       field("plugins.ai.read_group_background", "读取群内背景消息", "check", "未触发的群消息也可进入上下文，与长期记忆学习独立。"),
@@ -138,9 +139,9 @@
       field("limits.retention_days", "原始消息保留天数", "number", "长期记忆独立保存；原文过期后无法重新生成对应摘要。", { min: 1 }),
       field("plugins.ai.compact_after_messages", "触发整理的消息数", "number", "后台只整理安全的完整前缀。", { min: 1 }),
       field("plugins.ai.compact_idle_secs", "闲置整理等待（秒）", "number", "", { min: 1 }),
-      field("plugins.ai.memory_input_budget", "整理输入预算（估算）", "number", "", { min: 3072, max: 262144 }),
+      field("plugins.ai.memory_input_budget", "整理输入预算（估算）", "number", "默认 8000，供后台提炼与摘要整理使用；普通聊天的输入预算单独配置。", { min: 3072, max: 262144 }),
       field("plugins.ai.memory_output_budget", "整理输出 token 上限", "number", "", { min: 256, max: 8192 }),
-      field("plugins.ai.max_memories_per_conversation", "每个会话最多长期记忆", "number", "", { min: 1 }),
+      field("plugins.ai.max_memories_per_conversation", "长期记忆存储容量", "number", "全域共享开启时按同一机器人账号内每个 QQ 计；关闭时按来源会话计。降低容量不会删除已有记忆。", { min: 1 }),
       field("plugins.ai.memory_recall_limit", "每轮最多召回记忆", "number", "", { min: 1 }),
       field("plugins.ai.memory_recall_budget", "召回记忆预算（估算）", "number", "", { min: 64 }),
     ] },
@@ -1583,6 +1584,22 @@
   function scopeDescription(conversation) {
     return "机器人 " + String(conversation.bot_id ?? "—") + " · " + (conversation.mode === "user" ? "成员隔离" : "共享上下文") + " · 版本 " + conversation.epoch + " / " + conversation.memory_revision + (conversation.is_current === false ? " · 历史会话" : "");
   }
+  function memoryRangeDescription(conversation) {
+    return conversation.global_memory_shared
+      ? "全域共享：机器人 " + conversation.bot_id + " 的所有群聊和私聊" + (conversation.owner_id ? " · QQ " + conversation.owner_id : " · 按 QQ 归属，可在下方筛选人物") + "。编辑、停用与遗忘会影响该记忆在所有会话中的使用；摘要和短期上下文仍属于选中会话。"
+      : "按来源会话隔离：仅显示并维护当前会话的长期记忆。可在配置管理中开启全域长期记忆共享。";
+  }
+  function memoryMatchesSelection(record) {
+    const selected = state.memory.detail || state.memory.selected;
+    if (!selected) return false;
+    if (selected.memory_scope) return record.memory_scope === selected.memory_scope && typeof record.conversation_id === "string" && (!selected.owner_id || record.subject_id === selected.owner_id);
+    return record.conversation_id === selected.id;
+  }
+  function memorySourceTitle(record) {
+    const match = String(record.source_scope || record.conversation_id).match(/^(\d+):(group|friend):(\d+)(?::|$)/u);
+    if (!match) return "来源会话 " + record.conversation_id;
+    return "来源：机器人 " + match[1] + " · " + (match[2] === "group" ? "群 " : "私聊 ") + match[3] + (record.source_owner_id && match[2] === "group" ? " · 成员 " + record.source_owner_id : "");
+  }
   function memoryIsCurrent(version, id) { return state.authenticated && state.memory.version === version && state.memory.selected?.id === id; }
   function clearMemorySelection() {
     state.memory.version++; state.memory.selected = null; state.memory.detail = null; state.memory.rows = []; state.memory.checked.clear();
@@ -1615,7 +1632,7 @@
       const button = element("button", "conversation-item" + (state.memory.selected?.id === conversation.id ? " selected" : ""));
       button.type = "button"; button.dataset.action = "";
       button.setAttribute("aria-pressed", String(state.memory.selected?.id === conversation.id));
-      button.append(element("strong", "", scopeTitle(conversation)), element("span", "hint", "机器人 " + conversation.bot_id + " · " + (conversation.mode === "user" ? "成员隔离" : "共享") + " · " + conversation.memory_count + " 条记忆" + (conversation.is_current === false ? " · 历史" : "")));
+      button.append(element("strong", "", scopeTitle(conversation)), element("span", "hint", "机器人 " + conversation.bot_id + " · " + (conversation.mode === "user" ? "成员隔离上下文" : "共享上下文") + " · " + conversation.memory_count + (conversation.global_memory_shared ? " 条全域记忆" : " 条会话记忆") + (conversation.is_current === false ? " · 历史" : "")));
       button.addEventListener("click", () => { if (!state.busy && canDiscardMemory()) void runAction(() => selectConversation(conversation)); });
       box.append(button);
     }
@@ -1633,6 +1650,7 @@
     state.memory.detail = detail; state.memory.selected = detail; state.memory.conflict = false; state.memory.settingsDirty = false;
     $("no-conversation").hidden = true; $("selected-conversation").hidden = false; $("conversation-conflict").hidden = true;
     $("selected-scope-title").textContent = scopeTitle(detail); $("selected-scope-detail").textContent = scopeDescription(detail);
+    $("memory-range-description").textContent = memoryRangeDescription(detail);
     badge("selected-scope-badge", detail.is_current === false ? "历史会话" : detail.settings.paused ? "已暂停" : "可聊天", detail.is_current === false ? "neutral" : detail.settings.paused ? "wait" : "good");
     $("pause-conversation").textContent = detail.settings.paused ? "恢复聊天" : "暂停聊天";
     $("once-conversation").textContent = detail.settings.once ? "已放行一次" : "只回复一次";
@@ -1693,7 +1711,8 @@
     if ($("memory-enabled").value) query.set("active", $("memory-enabled").value);
     const result = await api("/api/memory/records?" + query);
     if (!memoryIsCurrent(version, id)) return;
-    if ((result.items || []).some((item) => item.conversation_id !== id)) throw new Error("记忆响应的会话范围不一致，已停止显示。");
+    if (state.memory.detail?.memory_scope && (result.access_conversation_id !== id || result.memory_scope !== state.memory.detail.memory_scope || result.global_memory_shared !== state.memory.detail.global_memory_shared)) throw new Error("记忆响应的会话范围不一致，请重新载入当前会话。");
+    if ((result.items || []).some((item) => !memoryMatchesSelection(item) || (state.memory.detail?.memory_scope && item.access_conversation_id !== id))) throw new Error("记忆响应的会话范围不一致，已停止显示。");
     state.memory.rows = result.items || []; state.memory.totalMemoryPages = Math.max(1, result.total_pages || 1);
     $("memories-page").textContent = "第 " + result.page + " / " + state.memory.totalMemoryPages + " 页 · " + result.total + " 条";
     renderMemories(); updateControls();
@@ -1713,7 +1732,7 @@
       checkbox.setAttribute("aria-label", "选择记忆 " + record.id); checkbox.dataset.memoryId = String(record.id);
       checkbox.addEventListener("change", () => { if (checkbox.checked) state.memory.checked.add(record.id); else state.memory.checked.delete(record.id); updateSelection(); updateControls(); });
       top.append(checkbox, element("span", "record-kind", kindNames[record.kind] || record.kind), element("span", "hint", "人物 " + record.subject_id), element("span", "record-state", (record.active ? "已启用" : "已停用") + " · " + (record.origin === "manual" ? "人工" : "自动") + (record.locked ? " · 锁定" : "")));
-      card.append(top, element("p", "memory-text", record.text));
+      card.append(top, element("p", "memory-text", record.text), element("p", "hint", memorySourceTitle(record)));
       const actions = element("div", "button-row");
       actions.append(memoryButton("编辑", () => openMemoryEditor(record), true), memoryButton(record.active ? "停用" : "启用", () => mutateMemory({ op: "set_active", id: record.id, version: record.version, active: !record.active }), true), memoryButton("遗忘", () => previewForget([record.id]), true));
       const details = element("details", "evidence-details"), summary = element("summary", "", "查看证据与来源"), evidence = element("div", "evidence-content"); details.append(summary, evidence);
@@ -1733,7 +1752,7 @@
     const version = state.memory.version, id = state.memory.selected?.id;
     const result = await api("/api/memory/records/" + record.id + "?evidence_page=" + page);
     if (!memoryIsCurrent(version, id) || !box.isConnected) return;
-    if (result.conversation_id !== id) throw new Error("证据不属于当前选中会话。");
+    if (!memoryMatchesSelection(result) || result.conversation_id !== record.conversation_id || result.subject_id !== record.subject_id) throw new Error("证据不属于当前选中的记忆范围。");
     const evidence = result.evidence || {}; box.replaceChildren();
     box.append(element("p", "hint", "记录 #" + record.id + " · 版本 " + result.version + " · 更新于 " + dateText(result.updated_at) + (result.expires_at ? " · 到期 " + dateText(result.expires_at) : " · 长期有效")));
     if (!(evidence.items || []).length) box.append(element("p", "hint", "没有可显示的原文证据。人工记录不伪造聊天来源。"));
@@ -1855,7 +1874,7 @@
   function openMemoryEditor(record = null) {
     state.memory.editing = record ? clone(record) : {}; state.memory.editorDirty = false;
     $("memory-editor-title").textContent = record ? "编辑记忆" : "新增记忆";
-    $("memory-editor-scope").textContent = scopeTitle(state.memory.detail) + " · 人工记录默认锁定，模型不会覆盖。";
+    $("memory-editor-scope").textContent = (record ? memorySourceTitle(record) : "来源：" + scopeTitle(state.memory.detail)) + (state.memory.detail.global_memory_shared ? " · 此 QQ 的记忆在同账号所有群聊和私聊共享。" : "。") + "人工记录默认锁定，模型不会覆盖。";
     $("edit-memory-subject").value = String(record?.subject_id ?? state.memory.detail.owner_id ?? (state.memory.detail.scene === "friend" ? state.memory.detail.peer_id : ""));
     $("edit-memory-kind").value = record?.kind || "fact"; $("edit-memory-text").value = record?.text || "";
     $("edit-memory-locked").checked = true; $("edit-memory-enabled").checked = record?.active ?? true;

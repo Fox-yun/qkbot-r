@@ -18,6 +18,8 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
     config.validate().unwrap();
     assert!(config.llm.vision);
+    assert!(config.plugins.ai.global_memory_shared);
+    assert_eq!(config.plugins.ai.memory_input_budget, 8000);
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -83,6 +85,24 @@ fn vision_defaults_on_for_legacy_configs_and_explicit_off_roundtrips() {
     let roundtrip: Config = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
     assert!(!roundtrip.llm.vision);
     assert!(format!("{:?}", disabled.llm).contains("vision: false"));
+}
+
+#[test]
+fn global_memory_sharing_defaults_on_and_explicit_off_roundtrips() {
+    assert!(Config::default().plugins.ai.global_memory_shared);
+    let legacy: Config = toml::from_str("[plugins.ai]\nkeywords = ['小鱼']").unwrap();
+    assert!(legacy.plugins.ai.global_memory_shared);
+    for shared in [false, true] {
+        let config: Config =
+            toml::from_str(&format!("[plugins.ai]\nglobal_memory_shared = {shared}")).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.plugins.ai.global_memory_shared, shared);
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.plugins.ai.global_memory_shared, shared);
+        let json_roundtrip: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(json_roundtrip.plugins.ai.global_memory_shared, shared);
+    }
 }
 
 #[test]
@@ -181,6 +201,7 @@ fn disabling_ai_does_not_require_a_model_endpoint() {
 #[test]
 fn larger_workloads_are_configurable_without_changing_lightweight_defaults() {
     let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    assert_eq!(Config::default().plugins.ai.memory_input_budget, 8000);
     assert_eq!(config.plugins.ai.max_memories_per_conversation, 256);
     assert_eq!(config.plugins.ai.memory_recall_limit, 5);
     assert_eq!(config.plugins.ai.defaults.input_budget, 6000);

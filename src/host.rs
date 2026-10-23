@@ -74,7 +74,8 @@ impl Host {
         let memory = MemoryStore::new(
             store.clone(),
             config.plugins.ai.max_memories_per_conversation,
-        );
+        )
+        .with_global_memory_shared(config.plugins.ai.global_memory_shared);
         memory.init().await?;
         crate::plugins::ai::semantic::init(&store).await?;
         let embedding = if config.embedding.enabled && config.plugins.ai.enabled {

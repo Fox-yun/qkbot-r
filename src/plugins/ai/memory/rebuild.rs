@@ -52,6 +52,8 @@ pub struct CommitStats {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Boundary {
     scope: String,
+    #[serde(default)]
+    memory_scope: String,
     epoch: i64,
     mode: String,
     owner_id: Option<i64>,
@@ -191,6 +193,7 @@ fn boundary(
         return Ok(None);
     };
     Ok(Some(Boundary {
+        memory_scope: super::scope::resolve(db, conversation_id)?,
         scope,
         epoch,
         mode,
@@ -272,8 +275,9 @@ pub fn status(db: &Connection, run_id: &str) -> Result<Status> {
 }
 
 fn existing_memories(db: &Connection, conversation_id: &str, subject: i64) -> Result<Vec<Value>> {
-    Ok(db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin,active,locked,version,created_at,updated_at,edited_by FROM ai_memories WHERE conversation_id=?1 AND subject_id=?2 ORDER BY id")?
-        .query_map(params![conversation_id,subject],|r|Ok(json!({
+    let domain = super::scope::resolve(db, conversation_id)?;
+    Ok(db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin,active,locked,version,created_at,updated_at,edited_by FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id=?2 ORDER BY id")?
+        .query_map(params![domain,subject],|r|Ok(json!({
             "id":r.get::<_,i64>(0)?,"subject_id":r.get::<_,i64>(1)?,"kind":r.get::<_,String>(2)?,
             "text":r.get::<_,String>(3)?,"evidence":r.get::<_,String>(4)?,"expires_at":r.get::<_,Option<i64>>(5)?,
             "origin":r.get::<_,String>(6)?,"active":r.get::<_,bool>(7)?,"locked":r.get::<_,bool>(8)?,
@@ -573,13 +577,9 @@ pub fn commit(
             expires_at,
         });
     }
-    let count: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM ai_memories WHERE conversation_id=?1",
-        [&batch.guard.conversation_id],
-        |r| r.get(0),
-    )?;
+    let count = super::scope::count(&tx, &batch.guard.conversation_id, batch.subject_id)?;
     ensure!(
-        inserts.is_empty() || usize::try_from(count)?.saturating_add(inserts.len()) <= capacity,
+        inserts.is_empty() || count.saturating_add(inserts.len()) <= capacity,
         "rebuild memory capacity exceeded; checkpoint was not advanced"
     );
     for insert in inserts {
@@ -622,6 +622,7 @@ mod tests {
         db.execute_batch(super::super::MIGRATION).unwrap();
         db.execute_batch(super::super::CURSOR_MIGRATION).unwrap();
         db.execute_batch(super::super::ADMIN_MIGRATION).unwrap();
+        db.execute_batch(super::super::scope::MIGRATION).unwrap();
         db.execute(
             "UPDATE ai_conversations SET memory_processed_until=1000",
             [],
@@ -677,6 +678,128 @@ mod tests {
     fn row_count(db: &Connection) -> i64 {
         db.query_row("SELECT COUNT(*) FROM ai_memories", [], |r| r.get(0))
             .unwrap()
+    }
+
+    fn other_chat(db: &Connection) -> &'static str {
+        let id = "1:friend:7:v0:user:7";
+        db.execute("INSERT INTO ai_conversations(id,scope,mode,owner_id,epoch) VALUES(?1,'1:friend:7','user',7,1)",[id]).unwrap();
+        id
+    }
+
+    #[test]
+    fn rebuild_shared_references_deduplicate_across_chats_and_keep_source_coordinates() {
+        let mut db = db();
+        let other = other_chat(&db);
+        write_memory(
+            &db,
+            other,
+            None,
+            7,
+            MemoryKind::Event,
+            "完成部署",
+            &[],
+            None,
+        )
+        .unwrap();
+        write_memory(
+            &db,
+            other,
+            None,
+            8,
+            MemoryKind::Event,
+            "他人的事项",
+            &[],
+            None,
+        )
+        .unwrap();
+        source(&db, 1, 7, "完成部署和复测", now());
+        let batch = prepared(&mut db);
+        assert_eq!(batch.existing.len(), 1);
+        let stats = commit_update(
+            &mut db,
+            &batch,
+            vec![
+                change(&batch.sources[0], "完成部署", None),
+                change(&batch.sources[0], "完成复测", None),
+            ],
+        );
+        assert_eq!((stats.inserted, stats.duplicates), (1, 1));
+        let source: (String, String) = db
+            .query_row(
+                "SELECT conversation_id,evidence FROM ai_memories WHERE text='完成复测'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source.0, CONVERSATION);
+        assert_eq!(
+            serde_json::from_str::<Vec<Evidence>>(&source.1).unwrap()[0].source_key,
+            batch.sources[0].key
+        );
+        assert_eq!(existing_memories(&db, other, 7).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rebuild_shared_capacity_and_concurrent_writes_cover_other_chats() {
+        let mut db = db();
+        let other = other_chat(&db);
+        write_memory(&db, other, None, 7, MemoryKind::Event, "旧事项", &[], None).unwrap();
+        source(&db, 1, 7, "新事项", now());
+        let batch = prepared(&mut db);
+        assert!(
+            commit(
+                &mut db,
+                &batch,
+                update(vec![change(&batch.sources[0], "新事项", None)]),
+                &AiSettings::default(),
+                1
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("capacity")
+        );
+        assert_eq!(status(&db, "rebuild-test").unwrap().batches, 0);
+        write_memory(
+            &db,
+            other,
+            None,
+            7,
+            MemoryKind::Event,
+            "并发新增",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            validate_snapshot(&db, &batch, &AiSettings::default())
+                .unwrap_err()
+                .to_string()
+                .contains("memories changed")
+        );
+        assert_eq!(row_count(&db), 2);
+    }
+
+    #[test]
+    fn rebuild_disabled_sharing_keeps_chat_references_separate_and_switch_invalidates_batch() {
+        let mut db = db();
+        let other = other_chat(&db);
+        write_memory(
+            &db,
+            other,
+            None,
+            7,
+            MemoryKind::Event,
+            "他处记忆",
+            &[],
+            None,
+        )
+        .unwrap();
+        source(&db, 1, 7, "原文", now());
+        let batch = prepared(&mut db);
+        super::super::scope::configure(&db, false).unwrap();
+        assert!(validate_snapshot(&db, &batch, &AiSettings::default()).is_err());
+        assert!(existing_memories(&db, CONVERSATION, 7).unwrap().is_empty());
+        assert_eq!(existing_memories(&db, other, 7).unwrap().len(), 1);
     }
 
     #[test]

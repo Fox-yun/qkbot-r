@@ -219,6 +219,7 @@ impl Runtime {
                     store.clone(),
                     config.plugins.ai.max_memories_per_conversation,
                 )
+                .with_global_memory_shared(config.plugins.ai.global_memory_shared)
                 .init()
                 .await?;
                 crate::plugins::ai::stickers::init_store(&store).await?;
@@ -475,5 +476,69 @@ impl Runtime {
             bail!("机器人后台任务异常结束");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn data_service_preserves_isolated_memory_when_bot_startup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("memory.db");
+        let store = Store::open(database.to_str().unwrap(), 16).await.unwrap();
+        MemoryStore::new(store.clone(), 256)
+            .with_global_memory_shared(false)
+            .init()
+            .await
+            .unwrap();
+        store.call(|db| {
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,summary) VALUES('existing','1:group:2','group','保留已有摘要')", [])?;
+            Ok(())
+        }).await.unwrap();
+        store.stop().await.unwrap();
+
+        let mut config = Config::default();
+        config.app.database = database.to_string_lossy().into_owned();
+        config.plugins.ai.global_memory_shared = false;
+        config.plugins.native.enabled.clear();
+        config.nonebot.enabled = false;
+        // The missing model endpoint stops the bot while leaving admin data online.
+        assert!(config.llm.chat_completions_url.is_empty());
+        let cancel = CancellationToken::new();
+        let (runtime, worker) = Runtime::start(config, "isolated".into(), cancel.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.status().await.phase != "error" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invalid bot configuration should fail startup");
+        runtime
+            .data()
+            .await
+            .unwrap()
+            .call(|db| {
+                let shared: bool = db.query_row(
+                    "SELECT global_shared FROM ai_memory_settings WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let (domain, summary, epoch): (String, String, i64) = db.query_row(
+                    "SELECT memory_scope,summary,epoch FROM ai_conversations WHERE id='existing'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                assert!(!shared);
+                assert_eq!(domain, "conversation:existing");
+                assert_eq!(summary, "保留已有摘要");
+                assert_eq!(epoch, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        cancel.cancel();
+        worker.await.unwrap();
     }
 }

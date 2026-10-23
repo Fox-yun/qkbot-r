@@ -60,13 +60,15 @@ send_cooldown_secs = 60        # 每群间隔；每次最终回复最多发送�
 [plugins.ai]
 enabled = true
 keywords = ["小鱼"]            # 群内真实 @ 或关键词触发；好友私聊直接触发
+global_memory_shared = true   # 同一机器人账号内，同一 QQ 的长期记忆在所有群聊和私聊共享；短期上下文仍独立
+# 关闭后长期记忆仅在来源会话可用；应用开关变更会重置短期上下文和摘要，保留长期记忆与原始消息
 read_group_background = true   # 已开启 Bot 的群内闲聊可作为短期背景
 learn_all_group_messages = false
 compact_after_messages = 40
 compact_idle_secs = 600
-memory_input_budget = 6000
+memory_input_budget = 8000    # 后台提炼输入预算；普通聊天 input_budget 独立配置
 memory_output_budget = 3200
-max_memories_per_conversation = 256 # 持久化容量，可按需要提高；不会全量载入上下文
+max_memories_per_conversation = 256 # 持久化容量：全域共享时按机器人账号内每个 QQ 计，关闭时按来源会话计；不会全量载入上下文
 memory_recall_limit = 5        # 每次最多召回的记忆条数，可提高
 memory_recall_budget = 1000    # 召回文本预算，最终仍受会话总输入预算约束
 

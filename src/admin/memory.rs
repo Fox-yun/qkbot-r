@@ -10,7 +10,8 @@ use crate::{
     config::{AiConfig, AiSettings},
     plugins::ai::{
         memory::{
-            MemoryKind, get_memory, lexical_terms, revoke_memories, validate_text, validate_ttl,
+            MemoryKind, get_memory, lexical_terms, revoke_memories, scope as memory_scope,
+            validate_text, validate_ttl,
         },
         resolve_settings,
     },
@@ -162,6 +163,8 @@ struct ConversationVersion {
     scope: String,
     epoch: i64,
     revision: i64,
+    #[serde(default)]
+    memory_scope: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct RecordVersion {
@@ -301,12 +304,21 @@ impl MemoryAdmin {
         self.store.call(move|db| {
             let offset=page_offset(query.page)?;
             ensure!(query.keyword.as_ref().is_none_or(|q|q.len()<=512),"keyword too long");
-            conversation_version(db,&query.conversation_id)?;
-            let predicate="conversation_id=?1 AND (?2 IS NULL OR instr(lower(text),lower(?2))>0) AND (?3 IS NULL OR subject_id=?3) AND (?4 IS NULL OR active=?4)";
-            let total:i64=db.query_row(&format!("SELECT count(*) FROM ai_memories WHERE {predicate}"),params![query.conversation_id,query.keyword,query.subject_id,query.active],|r|r.get(0))?;
-            let mut stmt=db.prepare(&format!("SELECT {RECORD_COLUMNS} FROM ai_memories WHERE {predicate} ORDER BY updated_at DESC,id DESC LIMIT 20 OFFSET ?5"))?;
-            let items=stmt.query_map(params![query.conversation_id,query.keyword,query.subject_id,query.active,offset],record_value)?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(page_value(items,total,query.page))
+            let domain=memory_scope::resolve(db,&query.conversation_id)?;
+            let owner:Option<i64>=db.query_row("SELECT owner_id FROM ai_conversations WHERE id=?1",[&query.conversation_id],|r|r.get(0))?;
+            let predicate="conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND (?2 IS NULL OR instr(lower(text),lower(?2))>0) AND (?3 IS NULL OR subject_id=?3) AND (?4 IS NULL OR active=?4) AND (?5 IS NULL OR subject_id=?5)";
+            let total:i64=db.query_row(&format!("SELECT count(*) FROM ai_memories WHERE {predicate}"),params![domain,query.keyword,query.subject_id,query.active,owner],|r|r.get(0))?;
+            let mut stmt=db.prepare(&format!("SELECT {RECORD_COLUMNS} FROM ai_memories WHERE {predicate} ORDER BY updated_at DESC,id DESC LIMIT 20 OFFSET ?6"))?;
+            let mut items=stmt.query_map(params![domain,query.keyword,query.subject_id,query.active,owner,offset],record_value)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for item in &mut items {
+                annotate_record(db,item)?;
+                item["access_conversation_id"]=json!(query.conversation_id);
+            }
+            let mut page=page_value(items,total,query.page);
+            page["memory_scope"]=json!(domain);
+            page["global_memory_shared"]=json!(domain.starts_with("bot:"));
+            page["access_conversation_id"]=json!(query.conversation_id);
+            Ok(page)
         }).await
     }
 
@@ -319,6 +331,7 @@ impl MemoryAdmin {
         actor.validate()?;
         self.store.call(move|db| {
             let mut item=record(db,id)?;
+            annotate_record(db,&mut item)?;
             let offset=page_offset(evidence_page)?;
             let total:i64=db.query_row("SELECT count(*) FROM ai_memory_provenance WHERE memory_id=?1",[id],|r|r.get(0))?;
             let mut stmt=db.prepare("SELECT source_key,quote FROM ai_memory_provenance WHERE memory_id=?1 ORDER BY source_key,quote LIMIT 20 OFFSET ?2")?;
@@ -351,30 +364,31 @@ impl MemoryAdmin {
             if let Some(result)=receipt(&tx,&actor,&request.request_id,Some(&hash))? { return Ok(result); }
             let cv=check_version(&tx,&request.conversation_id,request.epoch,request.memory_revision)?;
             let mut ids=Vec::new();
-            let scopes=vec![cv.scope.clone()];
+            let mut scopes=vec![cv.scope.clone()];
             match &request.action {
                 Action::Create{subject_id,kind,text,ttl_days,active} => {
                     validate_subject(&tx,&cv.id,*subject_id)?;
                     validate_text(text)?; validate_ttl(*ttl_days)?;
-                    let count:i64=tx.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id=?1",[&cv.id],|r|r.get(0))?;
-                    ensure!(usize::try_from(count)?<config.max_memories_per_conversation,"memory capacity reached");
+                    ensure!(memory_scope::count(&tx,&cv.id,*subject_id)?<config.max_memories_per_conversation,"memory capacity reached");
                     let expiry=ttl_days.map(|d|now()+i64::from(d)*86400);
                     tx.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,expires_at,origin,active,locked,version,edited_by) VALUES(?1,?2,?3,?4,'[]',?5,?5,?6,'manual',?7,1,1,?8)",params![cv.id,subject_id,kind.as_str(),text,now(),expiry,active,actor.admin_id])?;
                     let id=tx.last_insert_rowid(); index_memory(&tx,id,text,*active)?;ids.push(id);
-                    bump_context(&tx,&cv,true,true)?;
+                    scopes=bump_memory_contexts(&tx,&cv.id)?;
                 }
                 Action::Edit{id,version,kind,text,ttl_days,locked,active}=> {
                     validate_text(text)?;validate_ttl(*ttl_days)?;
+                    validate_memory_access(&tx,&cv.id,*id)?;
                     let expiry=ttl_days.map(|d|now()+i64::from(d)*86400);
-                    require_version(tx.execute("UPDATE ai_memories SET kind=?1,text=?2,expires_at=?3,origin='manual',active=?4,locked=?5,edited_by=?6,version=version+1,updated_at=?7 WHERE id=?8 AND conversation_id=?9 AND version=?10",params![kind.as_str(),text,expiry,active,locked,actor.admin_id,now(),id,cv.id,version])?==1,"memory version conflict")?;
+                    require_version(tx.execute("UPDATE ai_memories SET kind=?1,text=?2,expires_at=?3,origin='manual',active=?4,locked=?5,edited_by=?6,version=version+1,updated_at=?7 WHERE id=?8 AND version=?9",params![kind.as_str(),text,expiry,active,locked,actor.admin_id,now(),id,version])?==1,"memory version conflict")?;
                     index_memory(&tx,*id,text,*active)?;ids.push(*id);
-                    bump_context(&tx,&cv,true,true)?;
+                    scopes=bump_memory_contexts(&tx,&cv.id)?;
                 }
                 Action::SetActive{id,version,active}=> {
-                    require_version(tx.execute("UPDATE ai_memories SET active=?1,locked=1,edited_by=?2,version=version+1,updated_at=?3 WHERE id=?4 AND conversation_id=?5 AND version=?6",params![active,actor.admin_id,now(),id,cv.id,version])?==1,"memory version conflict")?;
+                    validate_memory_access(&tx,&cv.id,*id)?;
+                    require_version(tx.execute("UPDATE ai_memories SET active=?1,locked=1,edited_by=?2,version=version+1,updated_at=?3 WHERE id=?4 AND version=?5",params![active,actor.admin_id,now(),id,version])?==1,"memory version conflict")?;
                     let text:String=tx.query_row("SELECT text FROM ai_memories WHERE id=?1",[id],|r|r.get(0))?;
                     index_memory(&tx,*id,&text,*active)?;ids.push(*id);
-                    bump_context(&tx,&cv,true,true)?;
+                    scopes=bump_memory_contexts(&tx,&cv.id)?;
                 }
                 Action::Settings{settings}=> {
                     ensure!(config.persona(&settings.persona).is_some(),"当前运行配置中没有该人设；如刚保存了自定义人设，请先应用全局配置");
@@ -442,7 +456,11 @@ impl MemoryAdmin {
             require_version(forget_plan(&tx,&plan.conversation_id,&plan.requested_ids)?==plan,"preview version conflict; review a new preview")?;
             let targets=plan.requested_ids.iter().map(|id|get_memory(&tx,*id)?.context("memory no longer exists")).collect::<Result<Vec<_>>>()?;
             revoke_memories(&tx,&targets)?;
-            for cv in &plan.conversations { bump_context(&tx,cv,false,true)?; }
+            let mut invalidated=std::collections::BTreeSet::new();
+            for cv in &plan.conversations {
+                let bot=cv.scope.split(':').next().unwrap_or(&cv.scope);
+                if invalidated.insert(bot.to_owned()) { memory_scope::invalidate(&tx,&cv.id)?; }
+            }
             let scopes=plan.conversations.iter().map(|c|c.scope.clone()).collect::<std::collections::BTreeSet<_>>();
             let cv=conversation_version(&tx,&plan.conversation_id)?;
             let result=json!({"request_id":request.request_id,"status":"completed","scopes":scopes,"ids":plan.records.iter().map(|r|r.id).collect::<Vec<_>>(),"deleted_count":plan.records.len(),"source_count":plan.source_count,"epoch":cv.epoch,"memory_revision":cv.revision});
@@ -481,6 +499,22 @@ fn record(db: &Connection, id: i64) -> Result<Value> {
     .optional()?
     .ok_or_else(|| AdminError::NotFound("memory not found").into())
 }
+fn annotate_record(db: &Connection, item: &mut Value) -> Result<()> {
+    let id = item["conversation_id"]
+        .as_str()
+        .context("invalid memory source")?;
+    let domain = memory_scope::resolve(db, id)?;
+    let (scope, mode, owner): (String, String, Option<i64>) = db.query_row(
+        "SELECT scope,mode,owner_id FROM ai_conversations WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    item["memory_scope"] = json!(domain);
+    item["source_scope"] = json!(scope);
+    item["source_mode"] = json!(mode);
+    item["source_owner_id"] = json!(owner);
+    Ok(())
+}
 fn page_offset(page: Option<usize>) -> Result<i64> {
     let page = page.unwrap_or(1);
     ensure!(page > 0, "page starts at 1");
@@ -496,7 +530,7 @@ fn page_value(items: Vec<Value>, total: i64, page: Option<usize>) -> Value {
 }
 fn conversation_version(db: &Connection, id: &str) -> Result<ConversationVersion> {
     db.query_row(
-        "SELECT id,scope,epoch,memory_revision FROM ai_conversations WHERE id=?1",
+        "SELECT id,scope,epoch,memory_revision,memory_scope FROM ai_conversations WHERE id=?1",
         [id],
         |r| {
             Ok(ConversationVersion {
@@ -504,6 +538,7 @@ fn conversation_version(db: &Connection, id: &str) -> Result<ConversationVersion
                 scope: r.get(1)?,
                 epoch: r.get(2)?,
                 revision: r.get(3)?,
+                memory_scope: r.get(4)?,
             })
         },
     )
@@ -534,9 +569,12 @@ fn conversation_value(
     settings.mode = value["mode"].as_str().unwrap().to_owned();
     value.as_object_mut().unwrap().remove("settings_raw");
     value["settings"] = serde_json::to_value(settings)?;
+    let domain = memory_scope::resolve(db, id)?;
+    value["memory_scope"] = json!(domain);
+    value["global_memory_shared"] = json!(domain.starts_with("bot:"));
     value["memory_count"] = json!(db.query_row(
-        "SELECT count(*) FROM ai_memories WHERE conversation_id=?1",
-        [id],
+        "SELECT count(*) FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND (?2 IS NULL OR subject_id=?2)",
+        params![domain,value["owner_id"].as_i64()],
         |r| r.get::<_, i64>(0)
     )?);
     let scope = value["scope"].as_str().unwrap().to_owned();
@@ -582,6 +620,44 @@ fn validate_subject(db: &Connection, conversation_id: &str, subject: i64) -> Res
         "subject is outside this isolated conversation"
     );
     Ok(())
+}
+fn validate_memory_access(db: &Connection, conversation_id: &str, id: i64) -> Result<()> {
+    let domain = memory_scope::resolve(db, conversation_id)?;
+    let subject:Option<i64>=db.query_row(
+        "SELECT subject_id FROM ai_memories WHERE id=?1 AND conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2)",
+        params![id,domain],|r|r.get(0)).optional()?;
+    let subject = subject.ok_or(AdminError::Conflict(
+        "selected memory is missing or outside this memory scope",
+    ))?;
+    validate_subject(db, conversation_id, subject)
+}
+/// Memory triggers already advanced every shared revision. Keep message history
+/// while invalidating in-flight replies and summaries in every affected chat.
+fn bump_memory_contexts(db: &Connection, conversation_id: &str) -> Result<Vec<String>> {
+    let domain = memory_scope::resolve(db, conversation_id)?;
+    let conversations = db
+        .prepare("SELECT id,scope,epoch FROM ai_conversations WHERE memory_scope=?1 ORDER BY id")?
+        .query_map([&domain], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut scopes = std::collections::BTreeSet::new();
+    for (id, scope, epoch) in conversations {
+        db.execute(
+            "UPDATE ai_conversations SET epoch=epoch+1,summary='',compacted_until=0 WHERE id=?1",
+            [&id],
+        )?;
+        db.execute(
+            "UPDATE messages SET epoch=epoch+1 WHERE conversation_id=?1 AND epoch=?2",
+            params![id, epoch],
+        )?;
+        scopes.insert(scope);
+    }
+    Ok(scopes.into_iter().collect())
 }
 fn index_memory(db: &Connection, id: i64, text: &str, active: bool) -> Result<()> {
     db.execute("DELETE FROM ai_memory_search WHERE memory_id=?1", [id])?;
@@ -655,11 +731,9 @@ fn forget_plan(db: &Connection, conversation_id: &str, ids: &[i64]) -> Result<Fo
     ids.sort_unstable();
     ids.dedup();
     let encoded = serde_json::to_string(&ids)?;
-    let count:i64=db.query_row("SELECT count(*) FROM ai_memories WHERE conversation_id=?1 AND id IN (SELECT value FROM json_each(?2))",params![conversation_id,encoded],|r|r.get(0))?;
-    require_version(
-        count == i64::try_from(ids.len())?,
-        "selected memory is missing or outside this conversation",
-    )?;
+    for id in &ids {
+        validate_memory_access(db, conversation_id, *id)?;
+    }
     let mut stmt=db.prepare(&format!("{PLAN_KEYS} SELECT m.id,m.version FROM ai_memories m WHERE m.id IN (SELECT value FROM json_each(?1)) OR EXISTS(SELECT 1 FROM ai_memory_provenance p JOIN keys k ON k.source_key=p.source_key WHERE p.memory_id=m.id) ORDER BY m.id"))?;
     let records = stmt
         .query_map([&encoded], |r| {
@@ -670,7 +744,9 @@ fn forget_plan(db: &Connection, conversation_id: &str, ids: &[i64]) -> Result<Fo
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let affected = serde_json::to_string(&records.iter().map(|r| r.id).collect::<Vec<_>>())?;
-    let mut stmt=db.prepare("SELECT DISTINCT conversation_id FROM ai_memories WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY conversation_id")?;
+    // Forgetting clears all contexts for each affected bot, including contexts
+    // that consumed a shared memory before sharing was switched off.
+    let mut stmt=db.prepare("SELECT c.id FROM ai_conversations c WHERE substr(c.scope,1,instr(c.scope,':')) IN (SELECT substr(source.scope,1,instr(source.scope,':')) FROM ai_memories m JOIN ai_conversations source ON source.id=m.conversation_id WHERE m.id IN (SELECT value FROM json_each(?1))) ORDER BY c.id")?;
     let conversations = stmt
         .query_map([affected], |r| r.get::<_, String>(0))?
         .map(|row| conversation_version(db, &row?))
@@ -747,6 +823,226 @@ mod tests {
             bot_id: "1".into(),
             persona: persona.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn shared_admin_reads_edits_and_forgets_through_another_chat_with_owner_checks() {
+        let (_dir, store, service, actor) = fixture().await;
+        let created = service
+            .mutate(&actor, create("shared-create", 1, 0))
+            .await
+            .unwrap();
+        let id = created["ids"][0].as_i64().unwrap();
+        store.call(|db| {
+            db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at) VALUES('group',8,'fact','另一个人','[]',1,1)",[])?;
+            Ok(())
+        }).await.unwrap();
+        let list = service
+            .memories(
+                &actor,
+                MemoryQuery {
+                    conversation_id: "private".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["access_conversation_id"], "private");
+        assert_eq!(list["memory_scope"], "bot:1");
+        assert_eq!(list["items"][0]["conversation_id"], "group");
+        assert_eq!(list["items"][0]["source_scope"], "1:group:10");
+        assert_eq!(
+            service.conversation(&actor, "private").await.unwrap()["memory_count"],
+            1
+        );
+        assert_eq!(
+            service
+                .memories(
+                    &actor,
+                    MemoryQuery {
+                        conversation_id: "other".into(),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()["total"],
+            0
+        );
+        let detail = service.detail(&actor, id, None).await.unwrap();
+        assert_eq!(detail["memory_scope"], "bot:1");
+        let cv = service.conversation(&actor, "private").await.unwrap();
+        let request = MutationRequest {
+            request_id: "shared-edit".into(),
+            conversation_id: "private".into(),
+            epoch: cv["epoch"].as_i64().unwrap(),
+            memory_revision: cv["memory_revision"].as_i64().unwrap(),
+            action: Action::Edit {
+                id,
+                version: 1,
+                kind: MemoryKind::Preference,
+                text: "跨会话编辑".into(),
+                ttl_days: None,
+                locked: true,
+                active: true,
+            },
+        };
+        service.mutate(&actor, request).await.unwrap();
+        assert_eq!(
+            service.detail(&actor, id, None).await.unwrap()["conversation_id"],
+            "group"
+        );
+        let cv = service.conversation(&actor, "private").await.unwrap();
+        let inaccessible = service
+            .memories(
+                &actor,
+                MemoryQuery {
+                    conversation_id: "group".into(),
+                    subject_id: Some(8),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()["items"][0]["id"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            service
+                .preview_forget(
+                    &actor,
+                    ForgetPreviewRequest {
+                        conversation_id: "private".into(),
+                        epoch: cv["epoch"].as_i64().unwrap(),
+                        memory_revision: cv["memory_revision"].as_i64().unwrap(),
+                        ids: vec![inaccessible]
+                    }
+                )
+                .await
+                .is_err()
+        );
+        let preview = service
+            .preview_forget(
+                &actor,
+                ForgetPreviewRequest {
+                    conversation_id: "private".into(),
+                    epoch: cv["epoch"].as_i64().unwrap(),
+                    memory_revision: cv["memory_revision"].as_i64().unwrap(),
+                    ids: vec![id],
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .confirm_forget(
+                &actor,
+                ForgetConfirmRequest {
+                    request_id: "shared-forget".into(),
+                    preview_id: preview["preview_id"].as_str().unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(service.detail(&actor, id, None).await.is_err());
+        assert_eq!(
+            service
+                .memories(
+                    &actor,
+                    MemoryQuery {
+                        conversation_id: "group".into(),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()["total"],
+            1
+        );
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_admin_capacity_and_cas_cover_other_chats_and_switch_off_isolates() {
+        let (_dir, store, service, actor) = fixture().await;
+        let limited = MemoryAdmin::new(
+            store.clone(),
+            AiConfig {
+                max_memories_per_conversation: 1,
+                ..Default::default()
+            },
+        );
+        let before = service.conversation(&actor, "private").await.unwrap();
+        let created = limited
+            .mutate(&actor, create("capacity-create", 1, 0))
+            .await
+            .unwrap();
+        let id = created["ids"][0].as_i64().unwrap();
+        let mut request = create(
+            "capacity-other-chat",
+            before["epoch"].as_i64().unwrap(),
+            before["memory_revision"].as_i64().unwrap(),
+        );
+        request.conversation_id = "private".into();
+        assert!(
+            limited
+                .mutate(&actor, request.clone())
+                .await
+                .unwrap_err()
+                .is::<AdminError>()
+        );
+        let current = service.conversation(&actor, "private").await.unwrap();
+        request.epoch = current["epoch"].as_i64().unwrap();
+        request.memory_revision = current["memory_revision"].as_i64().unwrap();
+        assert!(
+            limited
+                .mutate(&actor, request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("capacity")
+        );
+        store
+            .call(|db| {
+                let tx = db.transaction()?;
+                memory_scope::configure(&tx, false)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .memories(
+                    &actor,
+                    MemoryQuery {
+                        conversation_id: "private".into(),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()["total"],
+            0
+        );
+        let cv = service.conversation(&actor, "private").await.unwrap();
+        assert_eq!(cv["global_memory_shared"], false);
+        assert!(
+            service
+                .mutate(
+                    &actor,
+                    MutationRequest {
+                        request_id: "isolated-edit".into(),
+                        conversation_id: "private".into(),
+                        epoch: cv["epoch"].as_i64().unwrap(),
+                        memory_revision: cv["memory_revision"].as_i64().unwrap(),
+                        action: Action::SetActive {
+                            id,
+                            version: 1,
+                            active: false
+                        }
+                    }
+                )
+                .await
+                .is_err()
+        );
+        store.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -1135,7 +1431,7 @@ mod tests {
             for table in ["ai_memories","ai_memory_search","ai_memory_provenance"] { assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,i64>(0))?,0); }
             assert_eq!(db.query_row("SELECT count(*) FROM ai_revoked_sources",[],|r|r.get::<_,i64>(0))?,2);
             assert!(db.query_row("SELECT revoked FROM messages WHERE key='1:group:10:1'",[],|r|r.get::<_,bool>(0))?);
-            assert_eq!(db.query_row("SELECT epoch,summary,memory_revision FROM ai_conversations WHERE id='other'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?,(2,String::new(),1));
+            assert_eq!(db.query_row("SELECT epoch,summary,memory_revision FROM ai_conversations WHERE id='other'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?,(2,String::new(),3));
             let snapshot:Option<String>=db.query_row("SELECT snapshot FROM ai_memory_previews LIMIT 1",[],|r|r.get(0)).optional()?;assert!(snapshot.is_none());
             let audit:String=db.query_row("SELECT result FROM ai_memory_operations WHERE request_id='forget-all'",[],|r|r.get(0))?;assert!(!audit.contains("红茶"));assert!(!audit.contains("绿茶"));
             Ok(())

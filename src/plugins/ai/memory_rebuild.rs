@@ -129,6 +129,10 @@ pub async fn run(path: &Path, run_id: &str, max_batches: usize) -> Result<()> {
     ensure!(max_batches <= 10_000, "memory_rebuild_batch_limit");
     let digest = config_digest(path)?;
     let mut db = open(path, &config, false).context("rebuild_database")?;
+    memory::scope::ensure_schema(&db).context("rebuild_memory_schema")?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    memory::scope::configure(&tx, config.plugins.ai.global_memory_shared)?;
+    tx.commit()?;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))

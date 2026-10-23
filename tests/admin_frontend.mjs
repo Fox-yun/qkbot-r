@@ -243,6 +243,50 @@ test("malformed memory scope response is rejected before display", async () => {
   h.setHandler(async () => ({ body: { items: [{ id: 1, conversation_id: "other", text: "secret" }], page: 1, total: 1, total_pages: 1 } }));
   await assert.rejects(h.app.loadMemories(), /范围/u); assert.equal(h.app.state.memory.rows.length, 0);
 });
+test("global memory sharing switch survives normal form editing", async () => {
+  const h = harness(); await h.login();
+  const toggle = h.app.inputs.get("plugins.ai.global_memory_shared").control;
+  assert.equal(toggle.checked, true);
+  toggle.checked = false; await toggle.emit("input");
+  assert.equal(h.app.readForm().plugins.ai.global_memory_shared, false);
+  const restored = h.snapshot(); restored.config.plugins.ai.global_memory_shared = false;
+  h.setHandler(async () => ({ body: restored })); await h.app.loadConfig();
+  assert.equal(h.app.inputs.get("plugins.ai.global_memory_shared").control.checked, false);
+});
+test("shared memory displays another source conversation and loads its evidence in the current scope", async () => {
+  const h = harness(); await h.login();
+  const cv = { ...h.conversation(), memory_scope: "bot:1", global_memory_shared: true };
+  const record = { id: 1, conversation_id: "1:friend:7:v0:user:7", source_scope: "1:friend:7", source_owner_id: 7, memory_scope: "bot:1", access_conversation_id: cv.id, subject_id: 7, kind: "preference", text: "喜欢红茶", active: true, origin: "auto", version: 1, updated_at: 1800000000 };
+  h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? cv : path.includes("/records/1?") ? { ...record, evidence: { items: [{ source_key: "1:friend:7:8", quote: "喜欢红茶" }], total_pages: 1 } } : { memory_scope: "bot:1", access_conversation_id: cv.id, global_memory_shared: true, items: [record], page: 1, total_pages: 1, total: 1 } }));
+  await h.app.selectConversation(cv);
+  assert.match(h.ids.get("memory-range-description").textContent, /全域共享.*所有群聊和私聊/u);
+  assert.match(h.ids.get("memory-list").textContent, /来源：机器人 1 · 私聊 7/u);
+  const box = h.document.createElement("div"); h.ids.get("memory-list").append(box);
+  await h.app.loadEvidence(record, box, 1);
+  assert.match(box.textContent, /喜欢红茶/u);
+  h.app.openMemoryEditor(record);
+  assert.match(h.ids.get("memory-editor-scope").textContent, /私聊 7.*所有群聊和私聊共享/u);
+});
+test("shared memory rejects another bot, member, access conversation or mismatched detail", async () => {
+  const h = harness(); await h.login();
+  const cv = { ...h.conversation("1:friend:7:v0:user:7"), scene: "friend", peer_id: 7, owner_id: 7, memory_scope: "bot:1", global_memory_shared: true };
+  h.app.state.memory.selected = cv; h.app.state.memory.detail = cv;
+  const record = { id: 1, conversation_id: "1:group:20:v0:group", source_scope: "1:group:20", memory_scope: "bot:1", access_conversation_id: cv.id, subject_id: 7, text: "共享资料", kind: "fact" };
+  const page = { memory_scope: "bot:1", access_conversation_id: cv.id, global_memory_shared: true, items: [record], page: 1, total: 1, total_pages: 1 };
+  for (const patch of [{ memory_scope: "bot:2" }, { subject_id: 8 }, { access_conversation_id: "another-entry" }]) {
+    h.setHandler(async () => ({ body: { ...page, items: [{ ...record, ...patch }] } }));
+    await assert.rejects(h.app.loadMemories(), /范围/u);
+    assert.equal(h.app.state.memory.rows.length, 0);
+  }
+  h.setHandler(async () => ({ body: { ...page, global_memory_shared: false } }));
+  await assert.rejects(h.app.loadMemories(), /范围/u);
+  const box = h.document.createElement("div"); h.ids.get("memory-list").append(box);
+  for (const patch of [{ memory_scope: "bot:2" }, { subject_id: 8 }, { conversation_id: "wrong-source" }]) {
+    h.setHandler(async () => ({ body: { ...record, ...patch, evidence: { items: [] } } }));
+    await assert.rejects(h.app.loadEvidence(record, box, 1), /范围/u);
+    assert.equal(box.textContent, "");
+  }
+});
 test("manual create is locked by the server and edit defaults to locked", async () => {
   const h = harness(); await h.login(); const cv = h.conversation(); h.app.state.memory.detail = cv; h.app.state.memory.selected = cv;
   h.app.openMemoryEditor(); assert.equal(h.ids.get("edit-memory-locked").checked, true); assert.equal(h.ids.get("edit-memory-locked").disabled, true);

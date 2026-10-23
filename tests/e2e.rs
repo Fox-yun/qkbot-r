@@ -1321,6 +1321,141 @@ async fn user_mode_separates_people_groups_and_private_conversations() {
     mock.stop().await;
 }
 
+const CROSS_CHAT_PREFERENCE: &str = "长期偏好乌龙茶";
+const SOURCE_CHAT_ONLY: &str = "仅在来源群短期出现的暗号";
+
+async fn seed_cross_chat_preference(
+    host: &Host,
+    router: &Router,
+    mock: &mut MockServer,
+) -> (qkbot::types::ContextGuard, i64) {
+    let mut source = message(1, &format!("{CROSS_CHAT_PREFERENCE}；{SOURCE_CHAT_ONLY}"));
+    source.sender_id = 7;
+    router.dispatch(source.clone()).await.unwrap();
+    mock.model()
+        .await
+        .reply
+        .send(answer("已收到来源群消息"))
+        .unwrap();
+    assert_eq!(mock.sent().await, "已收到来源群消息");
+    wait_for_outbox(host, "confirmed", 1).await;
+    let conversation = qkbot::plugins::ai::conversation(host, &source)
+        .await
+        .unwrap();
+    let id = host
+        .memory
+        .remember(
+            &conversation.guard,
+            7,
+            &source.key.key(),
+            CROSS_CHAT_PREFERENCE,
+            qkbot::plugins::ai::memory::MemoryKind::Preference,
+            None,
+        )
+        .await
+        .unwrap();
+    (conversation.guard, id)
+}
+
+#[tokio::test]
+async fn global_memory_shares_same_qq_across_groups_and_private_chat_without_history_or_other_people()
+ {
+    for enabled in [true, false] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            // The enabled case deliberately uses the default setting.
+            if !enabled {
+                config.plugins.ai.global_memory_shared = false;
+            }
+            config.plugins.ai.defaults.summary = false;
+            config.plugins.ai.defaults.memory_write = false;
+        })
+        .await;
+        assert_eq!(host.config.plugins.ai.global_memory_shared, enabled);
+        seed_cross_chat_preference(&host, &router, &mut mock).await;
+
+        let mut group = message(1, "我平时喜欢喝什么茶？");
+        group.key.scope.peer_id = 654;
+        group.sender_id = 7;
+        let mut private = message(1, "你记得我的饮茶偏好吗？");
+        private.key.scope.scene = Scene::Friend;
+        private.key.scope.peer_id = 7;
+        private.sender_id = 7;
+        private.mentions.clear();
+        let mut other_person = message(2, "你知道我喜欢喝什么茶吗？");
+        other_person.key.scope.peer_id = 654;
+        other_person.sender_id = 8;
+
+        for (incoming, same_person) in [(group, true), (private, true), (other_person, false)] {
+            router.dispatch(incoming).await.unwrap();
+            let request = mock.model().await;
+            let prompt = request.body["messages"].to_string();
+            assert_eq!(
+                prompt.contains(CROSS_CHAT_PREFERENCE),
+                enabled && same_person,
+                "sharing={enabled}, same_person={same_person}: {prompt}"
+            );
+            assert!(
+                !prompt.contains(SOURCE_CHAT_ONLY),
+                "long-term sharing must keep source chat history separate"
+            );
+            assert!(!prompt.contains("已收到来源群消息"));
+            if enabled && same_person {
+                assert!(prompt.contains("关于用户 7"));
+                assert!(prompt.contains("记录来源范围 123:group:456"));
+            }
+            // A generic reply keeps the next person's group history free of the
+            // remembered preference, so this checks subject filtering directly.
+            request.reply.send(answer("目标会话已处理")).unwrap();
+            assert_eq!(mock.sent().await, "目标会话已处理");
+        }
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn forgetting_shared_memory_during_another_groups_model_wait_blocks_its_stale_reply() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.defaults.summary = false;
+        config.plugins.ai.defaults.memory_write = false;
+    })
+    .await;
+    let (source_guard, id) = seed_cross_chat_preference(&host, &router, &mut mock).await;
+    let mut question = message(1, "说说我的饮茶偏好");
+    question.key.scope.peer_id = 654;
+    question.sender_id = 7;
+    router.dispatch(question.clone()).await.unwrap();
+    let old = mock.model().await;
+    assert!(
+        old.body["messages"]
+            .to_string()
+            .contains(CROSS_CHAT_PREFERENCE)
+    );
+
+    host.memory.forget(&source_guard, 7, id).await.unwrap();
+    old.reply.send(answer("旧回复不得发送")).unwrap();
+    question.key.message_seq = 2;
+    question.text = "遗忘后的新问题".into();
+    router.dispatch(question).await.unwrap();
+    let fresh = mock.model().await;
+    let prompt = fresh.body["messages"].to_string();
+    assert!(!prompt.contains(CROSS_CHAT_PREFERENCE));
+    assert!(!prompt.contains("说说我的饮茶偏好"));
+    assert!(!prompt.contains(SOURCE_CHAT_ONLY));
+    fresh.reply.send(answer("遗忘后的新回复")).unwrap();
+    assert_eq!(mock.sent().await, "遗忘后的新回复");
+    within(router.shutdown()).await.unwrap();
+    assert!(mock.sends.try_recv().is_err());
+    assert!(mock.models.try_recv().is_err());
+    drop(host);
+    mock.stop().await;
+}
+
 #[tokio::test]
 async fn quoted_same_sequence_is_resolved_with_full_scene_and_peer_key() {
     let mut mock = MockServer::start().await;
