@@ -143,6 +143,13 @@ impl AutoBatch {
         self.sources.iter().map(|source| source.key.key()).collect()
     }
 
+    pub(super) fn context_quote_keys(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .filter_map(|source| source.quote_key().map(|key| key.key()))
+            .collect()
+    }
+
     pub(super) fn authorization(&self) -> BatchCheck {
         BatchCheck {
             limits: self.limits,
@@ -283,6 +290,7 @@ pub(crate) async fn revoke_source(host: &Host, key: &MessageKey) -> Result<()> {
                 [&key],
             )?;
             super::learning::invalidate_sources(&tx, std::slice::from_ref(&key))?;
+            super::context::continuity::invalidate_sources(&tx, std::slice::from_ref(&key))?;
             tx.commit()?;
             Ok(())
         })
@@ -388,10 +396,11 @@ pub(super) async fn load_media(
         if let Some(quote) = &quote {
             let content = quote.content(host).await?;
             ensure!(content != "[引用已遗忘]", "自动接话引用已遗忘");
-            let content = if reply_enabled && content != "[引用不可用]" && quote.sender.is_some()
+            let content = if reply_enabled
+                && content != "[引用不可用]"
+                && let Some(sender) = quote.sender
             {
-                let (reference, envelope) =
-                    references.quote(&quote.key, quote.sender.unwrap(), &content)?;
+                let (reference, envelope) = references.quote(&quote.key, sender, &content)?;
                 result.quote_refs.push(reference);
                 envelope
             } else {
@@ -844,7 +853,9 @@ mod tests {
             assert_eq!(other, (false, true, 1));
             assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key='1:group:2:30')", [], |row| row.get::<_, bool>(0))?);
             let conversation: (i64, String) = db.query_row("SELECT epoch,summary FROM ai_conversations WHERE id='recall-test'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            assert_eq!(conversation, (1, "保持原有摘要".into()));
+            // Legacy summaries have no complete source graph. The first recall
+            // clears them; duplicate or unseen keys do not reset an empty epoch.
+            assert_eq!(conversation, (2, String::new()));
             Ok(())
         }).await.unwrap();
         restarted.cancel.cancel();

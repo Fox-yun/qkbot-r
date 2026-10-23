@@ -33,13 +33,14 @@
     <aside class="sidebar">
       <a class="brand" href="#overview"><span class="brand-mark small" aria-hidden="true">鱼</span><span>小鱼<span class="brand-sub">管理台</span></span></a>
       <nav class="navigation" aria-label="主要导航">
+        <span class="nav-section-label">工作空间</span>
         <button class="nav-item active" type="button" data-view="overview" aria-current="page"><span aria-hidden="true">◫</span>运行概览</button>
-        <button class="nav-item" type="button" data-view="qq"><span aria-hidden="true">◎</span>QQ 登录</button>
+        <button class="nav-item" type="button" data-view="context"><span aria-hidden="true">⌘</span>上下文与知识</button>
         <button class="nav-item" type="button" data-view="contacts"><span aria-hidden="true">◉</span>群与好友</button>
-        <button class="nav-item" type="button" data-view="memory"><span aria-hidden="true">▤</span>记忆与上下文</button>
-        <button class="nav-item" type="button" data-view="learning"><span aria-hidden="true">▥</span>学习笔记</button>
         <button class="nav-item" type="button" data-view="stickers"><span aria-hidden="true">▧</span>图库管理</button>
-        <button class="nav-item" type="button" data-view="config"><span aria-hidden="true">≡</span>配置管理</button>
+        <span class="nav-section-label">管理</span>
+        <button class="nav-item" type="button" data-view="qq"><span aria-hidden="true">◎</span>QQ 登录</button>
+        <button class="nav-item" type="button" data-view="config"><span aria-hidden="true">≡</span>设置与人设</button>
       </nav>
       <div class="sidebar-bottom"><span class="sidebar-label">轻量运行，随时调控</span><button id="open-security" class="text-button" type="button">账户安全</button><button id="logout" class="text-button" type="button">退出管理台 ↗</button></div>
     </aside>
@@ -48,12 +49,33 @@
       <div id="notice" class="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button id="dismiss-notice" type="button" aria-label="关闭提示">×</button></div>
       <div id="operation-notice" class="notice warning" role="status" hidden><span id="operation-text"></span><button id="check-operation" class="button secondary" type="button">查询操作结果</button></div>
 
+      <div id="knowledge-header" class="knowledge-header" hidden>
+        <div class="page-heading"><div><p class="eyebrow">CONTEXT & KNOWLEDGE</p><h1>让每一次对话，接得上。</h1><p class="muted">近期对话、个人记忆与交流经验，在一个工作区管理。</p></div><span class="workspace-mark" aria-hidden="true">⌘</span></div>
+        <nav class="workspace-tabs" aria-label="上下文与知识工作区">
+          <button class="workspace-tab active" type="button" data-view="context" aria-current="page">对话接续<span>跨群与私聊</span></button>
+          <button class="workspace-tab" type="button" data-view="memory">个人记忆<span>事实与偏好</span></button>
+          <button class="workspace-tab" type="button" data-view="learning">经验笔记<span>经验与用语</span></button>
+        </nav>
+      </div>
+
+      <section id="view-context" class="view knowledge-view" aria-labelledby="continuity-title" hidden>
+        <div class="section-heading"><div><h2 id="continuity-title">对话接续</h2><p class="muted">同一用户换一个聊天，仍能继续刚才的话题。</p></div><button id="refresh-context-overview" class="button secondary" type="button">刷新记录</button></div>
+        <div class="context-overview-grid">
+          <article class="card continuity-card"><div class="card-top"><span class="section-label">跨会话近期上下文</span><span id="context-enabled" class="badge neutral">待读取</span></div><h2 id="context-window">正在读取接续设置</h2><p id="context-window-detail" class="muted">从已完成的问答中读取上下文，每条资料保留来源。</p><div class="context-policy"><span id="context-neighbors">群聊背景 · 待读取</span><span id="context-time-window">时间范围 · 待读取</span></div><button class="button primary" type="button" data-config-section="context">调整接续与背景窗口 <span aria-hidden="true">↗</span></button></article>
+          <article class="card context-budget-card"><span class="section-label">已保存群聊最终上限 · 保守估算</span><h2 id="context-input-budget">—</h2><p class="hint">全局默认；按是否启用学习与记忆读取计算。</p><dl class="context-budget-list"><div><dt>普通输入预算</dt><dd id="context-ordinary-budget">—</dd></div><div><dt>其中：近期问答（含背景）</dt><dd id="context-recall-budget">—</dd></div><div><dt>其中：群聊背景上限</dt><dd id="context-neighbor-budget">—</dd></div><div><dt>独立笔记额度</dt><dd id="context-learning-budget">—</dd></div></dl><p class="hint" id="context-budget-note">普通输入与允许注入的笔记额度构成最终上限。</p><button class="text-button accent" type="button" data-config-section="knowledge">管理知识与预算 →</button></article>
+        </div>
+        <div id="context-counts" class="context-counts" aria-label="上下文与知识数据量"></div>
+        <article class="card source-browser"><div class="card-top"><div><span class="section-label">来源浏览</span><h2>最近完成的问答</h2></div><span class="badge neutral">只读预览</span></div><p class="hint">按来源标注，群友的发言保留原发言者；历史请求不会变成本轮操作授权。以下为已完成记录，不代表每轮都会召回。</p><p id="context-overview-message" class="muted" role="status" aria-live="polite">进入后加载最近问答。</p><div id="context-recent-list" class="context-recent-list"></div></article>
+        <div class="knowledge-guide"><span aria-hidden="true">↳</span><p>需要修改已记住的事实或交流经验？<button class="text-button accent" type="button" data-view="memory">管理个人记忆</button><span> / </span><button class="text-button accent" type="button" data-view="learning">管理经验笔记</button></p></div>
+      </section>
+
       <section id="view-overview" class="view" aria-labelledby="overview-title">
         <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1 id="overview-title">运行概览</h1><p class="muted">连接状态与配置版本，一目了然。</p></div><button id="refresh-status" class="button secondary" type="button" data-action>刷新状态</button></div>
         <div class="overview-grid">
           <article class="card runtime-card"><div class="card-top"><span class="section-label">机器人运行状态</span><span id="runtime-badge" class="badge neutral">读取中</span></div><h2 id="runtime-title">准备连接</h2><p id="runtime-message" class="muted">正在读取运行状态。</p><div class="runtime-actions"><button id="connect-runtime" class="button primary" type="button" data-action>连接机器人</button><button id="apply-runtime" class="button secondary" type="button" data-action>应用已保存配置</button><button id="stop-runtime" class="button danger" type="button" data-action>断开连接</button></div><p class="hint">连接使用已保存的配置。QQ 尚未登录时，小鱼会等待扫码完成后自动连接 Milky。</p></article>
           <article class="card identity-card"><span class="section-label">QQ 账号</span><div class="avatar" aria-hidden="true">Q</div><h2 id="account-name">尚未连接</h2><p id="account-id" class="muted">账号状态待同步</p><button class="text-button accent" type="button" data-view="qq">前往 QQ 登录 →</button></article>
         </div>
+        <button class="overview-context-entry" type="button" data-view="context"><span class="overview-entry-icon" aria-hidden="true">⌘</span><span><strong>上下文与知识</strong><span>查看跨群接续、记忆与交流经验</span></span><span aria-hidden="true">↗</span></button>
         <div class="metrics-grid"><article class="card metric"><span class="section-label">当前机器人</span><strong id="bot-id">—</strong><span class="hint">Milky 已确认的 QQ 号</span></article><article class="card metric"><span class="section-label">本次启动</span><strong id="started-at">—</strong><span class="hint">运行时启动时间</span></article><article class="card metric"><span class="section-label">配置状态</span><strong id="revision-state">—</strong><span id="revision-detail" class="hint">保存后需应用才能生效</span></article></div>
         <article class="card budget-card"><div class="card-top"><div><span class="section-label">模型用量与预算</span><h2>请求预算与使用情况</h2></div><button id="refresh-budget" class="text-button accent" type="button" data-action>刷新用量</button></div><div id="budget-usage" class="budget-grid"><p class="muted">正在读取用量。</p></div><p class="hint">预算控制会影响后续模型请求。上下文的保守估算与服务商实际 token 用量分别显示。</p></article>
         <article class="card setup-card"><div><span class="section-label">首次使用</span><h2>三步开始聊天</h2></div><ol class="steps"><li><span>01</span><div><strong>配置连接</strong><p>填写模型接口与 Milky 地址。</p></div></li><li><span>02</span><div><strong>登录 QQ</strong><p>通过 LLBot 管理端获取二维码并扫码。</p></div></li><li><span>03</span><div><strong>连接机器人</strong><p>保存并应用后，在群聊中 @小鱼或使用触发词；会话开关在「群与好友」中管理。</p></div></li></ol></article>
@@ -76,8 +98,8 @@
         </article>
       </section>
 
-      <section id="view-memory" class="view" aria-labelledby="memory-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">MEMORY & CONTEXT</p><h1 id="memory-title">记忆与上下文</h1><p class="muted">先选择会话范围，再查看资料和管理对话。这里的内容只显示在管理台。</p></div></div>
+      <section id="view-memory" class="view knowledge-view" aria-labelledby="memory-title" hidden>
+        <div class="section-heading"><div><h2 id="memory-title">个人记忆与会话</h2><p class="muted">按会话查看事实、偏好与原始证据，管理摘要和遗忘范围。</p></div><button class="button secondary" type="button" data-config-section="knowledge">记忆设置</button></div>
         <article class="card group-persona-card" aria-labelledby="group-persona-title">
           <div class="group-persona-copy"><h2 id="group-persona-title">全部群聊人设</h2><p class="hint">为当前登录 QQ 已加入的全部群统一选择人设，包含按成员隔离的会话及这些群以后新建的会话。好友、全局默认、历史和记忆保持不变；之后新加入的群仍用默认人设。</p><p class="hint">选项来自已保存人设；自定义修改需先保存并应用全局配置。本操作不受下方会话筛选影响。</p></div>
           <div class="group-persona-actions"><label for="group-persona-select">选择群聊人设</label><select id="group-persona-select" aria-describedby="group-persona-message"><option value="">请选择人设</option></select><button id="apply-group-persona" class="button primary" type="button">应用到全部群聊</button></div>
@@ -99,8 +121,8 @@
         </div>
       </section>
 
-      <section id="view-learning" class="view" aria-labelledby="learning-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">LEARNING NOTES</p><h1 id="learning-title">学习笔记</h1><p class="muted">同一机器人账号的群聊交流经验，与普通个人记忆分开管理。</p></div><button id="refresh-learning" class="button secondary" type="button">刷新笔记</button></div>
+      <section id="view-learning" class="view knowledge-view" aria-labelledby="learning-title" hidden>
+        <div class="section-heading"><div><h2 id="learning-title">经验笔记</h2><p class="muted">同一机器人账号的群聊经验、纠正与用语，保留版本和取材来源。</p></div><div class="button-row"><button class="button secondary" type="button" data-config-section="knowledge">学习设置</button><button id="refresh-learning" class="button secondary" type="button">刷新笔记</button></div></div>
         <article class="card"><div class="card-top"><div><span class="section-label">当前机器人账号</span><h2 id="learning-account">尚未读取</h2></div><button id="new-learning" class="button primary" type="button" disabled>新增笔记</button></div><p id="learning-summary" class="hint">进入此页后读取服务器确认的账号。</p><p class="hint">默认关闭自动学习。在配置中开启并应用后，仅从群聊取材；笔记仅提供给开启记忆读取的群聊。锁定可防止自动学习覆盖。来源被遗忘或撤回的笔记不能通过回滚恢复。</p><p id="learning-message" class="muted" role="status" aria-live="polite"></p><div id="learning-list"></div></article>
         <article id="learning-editor" class="card learning-editor" hidden><form id="learning-editor-form"><div class="card-top"><h2 id="learning-editor-title">新增笔记</h2><button id="cancel-learning-edit" class="text-button" type="button">取消编辑</button></div><p id="learning-editor-scope" class="hint"></p><div class="field-grid"><div><label for="edit-learning-kind">笔记类型</label><select id="edit-learning-kind"><option value="experience">交流经验</option><option value="correction">纠正记录</option><option value="term">用语解释</option></select></div><div class="check-field"><input id="edit-learning-locked" type="checkbox" checked><label for="edit-learning-locked">锁定，禁止自动学习覆盖</label></div></div><label for="edit-learning-text">笔记内容</label><textarea id="edit-learning-text" rows="6" required></textarea><p id="learning-editor-error" class="inline-error" role="alert"></p><button id="save-learning" class="button primary" type="submit">保存笔记</button></form></article>
         <details class="card learning-history"><summary>修改历史与回滚</summary><p class="hint">回滚会产生新版本。已失效来源的历史保留审计信息，不能恢复为有效笔记。</p><div id="learning-history"></div></details>
@@ -122,10 +144,18 @@
       </section>
 
       <section id="view-config" class="view" aria-labelledby="config-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1 id="config-title">配置管理</h1><p class="muted">先保存，再应用。运行中的会话只使用已应用的配置。</p></div><div class="button-row config-top-actions"><button id="reload-config" class="button secondary" type="button" data-action>重新载入</button><button id="save-config-top" class="button primary" type="button" data-action>保存当前配置</button></div></div>
+        <div class="page-heading"><div><p class="eyebrow">SETTINGS</p><h1 id="config-title">设置与人设</h1><p class="muted">按需调整，统一保存。应用成功后，机器人开始使用新配置。</p></div><div class="button-row config-top-actions"><button id="reload-config" class="button secondary" type="button" data-action>重新载入</button><button id="save-config-top" class="button primary" type="button" data-action>保存当前配置</button></div></div>
         <div class="config-state-panel" role="status" aria-live="polite"><span id="config-state" class="badge neutral">正在读取配置</span><p id="config-state-detail" class="hint">读取配置与当前运行版本后显示生效状态。</p></div>
         <div id="config-apply-error" class="notice error config-apply-error" role="status" hidden></div>
         <div id="config-warning" class="notice warning" role="status" hidden></div>
+        <nav id="config-categories" class="config-categories" aria-label="设置分类">
+          <button class="config-category active" type="button" data-config-category="all" aria-pressed="true">全部设置</button>
+          <button class="config-category" type="button" data-config-category="connection" aria-pressed="false">连接与模型</button>
+          <button class="config-category" type="button" data-config-category="context" aria-pressed="false">对话接续</button>
+          <button class="config-category" type="button" data-config-category="knowledge" aria-pressed="false">记忆与笔记</button>
+          <button class="config-category" type="button" data-config-category="conversation" aria-pressed="false">人设与聊天</button>
+          <button class="config-category" type="button" data-config-category="tools" aria-pressed="false">工具与容量</button>
+        </nav>
         <form id="config-form" novalidate><fieldset id="config-fields" class="config-fieldset"><div id="config-groups" class="config-groups"></div>
           <div id="model-picker" class="model-picker field full">
             <div class="button-row"><button id="fetch-models" class="button secondary" type="button">获取模型列表</button></div>

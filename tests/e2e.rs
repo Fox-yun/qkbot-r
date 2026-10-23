@@ -2510,6 +2510,8 @@ async fn user_mode_separates_people_groups_and_private_conversations() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_with(&mock, true, |config| {
         config.plugins.ai.defaults.mode = "user".into();
+        // Local mode isolation remains available with cross-chat continuity off.
+        config.plugins.ai.context.enabled = false;
     })
     .await;
     let original = message(1, "owner-group-secret");
@@ -2598,6 +2600,8 @@ async fn global_memory_shares_same_qq_across_groups_and_private_chat_without_his
     for enabled in [true, false] {
         let mut mock = MockServer::start().await;
         let (_temp, host, router) = setup_with(&mock, true, |config| {
+            // Test the independent long-term sharing policy, without recent turns.
+            config.plugins.ai.context.enabled = false;
             // The enabled case deliberately uses the default setting.
             if !enabled {
                 config.plugins.ai.global_memory_shared = false;
@@ -3276,8 +3280,10 @@ async fn reply_trigger_keeps_current_user_context_and_rechecks_queued_quote_revo
     barrier.sender_id = 888;
     router.dispatch(barrier).await.unwrap();
     blocker.reply.send(answer("在途回答")).unwrap();
-    mock.sent().await;
+    // The in-flight answer used the now-revoked quote, so the unified source
+    // guard discards it as well as the queued quote-triggered request.
     let request = mock.model().await;
+    assert!(mock.sends.try_recv().is_err());
     let current = request.body["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
@@ -4795,8 +4801,18 @@ async fn reply_tool_target_revoked_during_model_request_is_rejected_before_deliv
             json!({"reply_to":target["message_ref"],"text":"不可发送的失效引用"}),
         )]))
         .unwrap();
+    // A revoked input invalidates the entire response, including correction
+    // rounds which would otherwise carry that same stale input again.
+    router
+        .dispatch(message(3, "不再使用已遗忘的内容，重新回复"))
+        .await
+        .unwrap();
     let correction = mock.model().await;
-    assert_failed_tool_results(&correction.body, &["revoked-target"]);
+    assert!(
+        !correction.body["messages"]
+            .to_string()
+            .contains("稍后会被遗忘的目标")
+    );
     assert!(mock.sends.try_recv().is_err());
     correction
         .reply

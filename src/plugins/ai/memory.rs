@@ -155,6 +155,10 @@ pub struct MessageSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryBatch {
     pub guard: ContextGuard,
+    #[serde(skip)]
+    pub dependencies: super::context::ContextDependencyGuard,
+    #[serde(skip)]
+    pub summary_dependencies: super::context::ContextDependencyGuard,
     pub memory_revision: i64,
     pub previous_compacted_until: i64,
     pub previous_memory_processed_until: i64,
@@ -162,6 +166,9 @@ pub struct MemoryBatch {
     pub previous_summary: String,
     #[serde(skip)]
     expected_summary: String,
+    /// Effective summary read cursor; the stored cursor above remains the CAS value.
+    #[serde(skip)]
+    summary_start: i64,
     pub sources: Vec<MessageSource>,
     #[serde(serialize_with = "serialize_allowed_memories")]
     pub allowed_memories: Vec<Memory>,
@@ -176,6 +183,7 @@ pub struct MemoryBatch {
 #[derive(Debug, Clone)]
 pub struct SummaryRepair {
     pub guard: ContextGuard,
+    pub dependencies: super::context::ContextDependencyGuard,
     pub summary: String,
     pub summary_budget: usize,
     compacted_until: i64,
@@ -291,6 +299,7 @@ impl MemoryStore {
         self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await?;
         self.store.migrate("ai_memory", 4, scope::MIGRATION).await?;
         super::learning::init(&self.store).await?;
+        super::context::init(&self.store).await?;
         let enabled = self.global_memory_shared;
         self.store
             .call(move |db| {
@@ -469,10 +478,12 @@ impl MemoryStore {
                 if batch.sources.is_empty() {
                     return Ok(batch);
                 }
-                fit_batch(
+                let mut batch = fit_batch(
                     batch,
                     max_input_tokens.saturating_sub(MEMORY_PROMPT_RESERVE),
-                )
+                )?;
+                freeze_batch_dependencies(db, &mut batch)?;
+                Ok(batch)
             })
             .await
     }
@@ -512,8 +523,13 @@ fn prepare_summary_repair(
     budget: usize,
 ) -> Result<Option<SummaryRepair>> {
     check_guard(db, guard)?;
+    // Invalid derived content must be rebuilt from retained source messages,
+    // never passed back to a model as a compression baseline.
+    let Ok(dependencies) = super::context::summary_guard(db, guard) else {
+        return Ok(None);
+    };
     let repair = db.query_row("SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id=?1", [&guard.conversation_id], |row| Ok(SummaryRepair {
-        guard:guard.clone(),summary:row.get(0)?,compacted_until:row.get(1)?,memory_processed_until:row.get(2)?,memory_revision:row.get(3)?,summary_budget:budget
+        guard:guard.clone(),dependencies:dependencies.clone(),summary:row.get(0)?,compacted_until:row.get(1)?,memory_processed_until:row.get(2)?,memory_revision:row.get(3)?,summary_budget:budget
     }))?;
     Ok((summary_cost(&repair.summary)? > budget).then_some(repair))
 }
@@ -526,6 +542,7 @@ fn commit_summary_repair(db: &mut Connection, repair: SummaryRepair, summary: &s
     );
     let tx = db.transaction()?;
     check_guard(&tx, &repair.guard)?;
+    repair.dependencies.validate(&tx)?;
     ensure!(tx.execute("UPDATE ai_conversations SET summary=?1,memory_revision=memory_revision+1 WHERE id=?2 AND epoch=?3 AND summary=?4 AND compacted_until=?5 AND memory_processed_until=?6 AND memory_revision=?7",params![summary,repair.guard.conversation_id,repair.guard.epoch,repair.summary,repair.compacted_until,repair.memory_processed_until,repair.memory_revision])?==1,"summary repair snapshot changed");
     tx.commit()?;
     Ok(())
@@ -879,6 +896,7 @@ pub(crate) fn revoke_memories(db: &Connection, memories: &[Memory]) -> Result<()
     db.execute(&format!("{REVOCATION_KEYS} INSERT OR IGNORE INTO ai_revoked_sources(source_key,revoked_at) SELECT source_key,?3 FROM keys"),params![ids,extra_keys,now()])?;
     db.execute(&format!("{REVOCATION_KEYS} UPDATE messages SET revoked=1,learnable=0 WHERE key IN (SELECT source_key FROM keys)"),params![ids,extra_keys])?;
     super::learning::invalidate_sources(db, &learning_sources)?;
+    super::context::continuity::invalidate_sources(db, &learning_sources)?;
     for (table, column) in [
         ("ai_memory_search", "memory_id"),
         ("ai_memories", "id"),
@@ -920,9 +938,18 @@ fn prepare_batch_modes(
         [&guard.conversation_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
+    let summary_valid = summary.is_empty() || super::context::summary_guard(db, guard).is_ok();
+    // A revoked or changed dependency invalidates the whole derived baseline.
+    // Restart only the summary cursor: facts already learned remain processed.
+    // Retention may have removed part of that prefix; only surviving rows are read.
+    let summary_start = if summary_enabled && !summary_valid {
+        0
+    } else {
+        previous
+    };
     let start = match (summary_enabled, memory_write) {
-        (true, true) => previous.min(memory_previous),
-        (true, false) => previous,
+        (true, true) => summary_start.min(memory_previous),
+        (true, false) => summary_start,
         (false, true) => memory_previous,
         (false, false) => unreachable!(),
     };
@@ -957,7 +984,7 @@ fn prepare_batch_modes(
                     inbound_position: r.get(7)?,
                     context_visible: r.get(8)?,
                     summary_eligible: summary_enabled
-                        && position > previous
+                        && position > summary_start
                         && r.get::<_, bool>(8)?,
                     memory_eligible: memory_write
                         && position > memory_previous
@@ -971,6 +998,7 @@ fn prepare_batch_modes(
             raw_rows += 1;
             if revoked
                 || is_revoked(db, &source.key)?
+                || (source.role == "assistant" && !super::context::reply_is_valid(db, &source.key)?)
                 || !matches!(source.role.as_str(), "user" | "assistant")
             {
                 continue;
@@ -1009,24 +1037,53 @@ fn prepare_batch_modes(
     } else {
         Vec::new()
     };
-    Ok(MemoryBatch {
+    let mut batch = MemoryBatch {
         guard: guard.clone(),
+        dependencies: super::context::ContextDependencyGuard::default(),
+        summary_dependencies: super::context::ContextDependencyGuard::default(),
         memory_revision,
         previous_compacted_until: previous,
         previous_memory_processed_until: memory_previous,
         through_position,
-        previous_summary: if summary_enabled && through_position > previous {
+        previous_summary: if summary_enabled && through_position > summary_start && summary_valid {
             summary.clone()
         } else {
             String::new()
         },
         expected_summary: summary,
+        summary_start,
         sources,
         allowed_memories,
         memory_write: memory_write && through_position > memory_previous,
-        summary_enabled: summary_enabled && through_position > previous,
+        summary_enabled: summary_enabled && through_position > summary_start,
         summary_budget: usize::MAX,
-    })
+    };
+    freeze_batch_dependencies(db, &mut batch)?;
+    Ok(batch)
+}
+
+fn freeze_batch_dependencies(db: &Connection, batch: &mut MemoryBatch) -> Result<()> {
+    batch.summary_dependencies = super::context::capture_summary_dependencies(db, batch)?;
+    let mut dependencies = batch.summary_dependencies.clone();
+    dependencies.include_sources(
+        db,
+        &batch
+            .sources
+            .iter()
+            .map(|s| s.key.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    dependencies.include_memories(
+        db,
+        &batch
+            .allowed_memories
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+    )?;
+    dependencies.validate(db)?;
+    batch.dependencies = dependencies;
+    Ok(())
 }
 
 fn serialize_allowed_memories<S: serde::Serializer>(
@@ -1069,7 +1126,7 @@ fn fit_batch(mut batch: MemoryBatch, max_bytes: usize) -> Result<MemoryBatch> {
         );
         batch.sources.retain(|s| s.inbound_position < last);
         batch.through_position = batch.sources.last().unwrap().inbound_position;
-        if batch.through_position <= batch.previous_compacted_until {
+        if batch.through_position <= batch.summary_start {
             batch.summary_enabled = false;
             batch.previous_summary.clear();
         }
@@ -1242,6 +1299,7 @@ fn commit_batch_inner(
     );
     let tx = db.transaction()?;
     check_guard(&tx, &batch.guard)?;
+    batch.dependencies.validate(&tx)?;
     purge_expired(&tx)?;
     let domain = scope::resolve(&tx, &batch.guard.conversation_id)?;
     let (compacted, memory_processed, summary, revision): (i64, i64, String, i64) = tx.query_row(
@@ -1316,6 +1374,7 @@ fn commit_batch_inner(
             );
         }
     }
+    super::context::record_summary(&tx, batch)?;
     let mut counts = MemoryCommitCounts::default();
     for change in update.changes {
         match change {
@@ -1393,6 +1452,9 @@ pub struct ContextInput {
 pub struct BudgetedContext {
     pub messages: Vec<Value>,
     pub estimated_tokens: usize,
+    pub memory_count: usize,
+    pub history_dropped: usize,
+    pub summary_included: bool,
 }
 
 fn validate_protocol(messages: &[Value]) -> Result<()> {
@@ -1503,6 +1565,9 @@ pub fn build_context(mut input: ContextInput, max_input_tokens: usize) -> Result
     Ok(BudgetedContext {
         messages: assemble(&input),
         estimated_tokens: estimate,
+        memory_count: input.memories.len(),
+        history_dropped: dropped,
+        summary_included: !input.summary.is_empty(),
     })
 }
 

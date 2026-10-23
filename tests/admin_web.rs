@@ -346,6 +346,7 @@ async fn offline_bot_keeps_panel_available_and_every_api_requires_authentication
     for (method, path) in [
         (Method::GET, "/api/status"),
         (Method::GET, "/api/config"),
+        (Method::GET, "/api/context/overview"),
         (Method::PUT, "/api/config"),
         (Method::POST, "/api/llm/models"),
         (Method::POST, "/api/runtime/apply"),
@@ -542,6 +543,105 @@ async fn automatic_reply_policy_roundtrips_through_admin_save_and_apply() {
         );
         assert_eq!(std::fs::read(&panel.path).unwrap(), original);
     }
+    panel.shutdown().await;
+}
+
+#[tokio::test]
+async fn context_overview_tracks_applied_policy_and_rejects_invalid_windows() {
+    let panel = Panel::start().await;
+    panel.phase("waiting_login", None).await;
+    let mut snapshot = panel.snapshot().await;
+    assert!(snapshot["config"]["milky"]["bot_id"].is_null());
+    let original_policy = snapshot["config"]["plugins"]["ai"]["context"].clone();
+    let response = panel
+        .request(Method::GET, "/api/context/overview")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_secure(&response);
+    let overview: Value = response.json().await.unwrap();
+    assert!(overview["bot_id"].is_null());
+    assert_eq!(overview["enabled"], true);
+    assert_eq!(overview["config"], original_policy);
+    assert_eq!(overview["config"]["neighbors_before"], 10);
+    assert_eq!(overview["config"]["neighbors_after"], 5);
+    assert_eq!(
+        overview["counts"],
+        json!({"turns":0,"memories":0,"notes":0})
+    );
+    assert_eq!(overview["recent"], json!([]));
+    assert!(!overview["message"].as_str().unwrap().is_empty());
+
+    let policy = json!({
+        "enabled": true,
+        "recent_seconds": 3600,
+        "max_turns": 4,
+        "neighbors_before": 12,
+        "neighbors_after": 4,
+        "neighbor_seconds": 180,
+        "recall_budget": 2000,
+        "neighbor_budget": 800
+    });
+    snapshot["config"]["plugins"]["ai"]["context"] = policy.clone();
+    let response = panel.save(&snapshot, json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: Value = response.json().await.unwrap();
+    assert_eq!(saved["config"]["plugins"]["ai"]["context"], policy);
+    assert_eq!(
+        serde_json::to_value(panel.stored().plugins.ai.context).unwrap(),
+        policy
+    );
+    let response = panel
+        .request(Method::GET, "/api/context/overview")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["config"],
+        original_policy,
+        "saving a draft must not change the applied context preview"
+    );
+
+    let response = panel
+        .request(Method::POST, "/api/runtime/apply")
+        .json(&json!({"revision":saved["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    panel
+        .phase("waiting_login", saved["revision"].as_str())
+        .await;
+    let response = panel
+        .request(Method::GET, "/api/context/overview")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let applied: Value = response.json().await.unwrap();
+    assert_eq!(applied["config"], policy);
+    assert_eq!(applied["recent"], json!([]));
+
+    let original = std::fs::read(&panel.path).unwrap();
+    for invalid in [
+        json!({"neighbors_before":51}),
+        json!({"neighbors_before":-1}),
+        json!({"neighbors_after":51}),
+        json!({"neighbors_after":-1}),
+        json!({"neighbor_budget":2001}),
+        json!({"neighbor_budget":-1}),
+    ] {
+        let mut rejected = saved.clone();
+        for (key, value) in invalid.as_object().unwrap() {
+            rejected["config"]["plugins"]["ai"]["context"][key] = value.clone();
+        }
+        let response = panel.save(&rejected, json!({})).await;
+        assert!(response.status().is_client_error(), "accepted {invalid}");
+        assert_eq!(std::fs::read(&panel.path).unwrap(), original);
+    }
+    assert_eq!(panel.snapshot().await["revision"], saved["revision"]);
     panel.shutdown().await;
 }
 

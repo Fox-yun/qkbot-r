@@ -343,6 +343,27 @@ pub struct LearningCheck {
     notes: Vec<(i64, i64)>,
 }
 impl LearningCheck {
+    pub(crate) fn selected(&self, indices: &[usize]) -> Self {
+        let mut selected = self.clone();
+        selected.notes = indices
+            .iter()
+            .filter_map(|index| self.notes.get(*index).copied())
+            .collect();
+        selected
+    }
+
+    pub(crate) fn source_keys(&self, db: &Connection) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for (id, _) in &self.notes {
+            for source in sources(db, *id)? {
+                if !keys.contains(&source.source_key) {
+                    keys.push(source.source_key);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     pub fn validate(&self, db: &Connection) -> Result<()> {
         if self.notes.is_empty() {
             return Ok(());

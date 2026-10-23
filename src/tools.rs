@@ -279,15 +279,15 @@ pub struct ToolContext {
     pub received_at: i64,
     pub cancel: CancellationToken,
     pub access_revision: i64,
-    pub(crate) learning_check: Option<crate::plugins::ai::learning::LearningCheck>,
+    pub(crate) context_check: Option<crate::plugins::ai::context::ContextDependencyGuard>,
 }
 
 impl ToolContext {
-    pub(crate) fn with_learning(
+    pub(crate) fn with_context(
         mut self,
-        check: Option<crate::plugins::ai::learning::LearningCheck>,
+        check: Option<crate::plugins::ai::context::ContextDependencyGuard>,
     ) -> Self {
-        self.learning_check = check;
+        self.context_check = check;
         self
     }
 }
@@ -326,8 +326,30 @@ struct BoundContext {
     provider_epoch: i64,
     #[serde(default)]
     access_revision: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    learning_check: Option<crate::plugins::ai::learning::LearningCheck>,
+    #[serde(
+        default,
+        alias = "learning_check",
+        deserialize_with = "deserialize_context_check",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_check: Option<crate::plugins::ai::context::ContextDependencyGuard>,
+}
+
+fn deserialize_context_check<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::plugins::ai::context::ContextDependencyGuard>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            if value.get("notes").is_some() {
+                serde_json::from_value::<crate::plugins::ai::learning::LearningCheck>(value)
+                    .map(Into::into)
+            } else {
+                serde_json::from_value(value)
+            }
+            .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
 
 const MIGRATION: &str = "
@@ -431,7 +453,7 @@ fn plugin_epoch(tx: &rusqlite::Connection, id: &str) -> Result<i64> {
 
 fn authorize(tx: &rusqlite::Connection, ctx: &BoundContext, plugin: &str) -> Result<()> {
     crate::access::check_revision(tx, &ctx.scope.key(), ctx.access_revision)?;
-    if let Some(check) = &ctx.learning_check {
+    if let Some(check) = &ctx.context_check {
         check.validate(tx)?;
     }
     ensure!(
@@ -571,7 +593,7 @@ impl Gateway {
             received_at,
             cancel,
             access_revision,
-            learning_check: None,
+            context_check: None,
         })
     }
 
@@ -603,7 +625,7 @@ impl Gateway {
                 ai_epoch: Some(ctx.ai_epoch),
                 provider_epoch: *epoch,
                 access_revision: ctx.access_revision,
-                learning_check: ctx.learning_check.clone(),
+                context_check: ctx.context_check.clone(),
             };
             if check_runtime(self.epochs()?, &bound, spec.plugin).is_err() {
                 continue;
@@ -656,7 +678,7 @@ impl Gateway {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: *epoch,
             access_revision: ctx.access_revision,
-            learning_check: ctx.learning_check.clone(),
+            context_check: ctx.context_check.clone(),
         };
         let normalized = tool.prepare(
             args,
@@ -766,7 +788,7 @@ impl Gateway {
             ai_epoch: None,
             provider_epoch: epoch,
             access_revision,
-            learning_check: None,
+            context_check: None,
         };
         if spec.effect == Effect::NetworkRead {
             let turn = external_source
@@ -998,12 +1020,13 @@ mod tests {
                 db.execute("INSERT INTO ai_learning_notes(id,bot_id,kind,text,scope,updated_at) VALUES(1,1,'experience','not copied into tool context','1:group:2',?1)", [now()])?;
                 Ok(())
             }).await.unwrap();
-            let check = serde_json::from_value(json!({
-                "bot_id":1,"revision":0,"defaults":crate::config::AiSettings::default(),
-                "notes":[[1,1]]
-            }))
-            .unwrap();
-            let ctx = plain.clone().with_learning(Some(check));
+            let check: crate::plugins::ai::learning::LearningCheck =
+                serde_json::from_value(json!({
+                    "bot_id":1,"revision":0,"defaults":crate::config::AiSettings::default(),
+                    "notes":[[1,1]]
+                }))
+                .unwrap();
+            let ctx = plain.clone().with_context(Some(check.into()));
             let args = json!({"after_seconds":3600,"text":"source-bound reminder"});
             let (_, token) = pending(
                 gateway
@@ -1023,7 +1046,17 @@ mod tests {
                 .await
                 .unwrap();
             let saved: BoundContext = serde_json::from_str(&stored).unwrap();
-            assert!(saved.learning_check.is_some());
+            assert!(saved.context_check.is_some());
+            let mut old: Value = serde_json::from_str(&stored).unwrap();
+            let legacy_check = old
+                .as_object_mut()
+                .unwrap()
+                .remove("context_check")
+                .unwrap()["learning"][0]
+                .clone();
+            old["learning_check"] = legacy_check;
+            let old: BoundContext = serde_json::from_value(old).unwrap();
+            let legacy_context = old.context_check.unwrap();
             assert!(!stored.contains("not copied into tool context"));
             store.call(move |db| {
                 match change {
@@ -1033,6 +1066,13 @@ mod tests {
                 };
                 Ok(())
             }).await.unwrap();
+            store
+                .call(move |db| {
+                    assert!(legacy_context.validate(db).is_err());
+                    Ok(())
+                })
+                .await
+                .unwrap();
             // Confirmation reloads serialized dependencies; a local operation
             // and an idempotent replay may not silently discard those checks.
             assert!(
@@ -1077,7 +1117,7 @@ mod tests {
                 "access_revision":plain.access_revision
             }))
             .unwrap();
-            assert!(legacy.learning_check.is_none());
+            assert!(legacy.context_check.is_none());
             store.stop().await.unwrap();
         }
     }
@@ -1127,7 +1167,7 @@ mod tests {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: ctx.provider_epochs["ai"],
             access_revision: ctx.access_revision,
-            learning_check: None,
+            context_check: None,
         };
         let error = gateway
             .run(
@@ -1223,7 +1263,7 @@ mod tests {
             ai_epoch: Some(ctx.ai_epoch),
             provider_epoch: ctx.provider_epochs["ai"],
             access_revision: ctx.access_revision,
-            learning_check: None,
+            context_check: None,
         };
         assert!(
             gateway

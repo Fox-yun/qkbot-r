@@ -69,7 +69,7 @@ pub(crate) struct Authorization {
     external_operations: Vec<String>,
     requires_reply_tool: bool,
     auto_reply: Option<(super::auto_reply::BatchCheck, CancellationToken)>,
-    learning: Option<super::learning::LearningCheck>,
+    context: Option<super::context::ContextDependencyGuard>,
 }
 impl Authorization {
     pub(crate) fn external(operations: Vec<String>) -> Self {
@@ -79,15 +79,18 @@ impl Authorization {
             external_operations: operations,
             requires_reply_tool: false,
             auto_reply: None,
-            learning: None,
+            context: None,
         }
     }
     pub(crate) fn with_external(mut self, operations: Vec<String>) -> Self {
         self.external_operations = operations;
         self
     }
-    pub(super) fn with_learning(mut self, check: Option<super::learning::LearningCheck>) -> Self {
-        self.learning = check;
+    pub(super) fn with_context(
+        mut self,
+        check: Option<super::context::ContextDependencyGuard>,
+    ) -> Self {
+        self.context = check;
         self
     }
     pub(super) fn with_auto_reply(
@@ -101,6 +104,9 @@ impl Authorization {
     pub(crate) fn requires_reply_tool(&self) -> bool {
         self.requires_reply_tool
     }
+    pub(crate) fn context_dependencies(&self) -> super::context::ContextDependencyGuard {
+        self.context.clone().unwrap_or_default()
+    }
     pub(crate) fn check_sources(
         &self,
         db: &Connection,
@@ -108,8 +114,8 @@ impl Authorization {
         guard: &ContextGuard,
     ) -> Result<()> {
         crate::host::check_guard(db, guard)?;
-        if let Some(learning) = &self.learning {
-            learning.validate(db)?;
+        if let Some(context) = &self.context {
+            context.validate(db)?;
         }
         if let Some((batch, cancel)) = &self.auto_reply {
             ensure!(!cancel.is_cancelled(), "自动接话已取消");
@@ -436,7 +442,7 @@ impl References {
             external_operations: vec![],
             requires_reply_tool: true,
             auto_reply: None,
-            learning: None,
+            context: None,
         };
         authorization.check(db, &self.scope, guard)?;
         Ok(PreparedReply {

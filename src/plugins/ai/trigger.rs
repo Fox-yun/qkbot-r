@@ -140,6 +140,9 @@ impl Quote {
 }
 
 fn revoked(db: &Connection, key: &str) -> Result<bool> {
+    if !super::context::reply_is_valid(db, key)? {
+        return Ok(true);
+    }
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=?1)
          OR EXISTS(SELECT 1 FROM messages WHERE key=?1 AND revoked=1)",
@@ -577,6 +580,12 @@ impl Ingress {
                         guard.conversation_id,
                         guard.epoch
                     ],
+                )?;
+                super::context::continuity::register_incoming(
+                    &tx,
+                    &message.key.key(),
+                    trigger && reason != Some(Reason::Automatic),
+                    keep,
                 )?;
                 tx.commit()?;
                 Ok(Some((settings, reason)))

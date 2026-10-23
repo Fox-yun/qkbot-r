@@ -760,8 +760,15 @@ impl Chat {
         if let Some(batch) = batch {
             super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
         }
-        let (settings, summary, mut current, history, mut references) =
-            load_context(host, job).await?;
+        let LoadedContext {
+            settings,
+            summary,
+            mut current,
+            history,
+            mut references,
+            history_keys,
+            summary_dependencies,
+        } = load_context(host, job).await?;
         let quote = if batch.is_some() {
             None
         } else if let Some(quote) = job
@@ -786,76 +793,33 @@ impl Chat {
         } else {
             None
         };
-        let memories = if settings.memory_read {
-            let memories = super::semantic::retrieve(
+        let knowledge = Arc::new(
+            super::context::prepare(
                 host,
-                &job.guard,
-                job.actor,
-                &job.key.key(),
-                &current,
-                host.config.plugins.ai.memory_recall_limit,
-                host.config.plugins.ai.memory_recall_budget,
+                super::context::ContextRequest {
+                    guard: &job.guard,
+                    scope: &job.key.scope,
+                    source_key: &job.key.key(),
+                    actor: job.actor,
+                    position: job.position,
+                    received_at: job.received_at,
+                    current: &current,
+                    settings: &settings,
+                    allow_continuity: batch.is_none(),
+                },
                 cancel,
             )
-            .await?;
-            let guard = job.guard.clone();
-            host.store
-                .call(move |db| {
-                    crate::host::check_guard(db, &guard)?;
-                    memories
-                        .into_iter()
-                        .map(|m| {
-                            let origin = match m.origin.as_str() {
-                                "manual" => "管理员补充（不代表本人自述）",
-                                "auto" => "原始消息提取",
-                                _ => "历史记录",
-                            };
-                            let source_scope: String = db.query_row(
-                                "SELECT c.scope FROM ai_memories m JOIN ai_conversations c ON c.id=m.conversation_id WHERE m.id=?1",
-                                [m.id],
-                                |row| row.get(0),
-                            )?;
-                            Ok(format!(
-                                "关于用户 {} / {:?} / {} / 记录来源范围 {}（群限定事实勿泛化）：{}",
-                                m.subject_id, m.kind, origin, source_scope, m.text
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .await?
-        } else {
-            vec![]
-        };
-        let learning = if host.config.plugins.ai.learning.enabled
-            && settings.memory_read
-            && !settings.paused
-            && job.key.scope.scene == Scene::Group
-        {
-            Some(
-                super::learning::recall(
-                    host,
-                    &job.guard,
-                    &job.key.scope,
-                    &job.key.key(),
-                    job.actor,
-                    &current,
-                    host.config.plugins.ai.learning.injection_budget,
-                    cancel,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let learning_check = learning
-            .as_ref()
-            .filter(|context| !context.texts.is_empty())
-            .map(|context| context.check.clone());
+            .await?,
+        );
+        let memories = knowledge.memory_texts();
+        let continuity_texts = knowledge.continuity_texts();
+        let learning_texts = knowledge.learning_texts();
+        let mut context_check: Option<super::context::ContextDependencyGuard> = None;
         let mut system = system_prompt(&host.config, &settings, &job.key.scope, job.actor)?;
         // Custom participation policy belongs only to observation. A long policy
         // must not crowd out the context of an explicitly requested turn.
         system = participation_system(system, batch.is_some(), &host.config.plugins.ai.auto_reply);
-        let ctx = host
+        let mut ctx = host
             .gateway
             .context(
                 job.key.scope.clone(),
@@ -867,7 +831,7 @@ impl Chat {
                 cancel.clone(),
             )
             .await?
-            .with_learning(learning_check.clone());
+            .with_context(context_check.clone());
         let mut definitions = if host.config.llm.tool_calling {
             host.gateway.definitions(&ctx).await?
         } else {
@@ -1021,8 +985,17 @@ impl Chat {
                 current.push_str("\n[表情候选已失效，请直接文字回复。]");
             }
             let mut visible_quote = None;
+            let mut input_sources = batch
+                .map(|b| b.source_keys())
+                .unwrap_or_else(|| vec![job.key.key()]);
+            if let Some(batch) = batch {
+                input_sources.extend(batch.context_quote_keys());
+            }
             if let Some(quote) = &quote {
                 let content = quote.content(host).await?;
+                if content != "[引用已遗忘]" && content != "[引用不可用]" {
+                    input_sources.push(quote.key.key());
+                }
                 if job
                     .trigger
                     .as_ref()
@@ -1074,7 +1047,7 @@ impl Chat {
                     current.push_str("\n[表情候选已失效，请直接文字回复。]");
                 }
             }
-            let input = build_visual_context(
+            let assembled = super::context::assembly::assemble_with_builder(
                 ContextInput {
                     system: round_system_prompt(&system, &tools, search_enabled),
                     current: current.clone(),
@@ -1084,14 +1057,45 @@ impl Chat {
                     tool_schema: json!(tools),
                     tool_protocol: protocol.clone(),
                 },
+                &continuity_texts,
+                &learning_texts,
                 settings.input_budget,
-                &turn_visual,
+                host.config.plugins.ai.context.recall_budget,
+                if knowledge.learning.is_some() {
+                    host.config.plugins.ai.learning.injection_budget
+                } else {
+                    0
+                },
+                |input, budget| build_visual_context(input, budget, &turn_visual),
             )?;
-            let input = add_learning_context(
-                input,
-                learning.as_ref(),
-                host.config.plugins.ai.learning.injection_budget,
-            )?;
+            let selected_knowledge = knowledge.clone();
+            let selection = assembled.clone();
+            input_sources.extend(
+                history_keys
+                    .iter()
+                    .skip(selection.context.history_dropped)
+                    .cloned(),
+            );
+            let summary_dependencies = summary_dependencies.clone();
+            let mut selected = host
+                .store
+                .call(move |db| {
+                    let mut selected = selected_knowledge.selected_guard(db, &selection)?;
+                    selected.include_sources(db, &input_sources)?;
+                    if selection.context.summary_included {
+                        selected.extend(&summary_dependencies);
+                    }
+                    selected.validate(db)?;
+                    Ok(selected)
+                })
+                .await?;
+            if let Some(previous) = &context_check {
+                selected.extend(previous);
+            }
+            context_check = Some(selected);
+            ctx = ctx.with_context(context_check.clone());
+            tracing::debug!(usage=%serde_json::to_string(&assembled.usage)?, "context assembled");
+            let input = assembled.context;
             references.observe(&input.messages, visible_quote);
             references.observe_batch_quotes(&batch_quotes);
             sticker_turn.observe(&input.messages);
@@ -1136,7 +1140,7 @@ impl Chat {
                     admission,
                     (&host.milky, generation),
                     async {
-                        check_learning(host, &learning_check).await?;
+                        check_context(host, &context_check).await?;
                         check_visual_source(host, job, quoted_visual_key).await?;
                         if let Some(batch) = batch {
                             super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch)
@@ -1156,7 +1160,7 @@ impl Chat {
                     settings.output_budget,
                     cancel,
                     admission,
-                    check_learning(host, &learning_check),
+                    check_context(host, &context_check),
                 )
                 .await
             };
@@ -1174,7 +1178,7 @@ impl Chat {
                 result => result?,
             };
             host.usage("chat", &response).await?;
-            check_learning(host, &learning_check).await?;
+            check_context(host, &context_check).await?;
             if let Some(batch) = batch {
                 super::auto_reply::check_host(host, &job.guard, &job.key.scope, batch).await?;
             }
@@ -1207,10 +1211,10 @@ impl Chat {
                 }
                 let text = search_citations.render(&text, host.config.limits.max_message_bytes)?;
                 let mut reply = Reply::text("ai", text);
-                if !search_operations.is_empty() || learning_check.is_some() {
+                if !search_operations.is_empty() || context_check.is_some() {
                     reply.authorization = Some(
                         Authorization::external(search_operations)
-                            .with_learning(learning_check.clone()),
+                            .with_context(context_check.clone()),
                     );
                 }
                 return Ok(Some(reply));
@@ -1348,7 +1352,7 @@ impl Chat {
                     match prepared {
                         Ok(mut reply) => {
                             reply.authorization = reply.authorization.with_external(search_operations.clone())
-                                .with_learning(learning_check.clone());
+                                .with_context(context_check.clone());
                             if stickers_enabled {
                                 let image_selected = reply.message.segments.iter().any(|segment| matches!(segment, crate::types::OutgoingSegment::Image { .. }));
                                 tracing::info!(stage = "sticker_reply", status = "prepared", searched = sticker_searched, sticker_requested, image_selected, "model final reply prepared");
@@ -1369,9 +1373,9 @@ impl Chat {
                 }
                 Ok(Some(ToolOutcome::Pending { preview, .. })) => {
                     let mut reply = Reply::text("host", preview);
-                    if learning_check.is_some() {
+                    if context_check.is_some() {
                         reply.authorization = Some(Authorization::external(vec![])
-                            .with_learning(learning_check.clone()));
+                            .with_context(context_check.clone()));
                     }
                     return Ok(Some(reply));
                 },
@@ -1539,7 +1543,7 @@ impl Chat {
                 changes: vec![],
             };
             if self
-                .background_valid(&background, bot_id)
+                .background_dependencies_valid(&background, bot_id, &batch.dependencies)
                 .await
                 .context("validate_empty_batch_guard")?
             {
@@ -1576,7 +1580,7 @@ impl Chat {
             "conversation memory batch requested"
         );
         let Some(response) = self
-            .background_response(input.messages, &background, bot_id)
+            .background_response(input.messages, &background, bot_id, &batch.dependencies)
             .await
             .context("request_memory_model")?
         else {
@@ -1614,6 +1618,7 @@ impl Chat {
                     batch.summary_budget,
                     &background,
                     bot_id,
+                    &batch.dependencies,
                 )
                 .await
                 .inspect_err(|error| {
@@ -1657,7 +1662,7 @@ impl Chat {
             );
         }
         if self
-            .background_valid(&background, bot_id)
+            .background_dependencies_valid(&background, bot_id, &batch.dependencies)
             .await
             .context("validate_memory_commit_guard")?
         {
@@ -1693,22 +1698,55 @@ impl Chat {
         messages: Vec<Value>,
         background: &BackgroundLease<'_>,
         bot_id: i64,
+        dependencies: &super::context::ContextDependencyGuard,
     ) -> Result<Option<crate::llm::LlmResponse>> {
-        if !self.background_valid(background, bot_id).await? {
+        if !self
+            .background_dependencies_valid(background, bot_id, dependencies)
+            .await?
+        {
             return Ok(None);
         }
         let response = tokio::select! {
             biased;
             _ = background.job.cancel.cancelled() => return Ok(None),
-            response = self.host.llm.as_ref().context("model_unavailable")?.complete_background_admitted(
+            response = self.host.llm.as_ref().context("model_unavailable")?.complete_background_checked_admitted(
                 messages, self.host.config.plugins.ai.memory_output_budget,
                 &background.job.cancel, background.job.guard.clone(), self.host.epochs["ai"],
+                async {
+                    ensure!(
+                        self.background_dependencies_valid(background, bot_id, dependencies).await?,
+                        "background context dependencies changed before model admission"
+                    );
+                    Ok(())
+                },
             ) => response?,
         };
         if let Some(response) = &response {
             self.host.usage("memory", response).await?;
         }
+        if !self
+            .background_dependencies_valid(background, bot_id, dependencies)
+            .await?
+        {
+            return Ok(None);
+        }
         Ok(response)
+    }
+
+    async fn background_dependencies_valid(
+        &self,
+        background: &BackgroundLease<'_>,
+        bot_id: i64,
+        dependencies: &super::context::ContextDependencyGuard,
+    ) -> Result<bool> {
+        if !self.background_valid(background, bot_id).await? {
+            return Ok(false);
+        }
+        let dependencies = dependencies.clone();
+        self.host
+            .store
+            .call(move |db| Ok(dependencies.validate(db).is_ok()))
+            .await
     }
 
     async fn compress_pending_summary(
@@ -1717,6 +1755,7 @@ impl Chat {
         summary_budget: usize,
         background: &BackgroundLease<'_>,
         bot_id: i64,
+        dependencies: &super::context::ContextDependencyGuard,
     ) -> Result<Option<String>> {
         // This repairs a proposal, not the stored baseline. Never write any
         // intermediate summary or advance a cursor, including on cancellation.
@@ -1737,7 +1776,10 @@ impl Chat {
                 summary_budget,
                 self.host.config.plugins.ai.memory_input_budget,
             )?;
-            let Some(response) = self.background_response(input, background, bot_id).await? else {
+            let Some(response) = self
+                .background_response(input, background, bot_id, dependencies)
+                .await?
+            else {
                 return Ok(None);
             };
             let value = parse_batch_update(
@@ -1790,7 +1832,10 @@ impl Chat {
                 repair.summary_budget,
                 self.host.config.plugins.ai.memory_input_budget,
             )?;
-            let Some(response) = self.background_response(input, background, bot_id).await? else {
+            let Some(response) = self
+                .background_response(input, background, bot_id, &repair.dependencies)
+                .await?
+            else {
                 return Ok(MaintenanceOutcome::Unavailable);
             };
             let value = parse_batch_update(
@@ -1814,7 +1859,10 @@ impl Chat {
             offset += consumed;
         }
         ensure!(offset == repair.summary.len(), "summary_repair_round_limit");
-        if self.background_valid(background, bot_id).await? {
+        if self
+            .background_dependencies_valid(background, bot_id, &repair.dependencies)
+            .await?
+        {
             self.host
                 .memory
                 .commit_summary_repair(repair, rolling)
@@ -1824,7 +1872,10 @@ impl Chat {
     }
 }
 
-async fn check_learning(host: &Host, check: &Option<super::learning::LearningCheck>) -> Result<()> {
+async fn check_context(
+    host: &Host,
+    check: &Option<super::context::ContextDependencyGuard>,
+) -> Result<()> {
     if let Some(check) = check {
         let check = check.clone();
         host.store
@@ -1833,31 +1884,6 @@ async fn check_learning(host: &Host, check: &Option<super::learning::LearningChe
             .map_err(|_| RevokedTrigger)?;
     }
     Ok(())
-}
-
-/// Notes have a separate administrator-controlled input allowance. Assemble the
-/// ordinary turn first so notes cannot evict its current question or history.
-fn add_learning_context(
-    mut context: super::memory::BudgetedContext,
-    learning: Option<&super::learning::LearningContext>,
-    budget: usize,
-) -> Result<super::memory::BudgetedContext> {
-    let Some(learning) = learning.filter(|learning| !learning.texts.is_empty()) else {
-        return Ok(context);
-    };
-    let messages: Vec<_> = learning
-        .texts
-        .iter()
-        .map(|text| json!({"role":"user","content":text}))
-        .collect();
-    let added = messages.iter().try_fold(0usize, |cost, message| {
-        Ok::<_, anyhow::Error>(cost.saturating_add(serde_json::to_vec(message)?.len() + 1))
-    })?;
-    ensure!(added <= budget, "学习笔记超过独立输入预算");
-    // Keep the system first and the original current/tool protocol contiguous.
-    context.messages.splice(1..1, messages);
-    context.estimated_tokens = context.estimated_tokens.saturating_add(added);
-    Ok(context)
 }
 
 pub(crate) fn memory_system_prompt(summary_budget: usize, timezone: &str) -> String {
@@ -2018,8 +2044,9 @@ fn compaction_candidates(
                 AND id NOT IN (SELECT value FROM json_each(?5))
                 AND NOT EXISTS(SELECT 1 FROM json_each(?10) f WHERE json_extract(f.value,'$[0]')=c.id AND json_extract(f.value,'$[1]')=c.epoch)
         ), counts AS (
-            SELECT c.id,c.epoch,c.settings,c.summary_on,c.memory_on,c.recent,
+            SELECT c.id,c.epoch,c.settings,c.summary_on,c.memory_on,c.recent,c.summary!='' AS has_summary,
                 MAX(m.received_at) AS last_at,
+                SUM(COALESCE(m.origin_plugin,'')!='memory_only') AS summary_total,
                 SUM(m.inbound_position>c.compacted_until AND COALESCE(m.origin_plugin,'')!='memory_only') AS summary_rows,
                 SUM(m.inbound_position>c.memory_processed_until) AS memory_rows,
                 SUM(m.inbound_position>c.memory_processed_until AND m.role='user' AND m.learnable=1) AS facts
@@ -2027,29 +2054,55 @@ fn compaction_candidates(
             WHERE NOT c.is_paused AND (c.summary_on OR c.memory_on) AND m.revoked=0
                 AND m.role IN ('user','assistant') AND COALESCE(m.origin_plugin,'')!='control'
             GROUP BY c.id
+        ), eligible AS (
+            SELECT *,((summary_on AND summary_rows>recent AND (summary_rows>=?6 OR last_at<?7))
+                OR (memory_on AND facts>0 AND (memory_rows>=?6 OR last_at<?7))) AS pending
+            FROM counts
         )
-        SELECT id,epoch,settings FROM counts
-        WHERE (summary_on AND summary_rows>recent AND (summary_rows>=?6 OR last_at<?7))
-            OR (memory_on AND facts>0 AND (memory_rows>=?6 OR last_at<?7))
-        ORDER BY CASE WHEN id>?9 THEN 0 ELSE 1 END,id LIMIT 8",
+        SELECT id,epoch,settings,pending FROM eligible
+        WHERE pending OR (summary_on AND has_summary AND summary_total>recent AND last_at<?7)
+        ORDER BY CASE WHEN id>?9 THEN 0 ELSE 1 END,id",
     )?;
-    Ok(query
-        .query_map(
-            params![
-                defaults.summary,
-                defaults.memory_write,
-                defaults.paused,
-                defaults.recent_messages as i64,
-                serde_json::to_string(busy)?,
-                threshold,
-                idle_before,
-                bot_id,
-                cursor,
-                serde_json::to_string(failures)?
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+    let rows = query.query_map(
+        params![
+            defaults.summary,
+            defaults.memory_write,
+            defaults.paused,
+            defaults.recent_messages as i64,
+            serde_json::to_string(busy)?,
+            threshold,
+            idle_before,
+            bot_id,
+            cursor,
+            serde_json::to_string(failures)?
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        },
+    )?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (id, epoch, settings, pending) = row?;
+        // Invalid summaries can need regeneration without any new messages.
+        // Check before taking the small limit so healthy summaries cannot starve
+        // a later invalid one in the fair keyset order.
+        let guard = ContextGuard {
+            conversation_id: id.clone(),
+            epoch,
+        };
+        if pending || super::context::summary_guard(db, &guard).is_err() {
+            candidates.push((id, epoch, settings));
+            if candidates.len() == 8 {
+                break;
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn compaction_plan(
@@ -2062,8 +2115,17 @@ fn compaction_plan(
         "SELECT compacted_until,memory_processed_until FROM ai_conversations WHERE id=?1 AND epoch=?2",
         params![id,epoch], |row| Ok((row.get(0)?,row.get(1)?)))?;
     let boundary = compaction_boundary(db, id, epoch, settings.recent_messages.max(2) as i64)?;
+    let invalid_summary = settings.summary
+        && super::context::summary_guard(
+            db,
+            &ContextGuard {
+                conversation_id: id.to_owned(),
+                epoch,
+            },
+        )
+        .is_err();
     if settings.summary
-        && let Some(through) = boundary.filter(|through| *through > compacted)
+        && let Some(through) = boundary.filter(|through| *through > compacted || invalid_summary)
     {
         return Ok(Some((
             through,
@@ -2385,16 +2447,17 @@ impl std::fmt::Display for RevokedTrigger {
 }
 impl std::error::Error for RevokedTrigger {}
 
-async fn load_context(
-    host: &Host,
-    job: &Turn,
-) -> Result<(
-    crate::config::AiSettings,
-    String,
-    String,
-    Vec<Vec<Value>>,
-    References,
-)> {
+struct LoadedContext {
+    settings: crate::config::AiSettings,
+    summary: String,
+    current: String,
+    history: Vec<Vec<Value>>,
+    references: References,
+    history_keys: Vec<String>,
+    summary_dependencies: super::context::ContextDependencyGuard,
+}
+
+async fn load_context(host: &Host, job: &Turn) -> Result<LoadedContext> {
     let g = job.guard.clone();
     let pos = job.position;
     let actor = job.actor;
@@ -2410,7 +2473,8 @@ async fn load_context(
         let settings=super::resolve_settings(&defaults,&settings)?;
         let reference_enabled=tool_calling && settings.allowed_tools.iter().any(|name|name=="reply_message");
         let mut references=References::new(scope.clone());
-        let (summary,compacted)=if settings.summary {(summary,compacted)} else {(String::new(),0)};
+        let summary_dependencies = super::context::summary_guard(c,&g);
+        let (summary,compacted,summary_dependencies)=if settings.summary && summary_dependencies.is_ok() {(summary,compacted,summary_dependencies?)} else {(String::new(),0,super::context::ContextDependencyGuard::default())};
         let (sender,text,nickname,card):(i64,String,Option<String>,Option<String>)=c.query_row("SELECT sender_id,content,sender_nickname,sender_card FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0 AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key)",params![key,g.conversation_id,g.epoch],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         ensure!(sender==actor,"current message sender does not match job actor");
         let current = if let Some(batch) = &batch {
@@ -2423,14 +2487,17 @@ async fn load_context(
         let mut q=c.prepare("SELECT role,sender_id,content,sender_nickname,sender_card,key,inbound_position FROM messages WHERE conversation_id=?1 AND epoch=?2 AND revoked=0 AND role IN('user','assistant') AND COALESCE(origin_plugin,'') NOT IN('control','memory_only') AND inbound_position<?3 AND inbound_position>?4 AND scope=?6 AND key NOT IN(SELECT value FROM json_each(?7)) AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key) ORDER BY inbound_position DESC,id DESC LIMIT ?5")?;
         let rows=q.query_map(params![g.conversation_id,g.epoch,pos,compacted,settings.recent_messages as i64,scope.key(),batch_keys],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
         let mut history=Vec::new();
+        let mut history_keys=Vec::new();
         for (role,sender,text,nickname,card,key,position) in rows.into_iter().rev() {
+            if role=="assistant" && !super::context::reply_is_valid(c,&key)? { continue; }
             let content=if reference_enabled {
                 let data=serde_json::from_str(&message_content(sender,nickname.as_deref(),card.as_deref(),&text))?;
-                references.local(key,position,sender,&role,data,&[],false)?
+                references.local(key.clone(),position,sender,&role,data,&[],false)?
             } else if role=="user" { message_content(sender,nickname.as_deref(),card.as_deref(),&text) } else {text};
             history.push(vec![json!({"role":role,"content":content})]);
+            history_keys.push(key);
         }
-        Ok((settings,summary,current,history,references))
+        Ok(LoadedContext {settings,summary,current,history,references,history_keys,summary_dependencies})
     }).await
 }
 
@@ -3180,7 +3247,9 @@ mod tests {
             position: 2,
             guard: conv.guard,
         };
-        let (_, _, current, history, _) = load_context(&host, &turn).await.unwrap();
+        let LoadedContext {
+            current, history, ..
+        } = load_context(&host, &turn).await.unwrap();
         let current: Value = serde_json::from_str(&current).unwrap();
         let past: Value = serde_json::from_str(history[0][0]["content"].as_str().unwrap()).unwrap();
         assert_eq!(current["display_name"], "同名");
@@ -3390,7 +3459,9 @@ mod tests {
             position: 3,
             guard,
         };
-        let (_, summary, _, history, _) = load_context(&host, &turn(conv.guard.clone()))
+        let LoadedContext {
+            summary, history, ..
+        } = load_context(&host, &turn(conv.guard.clone()))
             .await
             .unwrap();
         assert_eq!(summary, "earlier summary");
@@ -3403,10 +3474,15 @@ mod tests {
         conv.guard = super::super::change_settings(&host, &conv, conv.settings.clone())
             .await
             .unwrap();
-        let (settings, summary, current, history, _) =
-            load_context(&host, &turn(conv.guard.clone()))
-                .await
-                .unwrap();
+        let LoadedContext {
+            settings,
+            summary,
+            current,
+            history,
+            ..
+        } = load_context(&host, &turn(conv.guard.clone()))
+            .await
+            .unwrap();
         assert!(settings.paused && !settings.once);
         assert!(summary.is_empty());
         assert_eq!(current, message_content(3, None, None, "current"));
@@ -3423,7 +3499,9 @@ mod tests {
         conv.guard = super::super::change_settings(&host, &conv, conv.settings.clone())
             .await
             .unwrap();
-        let (_, summary, _, history, _) = load_context(&host, &turn(conv.guard.clone()))
+        let LoadedContext {
+            summary, history, ..
+        } = load_context(&host, &turn(conv.guard.clone()))
             .await
             .unwrap();
         assert_eq!(summary, "earlier summary");
@@ -3546,6 +3624,30 @@ mod tests {
             db.execute("UPDATE ai_conversations SET epoch=2 WHERE id='chat-00'",[])?;
             db.execute("UPDATE messages SET epoch=2 WHERE conversation_id='chat-00'",[])?;
             assert!(compaction_candidates(db,&defaults,40,10,&[],1,"chat-11",&failures)?.iter().any(|row|row.0=="chat-00"));
+            Ok(())
+        }).await.unwrap();
+        host.store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_summary_rebuild_is_scheduled_without_new_messages_or_relearning_facts() {
+        let host = local_host().await;
+        let defaults = host.config.plugins.ai.defaults.clone();
+        host.store.call(move |db| {
+            for index in 0..10 {
+                let id = format!("rebuild-{index:02}");
+                db.execute("INSERT INTO ai_conversations(id,scope,mode,settings,summary,compacted_until,memory_processed_until) VALUES(?1,'1:group:2','group','{\"recent_messages\":2}','stored summary',4,4)", [&id])?;
+                for position in 1..=4 {
+                    db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,learnable) VALUES(?1,'1:group:2',?2,1,7,'user','retained original',1,?3,1)", params![format!("{id}-{position}"), id, position])?;
+                }
+            }
+            db.execute("INSERT INTO ai_context_summary_dependencies(conversation_id,epoch,dependencies) VALUES('rebuild-09',1,'{\"memories\":[{\"id\":999,\"version\":1}]}')", [])?;
+            let candidates = compaction_candidates(db, &defaults, 40, 10, &[], 1, "", &[])?;
+            assert_eq!(candidates.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(), vec!["rebuild-09"], "healthy summaries must not occupy the small candidate limit");
+            let settings = super::super::resolve_settings(&defaults, "{\"recent_messages\":2}")?;
+            assert_eq!(compaction_plan(db, "rebuild-09", 1, &settings)?, Some((2, true, false)));
+            assert_eq!(compaction_plan(db, "rebuild-00", 1, &settings)?, None);
+            assert!(compaction_candidates(db, &defaults, 40, 0, &[], 1, "", &[])?.is_empty());
             Ok(())
         }).await.unwrap();
         host.store.stop().await.unwrap();

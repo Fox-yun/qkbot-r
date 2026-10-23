@@ -478,6 +478,40 @@ impl Llm {
         .await
     }
 
+    /// Revalidate frozen knowledge after admission and immediately before the
+    /// background model request, using the existing memory quota and capacity.
+    pub async fn complete_background_checked_admitted(
+        &self,
+        messages: Vec<Value>,
+        max_output: usize,
+        cancel: &CancellationToken,
+        guard: crate::types::ContextGuard,
+        plugin_epoch: i64,
+        revalidate_sources: impl std::future::Future<Output = Result<()>> + Send,
+    ) -> Result<Option<LlmResponse>> {
+        let Ok(_background) = self.background.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        let Ok(permit) = self.requests.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        self.request(
+            messages,
+            Vec::new(),
+            max_output,
+            cancel,
+            permit,
+            Some(crate::budget::RequestAdmission::Memory {
+                guard,
+                plugin_epoch,
+            }),
+            None,
+            Some(Box::pin(revalidate_sources)),
+        )
+        .await
+        .map(Some)
+    }
+
     /// Learning has its own persisted quota but shares background capacity so
     /// it never queues ahead of normal chats or invokes tools.
     pub async fn complete_learning_admitted(

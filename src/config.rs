@@ -573,11 +573,70 @@ impl LearningConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    pub enabled: bool,
+    pub recent_seconds: u64,
+    pub max_turns: usize,
+    pub neighbors_before: usize,
+    pub neighbors_after: usize,
+    pub neighbor_seconds: u64,
+    pub recall_budget: usize,
+    pub neighbor_budget: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            recent_seconds: 7200,
+            max_turns: 3,
+            neighbors_before: 10,
+            neighbors_after: 5,
+            neighbor_seconds: 120,
+            recall_budget: 3000,
+            neighbor_budget: 1500,
+        }
+    }
+}
+
+impl ContextConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (60..=604_800).contains(&self.recent_seconds),
+            "跨会话接续时间须为 60..604800 秒"
+        );
+        ensure!(
+            (1..=32).contains(&self.max_turns),
+            "跨会话接续轮数须为 1..32"
+        );
+        ensure!(
+            self.neighbors_before <= 50 && self.neighbors_after <= 50,
+            "前后群聊消息数各须为 0..50"
+        );
+        ensure!(
+            (1..=3600).contains(&self.neighbor_seconds),
+            "群聊邻域时间须为 1..3600 秒"
+        );
+        ensure!(
+            (256..=64_000).contains(&self.recall_budget),
+            "跨会话资料预算须为 256..64000"
+        );
+        ensure!(
+            self.neighbor_budget <= self.recall_budget,
+            "群聊背景预算不能超过跨会话资料预算"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub enabled: bool,
     pub defaults: AiSettings,
     pub auto_reply: AutoReplyConfig,
     pub learning: LearningConfig,
+    pub context: ContextConfig,
     pub keywords: Vec<String>,
     pub global_memory_shared: bool,
     pub read_group_background: bool,
@@ -598,6 +657,7 @@ impl Default for AiConfig {
             defaults: AiSettings::default(),
             auto_reply: AutoReplyConfig::default(),
             learning: LearningConfig::default(),
+            context: ContextConfig::default(),
             keywords: vec!["小鱼".into()],
             global_memory_shared: true,
             read_group_background: true,
@@ -819,6 +879,7 @@ impl Config {
         let ai = &self.plugins.ai;
         ai.auto_reply.validate()?;
         ai.learning.validate()?;
+        ai.context.validate()?;
         ensure!(ai.persona(&ai.defaults.persona).is_some(), "人设不存在");
         ensure!(
             ai.personas

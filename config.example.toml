@@ -93,6 +93,16 @@ max_changes_per_run = 6        # 1..20
 max_note_chars = 2000          # 100..10000
 injection_budget = 12000       # 聊天时笔记的独立额外空间：0..64000；0=暂不注入但仍可学习，不占原聊天输入预算
 
+[plugins.ai.context]
+enabled = true                # 同机器人、同 QQ 跨群与私聊接续；只登记明确触发且已确认发送的新问答
+recent_seconds = 7200          # 最近问答时间范围：60..604800 秒
+max_turns = 3                  # 每轮最多候选问答数：1..32
+neighbors_before = 10          # 来源群聊前文条数：0..50，设 0 不读取前文
+neighbors_after = 5            # 来源群聊后文条数：0..50，设 0 不读取后文
+neighbor_seconds = 120         # 前后各自时间范围：1..3600 秒；不越过本轮消息水位
+recall_budget = 3000           # 跨会话资料子预算：256..64000，占用普通聊天输入预算，最多其一半
+neighbor_budget = 1500         # 辅助群聊背景子预算：0..recall_budget；来源隔离和总预算仍有效
+
 [plugins.ai.defaults]
 reply_to_bot = true            # 引用回复当前机器人账号的消息时触发 AI；插件命令仍优先
 mode = "group"                # group：同群共享；user：同群按用户隔离，回复仍公开

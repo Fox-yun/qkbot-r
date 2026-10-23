@@ -1,6 +1,7 @@
 //! Embedded administration with server sessions and a shared database service.
 pub mod auth;
 pub mod contacts;
+pub mod context;
 pub mod embedding;
 pub mod learning;
 pub mod memory;
@@ -103,6 +104,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(scope_plugins).post(toggle_scope_plugin),
         )
         .route("/api/budget", get(budget))
+        .route("/api/context/overview", get(context::overview))
         .route("/api/learning", get(learning::snapshot))
         .route("/api/learning/mutate", post(learning::mutate))
         .route("/api/learning/operations/{id}", get(learning::operation))

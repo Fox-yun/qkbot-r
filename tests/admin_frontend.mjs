@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning, loadContextOverview, renderContextOverview, invalidateContextOverview, filterConfig, openConfigSection };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -97,6 +97,7 @@ function harness() {
     result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
     result.plugins.ai.learning = { enabled: false, semantic_recall: true, recall_limit: 8, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
     Object.assign(result.limits, { learning_requests_per_hour: 4, learning_requests_per_day: 24, learning_max_input_budget: 8000, learning_max_output_tokens: 1200 });
+    result.plugins.ai.context = { enabled: true, recent_seconds: 7200, max_turns: 3, neighbors_before: 10, neighbors_after: 5, neighbor_seconds: 120, recall_budget: 3000, neighbor_budget: 1500 };
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
     result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
     result.app.database = "data/test.db"; return result;
@@ -1825,4 +1826,121 @@ test('confirmed sticker mutation distinguishes a later listing refresh failure',
   });
   await h.app.mutateSticker('reindex', h.app.state.stickers.rows[0]);
   assert.equal(h.app.state.stickers.operation, null); assert.match(h.ids.get('sticker-message').textContent, /已提交.*尚未完成.*列表刷新未完成/u);
+});
+
+function contextSnapshot(h, overrides = {}) {
+  return {
+    bot_id: "1", enabled: true, config: structuredClone(h.sample.plugins.ai.context),
+    counts: { turns: 17, memories: 8, notes: 4 },
+    recent: [{ id: 1, user_id: "42", conversation_id: "1:group:10:v0:group", scene: "group", peer_id: "10", completed_at: 1792800000, request_key: "msg:100", reply_key: "msg:101", user_text: "<img src=x onerror=alert(1)>第二个方案呢？", assistant_text: "第二个方案是本地部署。" }],
+    ...overrides,
+  };
+}
+
+test("continuity window defaults to ten before and five after and saves typed bounded settings", async () => {
+  const h = harness(); await h.login();
+  const group = h.app.groups.find((entry) => entry.title === "跨会话接续"); assert.equal(group.fields.length, 8);
+  assert.equal(h.app.inputs.get("plugins.ai.context.neighbors_before").control.value, "10");
+  assert.equal(h.app.inputs.get("plugins.ai.context.neighbors_after").control.value, "5");
+  h.app.openConfigSection("context");
+  for (const [name, value] of Object.entries({ neighbors_before: "15", neighbors_after: "7", neighbor_seconds: "180", recent_seconds: "604800", max_turns: "32", neighbor_budget: "0" })) {
+    const control = h.app.inputs.get("plugins.ai.context." + name).control; control.value = value; await control.emit("input");
+  }
+  assert.equal(h.calls.some((call) => call.path === "/api/config" && call.options.method === "PUT"), false);
+  let saved;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/config" && options.method === "PUT") { saved = JSON.parse(options.body); return { body: {} }; }
+    if (path === "/api/config") return { body: { ...h.snapshot(), config: saved.config, revision: "r2" } };
+    return { body: { phase: "running", applied_revision: "r2", loaded_plugins: [] } };
+  });
+  await h.app.saveConfig(true);
+  assert.deepEqual(saved.config.plugins.ai.context, { enabled: true, recent_seconds: 604800, max_turns: 32, neighbors_before: 15, neighbors_after: 7, neighbor_seconds: 180, recall_budget: 3000, neighbor_budget: 0 });
+  assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
+});
+
+test("continuity validates integer ranges and background budget containment in form and JSON", async () => {
+  const h = harness(); await h.login();
+  for (const [name, value] of [["neighbors_before", "51"], ["neighbors_after", "-1"], ["recent_seconds", "604801"], ["max_turns", "3.5"], ["neighbor_budget", "3001"]]) {
+    const control = h.app.inputs.get("plugins.ai.context." + name).control, previous = control.value; control.value = value;
+    assert.throws(() => h.app.readForm(), /范围|不能超过/u); control.value = previous;
+  }
+  const config = h.app.readForm(); config.plugins.ai.context.neighbor_budget = 3001;
+  h.ids.get("config-json").value = JSON.stringify(config); h.app.state.jsonDirty = true;
+  assert.throws(() => h.app.adoptJson(), /不能超过/u);
+  assert.equal(h.app.state.jsonDirty, true);
+});
+
+test("knowledge navigation unifies memory and notes while config filters preserve hidden drafts", async () => {
+  const h = harness(); await h.login();
+  h.app.state.memory.list = [h.conversation()]; h.app.showView("memory");
+  assert.equal(h.ids.get("knowledge-header").hidden, false);
+  const nav = h.document.querySelectorAll(".nav-item").find((node) => node.dataset.view === "context");
+  assert.equal(nav.attrs["aria-current"], "page");
+  const memoryTab = h.document.querySelectorAll(".workspace-tab").find((node) => node.dataset.view === "memory");
+  assert.equal(memoryTab.attrs["aria-current"], "page");
+  const model = h.app.inputs.get("llm.model").control; model.value = "draft-model"; await model.emit("input");
+  h.app.openConfigSection("context");
+  assert.equal(h.app.state.view, "config"); assert.equal(h.ids.get("knowledge-header").hidden, true);
+  for (const card of h.document.querySelectorAll("[data-config-group]")) assert.equal(card.hidden, card.dataset.configGroup !== "context");
+  assert.equal(h.app.readForm().llm.model, "draft-model");
+  h.app.filterConfig("all"); assert.equal(h.document.querySelectorAll("[data-config-group]").some((card) => card.hidden), false);
+  assert.equal(model.value, "draft-model");
+});
+
+test("continuity overview is lazy and previews literal account-bound sources with applied settings", async () => {
+  const h = harness(); await h.login();
+  assert.equal(h.calls.some((call) => call.path === "/api/context/overview"), false);
+  const snapshot = contextSnapshot(h); snapshot.config.neighbors_before = 12;
+  h.setHandler(async () => ({ body: snapshot })); h.app.state.view = "context"; await h.app.loadContextOverview();
+  assert.match(h.ids.get("context-neighbors").textContent, /前 12 \/ 后 5/u);
+  assert.equal(h.app.inputs.get("plugins.ai.context.neighbors_before").control.value, "10", "applied snapshot never overwrites the saved config draft");
+  assert.match(h.ids.get("context-counts").textContent, /17.*预览问答.*8.*个人记忆.*4.*经验笔记/su);
+  assert.match(h.ids.get("context-recent-list").textContent, /群 10.*用户 42.*机器人 1.*msg:100.*msg:101/su);
+  assert.match(h.ids.get("context-recent-list").textContent, /<img src=x onerror=alert\(1\)>/u);
+  assert.equal(h.document.querySelectorAll(".context-quote img").length, 0);
+  assert.equal(h.ids.get("context-input-budget").textContent, "6,000");
+  h.app.state.config.plugins.ai.learning.enabled = true; h.app.renderContextOverview();
+  assert.equal(h.ids.get("context-input-budget").textContent, "18,000");
+  assert.match(h.ids.get("context-budget-note").textContent, /普通输入加上.*笔记额度.*接续占普通输入/u);
+});
+
+test("continuity empty, malformed and failed reads clear sources without a fake success state", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "context";
+  h.setHandler(async () => ({ body: contextSnapshot(h, { bot_id: null, recent: [], counts: { turns: 0, memories: 0, notes: 0 }, message: "等待机器人连接。" }) }));
+  await h.app.loadContextOverview(); assert.match(h.ids.get("context-overview-message").textContent, /等待机器人/u);
+  assert.match(h.ids.get("context-recent-list").textContent, /连接机器人/u);
+  const bad = contextSnapshot(h); bad.recent[0].user_id = 42;
+  h.setHandler(async () => ({ body: bad })); await h.app.loadContextOverview();
+  assert.equal(h.app.state.context.snapshot, null); assert.equal(h.ids.get("context-recent-list").textContent, "");
+  assert.match(h.ids.get("context-overview-message").textContent, /来源格式无效/u);
+  h.setHandler(async () => ({ status: 503, body: { error: { code: "unavailable", message: "正在重连" } } }));
+  await h.app.loadContextOverview(); assert.equal(h.app.state.context.snapshot, null);
+  assert.equal(h.ids.get("refresh-context-overview").disabled, false);
+});
+
+test("continuity rejects late reads after navigation, logout and account changes", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "context";
+  let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const pending = h.app.loadContextOverview(); await Promise.resolve();
+  h.app.showView("overview"); resolve({ body: contextSnapshot(h) }); await pending;
+  assert.equal(h.app.state.context.snapshot, null); assert.equal(h.ids.get("context-recent-list").textContent, "");
+  h.app.state.view = "context"; const logoutPending = h.app.loadContextOverview(); await Promise.resolve();
+  h.app.clearSession(); resolve({ body: contextSnapshot(h) }); await logoutPending;
+  assert.equal(h.app.state.context.snapshot, null);
+  await h.login(); h.app.state.view = "context"; h.setHandler(async () => ({ body: contextSnapshot(h) })); await h.app.loadContextOverview();
+  h.app.state.status = { phase: "running", online: true, bot_id: 99 }; h.app.renderStatus();
+  assert.equal(h.app.state.context.snapshot, null); assert.match(h.ids.get("context-overview-message").textContent, /账号已变化/u);
+});
+
+test("continuity cannot display another bot's source conversation or an account replaced during loading", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "context";
+  const wrong = contextSnapshot(h); wrong.recent[0].conversation_id = "99:group:10:v0:group";
+  h.setHandler(async () => ({ body: wrong })); await h.app.loadContextOverview();
+  assert.equal(h.app.state.context.snapshot, null); assert.match(h.ids.get("context-overview-message").textContent, /来源会话.*不一致/u);
+  let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
+  const pending = h.app.loadContextOverview(); await Promise.resolve();
+  h.app.state.status = { phase: "running", online: true, bot_id: 99 }; h.app.renderStatus();
+  resolve({ body: contextSnapshot(h) }); await pending;
+  assert.equal(h.app.state.context.snapshot, null); assert.equal(h.ids.get("context-recent-list").textContent, "");
+  assert.match(h.ids.get("context-overview-message").textContent, /账号已变化/u);
 });

@@ -362,6 +362,10 @@ impl Host {
         let scope_key = scope.key();
         let destination = scope.clone();
         let _delivery = self.access.delivery_guard(scope).await?;
+        let dependencies = authorization
+            .as_ref()
+            .map(|a| a.context_dependencies())
+            .unwrap_or_default();
         let submit=self.store.call(move|c|{
             let mut message=message;
             let mut authorization=authorization;
@@ -408,11 +412,22 @@ impl Host {
             let tx=c.transaction()?;
             tx.execute("UPDATE outbox SET state=?2,message_seq=?3,detail=?4,updated_at=?5 WHERE id=?1",params![id,state,seq,detail,now()])?;
             if let Some(seq)=seq {
-                let valid=origin=="ai"&&guard.as_ref().is_some_and(|g|check_guard(&tx,g).is_ok())&&check_plugin(&tx,&origin,plugin_epoch).is_ok()&&crate::access::check_revision(&tx,&scope.key(),access_revision).is_ok();
+                let valid=origin=="ai"&&guard.as_ref().is_some_and(|g|check_guard(&tx,g).is_ok())&&check_plugin(&tx,&origin,plugin_epoch).is_ok()&&crate::access::check_revision(&tx,&scope.key(),access_revision).is_ok()&&dependencies.validate(&tx).is_ok();
                 let (conversation,epoch)=if valid {let g=guard.as_ref().unwrap();(g.conversation_id.clone(),g.epoch)}else{(String::new(),0)};
                 let role=if valid{"assistant"}else{"system"};
                 let key=format!("{}:{}",scope.key(),seq);
                 tx.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,origin_plugin,learnable,access_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11) ON CONFLICT(key) DO UPDATE SET role=excluded.role,content=excluded.content,conversation_id=excluded.conversation_id,epoch=excluded.epoch,inbound_position=excluded.inbound_position,origin_plugin=excluded.origin_plugin,access_revision=excluded.access_revision",params![key,scope.key(),conversation,epoch,scope.bot_id,role,text,now(),inbound_position,origin,access_revision])?;
+                if valid && !text.trim().is_empty() {
+                    tx.execute_batch("SAVEPOINT context_metadata")?;
+                    match dependencies.register_reply(&tx, inbound_position, &key) {
+                        Ok(()) => tx.execute_batch("RELEASE context_metadata")?,
+                        Err(error) => {
+                            tx.execute_batch("ROLLBACK TO context_metadata; RELEASE context_metadata")?;
+                            tx.execute("UPDATE messages SET role='system',conversation_id='',epoch=0 WHERE key=?1", [&key])?;
+                            tracing::warn!(%error, "confirmed reply excluded from context after dependency registration failed");
+                        }
+                    }
+                }
             }
             tx.commit()?;Ok(())
         }).await;
@@ -738,6 +753,7 @@ impl Router {
             .call(move |c| {
                 // Never expire unresolved sends or active conversation work as ordinary logs.
                 c.execute("DELETE FROM messages WHERE received_at<?1", [cutoff])?;
+                crate::plugins::ai::context::maintain(c)?;
                 c.execute(
                     "DELETE FROM outbox WHERE created_at<?1 AND state IN('confirmed','failed') AND NOT EXISTS(SELECT 1 FROM reminder_jobs r WHERE r.status='dispatching' AND r.outbox_id=outbox.id)",
                     [cutoff],
