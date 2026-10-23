@@ -4107,6 +4107,32 @@ async fn sticker_reply_rejects_raw_image_arguments_without_sending_or_fetching()
             .unwrap();
         request = mock.model().await;
         assert_failed_tool_results(&request.body, &[id]);
+        if id == "forged-image" {
+            // An unknown raw-image field is a structural reply error. Its
+            // bounded recovery closes all tools and requests plain text.
+            assert!(request.body.get("tools").is_none());
+            assert_eq!(request.body["tool_choice"], "none");
+            assert_eq!(
+                last_model_tool_result(&request.body, id)["error"],
+                "reply_message 参数格式无效"
+            );
+            assert!(
+                request.body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("刚才的reply_message参数不符合格式")
+            );
+        } else {
+            // Forged sticker sources never qualify for structural recovery.
+            assert_eq!(request.body["tool_choice"], "auto");
+            assert!(
+                request.body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "reply_message")
+            );
+        }
         assert!(
             mock.sends.try_recv().is_err(),
             "invalid image arguments must have no send side effect"
@@ -4115,14 +4141,7 @@ async fn sticker_reply_rejects_raw_image_arguments_without_sending_or_fetching()
         assert!(mock.quotes.try_recv().is_err());
         assert!(mock.resources.try_recv().is_err());
     }
-    request
-        .reply
-        .send(model_tool_response(vec![model_tool_call(
-            "text-only",
-            "reply_message",
-            json!({"text":"正常文字回复"}),
-        )]))
-        .unwrap();
+    request.reply.send(answer("正常文字回复")).unwrap();
     let sent = within(mock.sends.recv()).await.unwrap();
     assert_eq!(
         sent["message"],
@@ -4133,6 +4152,8 @@ async fn sticker_reply_rejects_raw_image_arguments_without_sending_or_fetching()
     assert!(mock.sends.try_recv().is_err());
     assert!(mock.models.try_recv().is_err());
     assert!(mock.embeddings.try_recv().is_err());
+    assert!(mock.quotes.try_recv().is_err());
+    assert!(mock.resources.try_recv().is_err());
     drop(host);
     mock.stop().await;
 }

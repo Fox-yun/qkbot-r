@@ -319,6 +319,7 @@ pub struct ContextRequest<'a> {
     pub received_at: i64,
     pub current: &'a str,
     pub settings: &'a AiSettings,
+    pub(crate) once_query: Option<&'a super::semantic::OnceQueryPermit>,
     /// Multi-author automatic participation cannot be attributed to the last
     /// speaker as a request to resume their personal conversations.
     pub allow_continuity: bool,
@@ -387,7 +388,7 @@ pub async fn prepare(
     cancel: &CancellationToken,
 ) -> Result<PreparedContext> {
     let memories = if request.settings.memory_read {
-        super::semantic::retrieve(
+        super::semantic::retrieve_for_turn(
             host,
             request.guard,
             request.actor,
@@ -396,6 +397,7 @@ pub async fn prepare(
             host.config.plugins.ai.memory_recall_limit,
             host.config.plugins.ai.memory_recall_budget,
             cancel,
+            request.once_query,
         )
         .await?
     } else {

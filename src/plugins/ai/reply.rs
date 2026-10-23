@@ -230,6 +230,17 @@ pub(super) struct References {
     current_sources: BTreeSet<String>,
 }
 
+#[derive(Debug)]
+pub(super) struct InvalidArguments;
+
+impl std::fmt::Display for InvalidArguments {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("reply_message 参数格式无效")
+    }
+}
+
+impl std::error::Error for InvalidArguments {}
+
 impl References {
     pub(super) fn new(scope: Scope) -> Self {
         Self {
@@ -395,7 +406,7 @@ impl References {
         args: Value,
         max_bytes: usize,
     ) -> Result<PreparedReply> {
-        let args: Arguments = serde_json::from_value(args).context("reply_message 参数格式无效")?;
+        let args: Arguments = serde_json::from_value(args).context(InvalidArguments)?;
         ensure!(!args.text.trim().is_empty(), "回复正文不能为空");
         ensure!(args.mention_users.len() <= 32, "提及参数过多");
         let mentions: BTreeSet<_> = args.mention_users.into_iter().collect();
@@ -522,6 +533,46 @@ mod tests {
 
     fn envelope(content: &Value) -> Value {
         json!({"role":"user","content":content.to_string()})
+    }
+
+    #[test]
+    fn only_reply_argument_structure_errors_allow_text_recovery() {
+        let (db, scope, guard) = fixture();
+        let mut references = References::new(scope);
+        let current = local(&mut references, 20, "synthetic current input", &[]);
+        for args in [
+            json!({}),
+            json!({"text":42}),
+            json!({"text":"synthetic", "mention_users":null}),
+            json!({"text":"synthetic", "unknown":true}),
+        ] {
+            let error = references.resolve(&db, &guard, args, 4096).err().unwrap();
+            assert!(error.is::<InvalidArguments>());
+            assert_eq!(error.to_string(), "reply_message 参数格式无效");
+        }
+        for args in [
+            json!({"text":""}),
+            json!({"text":"synthetic", "reply_to":"forged-message"}),
+            json!({"text":"synthetic", "mention_users":["forged-member"]}),
+        ] {
+            let error = references.resolve(&db, &guard, args, 4096).err().unwrap();
+            assert!(!error.is::<InvalidArguments>());
+        }
+        db.execute(
+            "UPDATE messages SET revoked=1 WHERE inbound_position=20",
+            [],
+        )
+        .unwrap();
+        let error = references
+            .resolve(
+                &db,
+                &guard,
+                json!({"text":"synthetic", "reply_to":current["message_ref"]}),
+                4096,
+            )
+            .err()
+            .unwrap();
+        assert!(!error.is::<InvalidArguments>());
     }
 
     #[test]

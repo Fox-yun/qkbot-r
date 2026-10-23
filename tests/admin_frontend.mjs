@@ -1698,6 +1698,234 @@ test("catalog and saved permission refresh preserve conversation selections and 
   current.checked = true; await current.emit("change"); assert.deepEqual([...h.app.readSettings().allowed_tools], ["reminder_create"]);
 });
 
+async function appliedConversation(h) {
+  h.sample.plugins.ai.defaults.allowed_tools = ["clock_now"];
+  await h.login();
+  h.setHandler(async () => ({ body: { phase: "running", applied_revision: "r1", loaded_plugins: ["ai", "clock"] } }));
+  await h.app.refreshStatus();
+  const detail = structuredClone(h.conversation());
+  h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? detail : emptyConversations }));
+  await h.app.selectConversation(detail);
+  return detail;
+}
+
+async function saveSearchDefaults(h) {
+  const saved = h.snapshot(); saved.revision = "r2";
+  saved.config.plugins.ai.defaults.allowed_tools = ["clock_now", "web_search"];
+  saved.tool_catalog.push({ name: "web_search", description: "联网搜索", plugin_id: "web_search", effect: "network_read" });
+  h.setHandler(async () => ({ body: saved })); await h.app.loadConfig();
+  return saved;
+}
+
+async function observeApplied(h, revision = "r2") {
+  h.setHandler(async () => ({ body: { phase: "running", applied_revision: revision, loaded_plugins: ["ai", "clock", "web_search"] } }));
+  await h.app.refreshStatus();
+}
+
+test("applied defaults invalidate clean conversation settings so a budget edit cannot remove a newly allowed search tool", async () => {
+  const h = harness(), old = await appliedConversation(h);
+  await saveSearchDefaults(h);
+  assert.equal(h.app.state.status.applied_revision, "r1");
+  assert.equal(h.app.state.memory.conflict, false, "saving without applying must preserve the running conversation settings");
+  assert.deepEqual([...h.app.readSettings().allowed_tools], ["clock_now"]);
+  await observeApplied(h);
+  assert.equal(h.app.state.memory.conflict, true);
+  assert.equal(h.ids.get("conversation-conflict").hidden, false);
+  assert.match(h.ids.get("conversation-conflict").textContent, /运行配置已切换.*草稿仍保留.*重新载入/u);
+  assert.match(h.ids.get("conversation-dirty").textContent, /保存已暂停/u);
+  assert.equal(h.ids.get("conversation-settings-fields").disabled, true);
+  assert.equal(h.ids.get("save-conversation-settings").disabled, true);
+  assert.equal(h.ids.get("reload-conversation").disabled, false);
+  const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000"; await budget.emit("input");
+  await h.ids.get("conversation-settings-form").emit("submit"); await new Promise(setImmediate);
+  assert.equal(h.calls.some((call) => call.options.method === "POST"), false);
+  assert.equal(budget.value, "12000");
+  const fresh = { ...old, settings: { ...old.settings, allowed_tools: ["clock_now", "web_search"] } };
+  let sent;
+  h.setHandler(async (path, options) => {
+    if (path === "/api/status") return { body: { phase: "running", applied_revision: "r2" } };
+    if (path === "/api/memory/mutate") { sent = JSON.parse(options.body); return { body: { request_id: sent.request_id, status: "completed" } }; }
+    return { body: path.includes("/conversations/") ? fresh : emptyConversations };
+  });
+  await h.ids.get("reload-conversation").emit("click"); await new Promise(setImmediate);
+  assert.equal(h.app.state.memory.conflict, false); assert.equal(h.app.state.memory.settingsDirty, false);
+  assert.deepEqual([...h.app.readSettings().allowed_tools], ["clock_now", "web_search"]);
+  const freshBudget = h.app.settingInputs.get("input_budget").input; freshBudget.value = "12000"; await freshBudget.emit("input");
+  await h.ids.get("conversation-settings-form").emit("submit"); await new Promise(setImmediate);
+  assert.deepEqual(sent.action.settings.allowed_tools, ["clock_now", "web_search"]);
+  assert.equal(sent.action.settings.input_budget, 12000);
+  assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 1);
+});
+
+test("applied revision changes preserve dirty conversation drafts and explicit overrides until the user reloads", async () => {
+  const h = harness(), old = await appliedConversation(h);
+  const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000"; await budget.emit("input");
+  const selected = toolCheckbox(conversationTools(h), "clock_now"); selected.checked = false; await selected.emit("change");
+  h.app.openMemoryEditor({ id: 5, conversation_id: old.id, subject_id: 7, text: "原记录", kind: "fact", active: true, version: 1 });
+  h.ids.get("edit-memory-text").value = "未保存记忆正文"; h.app.state.memory.editorDirty = true;
+  h.app.state.memory.preview = { preview_id: "old-preview" }; h.ids.get("forget-dialog").showModal();
+  await saveSearchDefaults(h); await observeApplied(h);
+  assert.equal(h.app.settingInputs.get("input_budget").input, budget); assert.equal(budget.value, "12000");
+  assert.deepEqual([...h.app.readSettings().allowed_tools], []);
+  assert.equal(h.app.state.memory.settingsDirty, true); assert.equal(h.app.state.memory.editorDirty, true);
+  assert.equal(h.ids.get("edit-memory-text").value, "未保存记忆正文"); assert.equal(h.ids.get("memory-editor").open, true);
+  assert.equal(h.ids.get("save-memory").disabled, true); assert.equal(h.app.state.memory.preview, null); assert.equal(h.ids.get("forget-dialog").open, false);
+  h.window.confirm = () => false;
+  const count = h.calls.length; await h.ids.get("reload-conversation").emit("click"); await new Promise(setImmediate);
+  assert.equal(h.calls.length, count); assert.equal(h.app.state.memory.conflict, true); assert.equal(budget.value, "12000");
+  h.window.confirm = () => true;
+  h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? old : emptyConversations }));
+  await h.ids.get("reload-conversation").emit("click"); await new Promise(setImmediate);
+  assert.equal(h.app.state.memory.conflict, false);
+  assert.deepEqual([...h.app.readSettings().allowed_tools], ["clock_now"], "an authoritative explicit override must not be expanded to global tools");
+  assert.equal(h.app.state.memory.editorDirty, false); assert.equal(h.ids.get("memory-editor").open, false);
+});
+
+test("conversation reload retires older status responses and their errors without changing the fresh form", async () => {
+  for (const rejected of [false, true]) {
+    const h = harness(), old = await appliedConversation(h); await saveSearchDefaults(h); await observeApplied(h);
+    let finish;
+    h.setHandler(() => new Promise((resolve) => { finish = resolve; })); const pending = h.app.refreshStatus();
+    const fresh = { ...old, settings: { ...old.settings, allowed_tools: ["clock_now", "web_search"] } };
+    h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? fresh : emptyConversations }));
+    await h.app.selectConversation(fresh);
+    const version = h.app.state.memory.version, field = h.app.settingInputs.get("input_budget").input;
+    finish(rejected ? { error: new Error("stale network failure") } : { body: { phase: "running", applied_revision: "r1", loaded_plugins: ["ai", "clock"] } });
+    await pending;
+    assert.equal(h.app.state.status.applied_revision, "r2"); assert.equal(h.app.state.memory.conflict, false);
+    assert.equal(h.app.state.memory.version, version); assert.equal(h.app.settingInputs.get("input_budget").input, field);
+    assert.deepEqual([...h.app.readSettings().allowed_tools], ["clock_now", "web_search"]);
+  }
+});
+
+test("a later applied revision rejects an in-flight conversation reload and keeps a visible recovery entry", async () => {
+  const h = harness(), old = await appliedConversation(h); let finish;
+  h.setHandler(() => new Promise((resolve) => { finish = resolve; }));
+  const pending = h.app.selectConversation(old);
+  await observeApplied(h);
+  assert.equal(h.app.state.memory.conflict, true); assert.equal(h.ids.get("selected-conversation").hidden, false);
+  assert.equal(h.ids.get("reload-conversation").disabled, false);
+  finish({ body: old }); await pending;
+  assert.equal(h.app.state.memory.detail, null); assert.equal(h.app.state.memory.conflict, true);
+  assert.equal(h.ids.get("conversation-settings-fields").disabled, true);
+  const fresh = { ...old, settings: { ...old.settings, input_budget: 9000 } };
+  h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? fresh : emptyConversations }));
+  await h.app.selectConversation(fresh);
+  assert.equal(h.app.state.memory.conflict, false); assert.equal(h.app.readSettings().input_budget, 9000);
+});
+
+test("late conversation and runtime reads cannot cross a selection change or a signed-out session", async () => {
+  for (const logout of [false, true]) {
+    const h = harness(), old = await appliedConversation(h); let finishDetail, finishStatus;
+    h.setHandler((path) => new Promise((resolve) => { if (path === "/api/status") finishStatus = resolve; else finishDetail = resolve; }));
+    const pendingDetail = h.app.selectConversation(old), pendingStatus = h.app.refreshStatus();
+    if (logout) { h.app.clearSession(); await h.login(); }
+    const next = { ...h.conversation("1:friend:30:0"), scene: "friend", peer_id: 30, scope: "1:friend:30", settings: { ...old.settings, allowed_tools: [] } };
+    h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? next : emptyConversations }));
+    await h.app.selectConversation(next);
+    const status = h.app.state.status, version = h.app.state.memory.version;
+    finishDetail({ body: old }); finishStatus({ body: { phase: "running", applied_revision: "old-r0", loaded_plugins: [] } });
+    await Promise.all([pendingDetail, pendingStatus]);
+    assert.equal(h.app.state.memory.selected.id, next.id); assert.equal(h.app.state.memory.version, version);
+    assert.equal(h.app.state.memory.conflict, false); assert.equal(h.app.state.status, status);
+    assert.deepEqual([...h.app.readSettings().allowed_tools], []);
+  }
+});
+
+test("runtime-operation readback supersedes polling before marking a conversation stale", async () => {
+  const h = harness(); await appliedConversation(h); let finish;
+  h.setHandler(() => new Promise((resolve) => { finish = resolve; })); const pending = h.app.refreshStatus();
+  h.app.state.pendingOperation = { kind: "runtime", goal: "running", revision: "r2" };
+  h.setHandler(async () => ({ body: { phase: "running", applied_revision: "r2", loaded_plugins: ["ai", "clock", "web_search"] } }));
+  await h.app.checkOperation();
+  assert.equal(h.app.state.pendingOperation, null); assert.equal(h.app.state.memory.conflict, true);
+  const version = h.app.state.memory.version;
+  finish({ body: { phase: "running", applied_revision: "r1", loaded_plugins: ["ai", "clock"] } }); await pending;
+  assert.equal(h.app.state.status.applied_revision, "r2"); assert.equal(h.app.state.memory.version, version);
+});
+
+test("settings save checks applied configuration even while an older runtime poll is pending", async () => {
+  const h = harness(); await appliedConversation(h); await saveSearchDefaults(h);
+  let finishOld;
+  h.setHandler(() => new Promise((resolve) => { finishOld = resolve; })); const pending = h.app.refreshStatus();
+  const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000"; await budget.emit("input");
+  h.setHandler(async (path) => { assert.equal(path, "/api/status"); return { body: { phase: "running", applied_revision: "r2" } }; });
+  await h.ids.get("conversation-settings-form").emit("submit"); await new Promise(setImmediate);
+  assert.equal(h.app.state.memory.conflict, true); assert.equal(budget.value, "12000"); assert.equal(h.app.state.memory.settingsDirty, true);
+  assert.equal(h.calls.filter((call) => call.options.method === "POST").length, 0);
+  finishOld({ body: { phase: "running", applied_revision: "r1" } }); await pending;
+  assert.equal(h.app.state.status.applied_revision, "r2"); assert.equal(h.app.state.memory.conflict, true);
+});
+
+test("settings preflight permits saved-but-unapplied defaults and rejects unavailable or transitioning runtime state", async () => {
+  for (const scenario of ["saved-only", "starting", "stopping", "error", "malformed", "superseded", "logout", "selection"]) {
+    const h = harness(), old = await appliedConversation(h); await saveSearchDefaults(h);
+    const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000"; await budget.emit("input");
+    let finish, sent;
+    h.setHandler(async (path, options) => {
+      if (path === "/api/status") {
+        if (["superseded", "logout", "selection"].includes(scenario)) return new Promise((resolve) => { finish = resolve; });
+        if (scenario === "error") return { error: new Error("synthetic status failure") };
+        return { body: scenario === "malformed" ? {} : { phase: scenario === "saved-only" ? "running" : scenario, applied_revision: "r1" } };
+      }
+      if (path === "/api/memory/mutate") { sent = JSON.parse(options.body); return { body: { request_id: sent.request_id, status: "completed" } }; }
+      return { body: path.includes("/conversations/") ? old : emptyConversations };
+    });
+    const saving = h.app.runAction(() => h.app.mutateMemory({ op: "settings", settings: h.app.readSettings() }));
+    if (["superseded", "logout", "selection"].includes(scenario)) {
+      assert.ok(finish);
+      if (scenario === "logout") h.app.clearSession();
+      else {
+        const next = scenario === "selection" ? { ...old, id: "1:friend:20:0", scene: "friend", scope: "1:friend:20", peer_id: 20 } : old;
+        h.setHandler(async (path) => ({ body: path.includes("/conversations/") ? next : emptyConversations }));
+        await h.app.selectConversation(next);
+      }
+      finish({ body: { phase: "running", applied_revision: "r1" } });
+    }
+    await saving;
+    assert.equal(h.calls.filter((call) => call.options.method === "POST").length, scenario === "saved-only" ? 1 : 0, scenario);
+    if (scenario === "saved-only") { assert.deepEqual(sent.action.settings.allowed_tools, ["clock_now"]); assert.equal(sent.action.settings.input_budget, 12000); }
+    else if (["starting", "stopping", "error", "malformed"].includes(scenario)) { assert.equal(budget.value, "12000"); assert.equal(h.app.state.memory.settingsDirty, true); }
+  }
+});
+
+test("an accepted queued apply blocks old conversation settings until the target runs or a terminal transition is confirmed", async () => {
+  for (const outcome of ["running", "error", "stopped", "logout", "initially-stopped"]) {
+    const h = harness(), old = await appliedConversation(h); await saveSearchDefaults(h);
+    let status = { phase: "running", applied_revision: "r1", runtime_generation: 1 };
+    if (outcome === "initially-stopped") {
+      status = { phase: "stopped", applied_revision: null, runtime_generation: 1 };
+      h.setHandler(async (path) => ({ body: path === "/api/status" ? status : path.includes("/conversations/") ? old : emptyConversations }));
+      await h.app.refreshStatus(); await h.app.selectConversation(old);
+    }
+    const budget = h.app.settingInputs.get("input_budget").input; budget.value = "12000"; await budget.emit("input");
+    h.setHandler(async (path) => {
+      if (path === "/api/runtime/apply" || path === "/api/runtime/stop") return { status: 202, body: { accepted: true } };
+      assert.equal(path, "/api/status"); return { body: status };
+    });
+    await h.ids.get("apply-runtime").emit("click"); await new Promise(setImmediate);
+    assert.equal(h.app.state.runtimeApplyTarget.revision, "r2");
+    assert.equal(h.app.state.memory.conflict, false);
+    await h.ids.get("conversation-settings-form").emit("submit"); await new Promise(setImmediate);
+    assert.equal(h.calls.some((call) => call.path === "/api/memory/mutate"), false, outcome);
+    assert.match(h.ids.get("notice-text").textContent, /应用请求已排队.*尚未保存/u);
+    assert.equal(budget.value, "12000"); assert.equal(h.app.state.memory.settingsDirty, true);
+    if (outcome === "logout") {
+      h.app.clearSession(); await h.login(); assert.equal(h.app.state.runtimeApplyTarget, null); continue;
+    }
+    if (outcome === "stopped") {
+      await h.ids.get("stop-runtime").emit("click"); await new Promise(setImmediate);
+      assert.ok(h.app.state.runtimeApplyTarget, "accepting stop while the old host still runs must not unlock settings");
+    }
+    status = outcome === "running" ? { phase: "running", applied_revision: "r2", runtime_generation: 2 }
+      : { phase: outcome === "initially-stopped" ? "error" : outcome, applied_revision: null, runtime_generation: 2 };
+    await h.app.refreshStatus();
+    assert.equal(h.app.state.runtimeApplyTarget, null, outcome);
+    assert.equal(h.app.state.memory.conflict, true, "failed startup can change defaults before publishing an applied revision");
+    assert.equal(budget.value, "12000");
+  }
+});
+
 test("tool metadata stays literal, prototype names are safe, and malformed catalogs never replace the draft", async () => {
   const h = harness(); await h.login(); const snapshot = h.snapshot();
   snapshot.tool_catalog = [{ name: "__proto__", description: "<img onerror=alert(1)>", plugin_id: "clock", effect: "read" }, { name: "constructor", description: "不可继承对象属性", plugin_id: "constructor", effect: "read" }];

@@ -7,9 +7,9 @@
     secrets: {}, status: null, qq: null, busy: false, dirty: false, applyError: null, applyFailure: null,
     jsonDirty: false, formInvalid: false, stale: false,
     configSave: { phase: "", message: "", kind: "" },
-    runtimeTimer: null, qqTimer: null, runtimePolling: false, qqPolling: false,
+    runtimeTimer: null, qqTimer: null, runtimePolling: false, runtimeQueryVersion: 0, runtimeRevision: null, runtimeApplyTarget: null, qqPolling: false,
     qqPollingPaused: false, qqQueryVersion: 0, qqFailures: 0, qqInterval: 5000, qqError: "", qrExpires: null, view: "overview",
-    memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false },
+    memory: { page: 1, totalPages: 1, list: [], selected: null, version: 0, detail: null, pageMemories: 1, totalMemoryPages: 1, rows: [], checked: new Set(), settingsDirty: false, editorDirty: false, editing: null, preview: null, conflict: false, conflictReason: "" },
     pendingOperation: null,
     personaTemplates: {}, personaSelected: null, toolCatalog: [], pluginCatalog: [], autoReplyBaseEstimate: null,
     groupPersona: { saving: false, message: "", kind: "" },
@@ -1081,7 +1081,9 @@
     $("forget-selected").disabled = memoryBlocked || state.memory.settingsDirty || !state.memory.checked.size;
     $("save-memory").disabled = memoryBlocked;
     $("confirm-forget").disabled = memoryBlocked || !state.memory.preview;
-    $("conversation-dirty").textContent = state.memory.settingsDirty ? "有尚未保存的会话设置" : "与当前会话同步";
+    $("conversation-conflict").hidden = !state.memory.conflict;
+    $("conversation-conflict").textContent = state.memory.conflictReason || "会话已变化，当前编辑仍保留。请复制需要保留的内容，再重新载入此会话。";
+    $("conversation-dirty").textContent = state.memory.conflict ? state.memory.conflictReason || "会话已变化，请重新载入后再保存。" : state.memory.settingsDirty ? "有尚未保存的会话设置" : "与当前会话同步";
     $("memory-selection-count").textContent = state.memory.checked.size ? "已选择 " + state.memory.checked.size + " 条" : "未选择";
     for (const [prefix, page, total] of [["conversations", state.memory.page, state.memory.totalPages], ["memories", state.memory.pageMemories, state.memory.totalMemoryPages]]) {
       $(prefix + "-prev").disabled = unavailable || page <= 1;
@@ -1196,6 +1198,28 @@
   function renderStatus() {
     if (!state.status) { updateControls(); return; }
     const status = state.status;
+    const target = state.runtimeApplyTarget;
+    let applyTerminated = false;
+    if (target) {
+      // A successful apply response only queues work; an unchanged old status is not completion.
+      if (["starting", "stopping"].includes(status.phase) || (Number.isSafeInteger(target.generation) && Number.isSafeInteger(status.runtime_generation) && status.runtime_generation !== target.generation)) target.progressed = true;
+      applyTerminated = ["error", "stopped"].includes(status.phase) && (target.progressed || (Object.hasOwn(phases, target.phase) && status.phase !== target.phase));
+      if ((status.applied_revision === target.revision && ["running", "waiting_login"].includes(status.phase)) || applyTerminated) state.runtimeApplyTarget = null;
+    }
+    // Failed startup may install defaults before it can publish applied_revision.
+    if (applyTerminated || (Object.hasOwn(status, "applied_revision") && status.applied_revision !== state.runtimeRevision)) {
+      state.runtimeRevision = status.applied_revision;
+      if (state.memory.selected || state.memory.detail) {
+        state.memory.version++; state.memory.conflict = true; state.memory.preview = null;
+        state.memory.conflictReason = (applyTerminated ? "应用请求已结束，需重新核对会话的默认工具、人设和预算。" : "运行配置已切换，会话的默认工具、人设或预算可能已变化。") + "当前草稿仍保留，保存已暂停；请复制需要保留的内容，再点「重新载入」核对。";
+        if (!state.memory.detail && state.memory.selected) {
+          $("no-conversation").hidden = true; $("selected-conversation").hidden = false;
+          $("selected-scope-title").textContent = scopeTitle(state.memory.selected);
+          $("selected-scope-detail").textContent = scopeDescription(state.memory.selected);
+        }
+        if ($("forget-dialog").open) $("forget-dialog").close();
+      }
+    }
     if (state.learning.snapshot && status.online && status.bot_id != null && state.learning.snapshot.bot_id !== String(status.bot_id)) { invalidateLearning(); state.learning.conflict = Boolean(state.learning.dirty); state.learning.message = "机器人账号已变化，请刷新学习笔记。"; renderLearning(); }
     if (state.context.snapshot && status.online && status.bot_id != null && state.context.snapshot.bot_id !== String(status.bot_id)) { invalidateContextOverview(); state.context.message = "机器人账号已变化，请刷新接续记录。"; renderContextOverview(); }
     const contacts = state.contacts;
@@ -1258,16 +1282,24 @@
     state.qqQueryVersion++; state.qqPolling = false; state.qqPollingPaused = false; state.qqFailures = 0;
     state.qqInterval = 5000; state.qqError = ""; state.qq = null; clearTimeout(state.qqTimer);
   }
-  async function refreshStatus(manual = false) {
-    if (!state.authenticated || state.runtimePolling || document.hidden) return;
-    const session = state.session; state.runtimePolling = true;
+  function invalidateRuntimeRead() {
+    state.runtimeQueryVersion++; state.runtimePolling = false; clearTimeout(state.runtimeTimer);
+  }
+  async function readRuntimeStatus() {
+    const session = state.session, version = ++state.runtimeQueryVersion; state.runtimePolling = true;
     try {
       const result = await api("/api/status");
-      if (session !== state.session || !state.authenticated) return;
-      state.status = result; renderStatus(); if (manual) notice("运行状态已更新。");
+      if (session !== state.session || !state.authenticated || version !== state.runtimeQueryVersion) return null;
+      state.status = result; renderStatus(); return result;
     }
+    catch (error) { if (session !== state.session || version !== state.runtimeQueryVersion) return null; throw error; }
+    finally { if (session === state.session && version === state.runtimeQueryVersion) { state.runtimePolling = false; scheduleRuntime(); } }
+  }
+  async function refreshStatus(manual = false) {
+    if (!state.authenticated || state.runtimePolling || document.hidden) return;
+    const session = state.session;
+    try { if (await readRuntimeStatus() && manual) notice("运行状态已更新。"); }
     catch (error) { if (session === state.session && error.status !== -1) { if (manual) report(error); else badge("header-status", "状态暂不可用", "wait"); } }
-    finally { if (session === state.session) { state.runtimePolling = false; scheduleRuntime(); } }
   }
   function qqFailure(error) {
     state.qqError = error.message || "QQ 状态查询失败。";
@@ -1832,12 +1864,17 @@
   }
   function clearOperation() { state.pendingOperation = null; $("operation-notice").hidden = true; updateControls(); }
   async function applyRuntime(stop = false) {
+    const session = state.session, revision = state.revision;
+    const target = { revision, phase: state.status?.phase, generation: state.status?.runtime_generation, progressed: false };
     try {
       if (!stop && state.applyError) throw new Error(state.applyError);
       await api(stop ? "/api/runtime/stop" : "/api/runtime/apply", "POST", {});
-      if (!stop) state.applyFailure = null;
+      if (session !== state.session || !state.authenticated) return false;
+      if (!stop) { state.applyFailure = null; state.runtimeApplyTarget = target; }
+      invalidateRuntimeRead();
     }
     catch (error) {
+      if (session !== state.session || !state.authenticated) return false;
       if (uncertain(error)) {
         trackOperation({ kind: "runtime", label: stop ? "断开连接" : "应用配置", goal: stop ? "stopped" : "running", revision: state.revision });
         notice((stop ? "断开结果待确认。" : "配置已保存，应用结果尚未确认。") + error.message, "warning"); return false;
@@ -1902,7 +1939,7 @@
       notice($("config-warning").textContent, "warning"); updateControls();
       configSaveFeedback($("config-warning").textContent, "warning");
     } else {
-      state.status = await api("/api/status"); renderStatus();
+      if (!await readRuntimeStatus() || state.pendingOperation !== operation) return;
       const done = operation.goal === "stopped" ? state.status.phase === "stopped" : state.status.applied_revision === operation.revision && ["running", "waiting_login"].includes(state.status.phase);
       if (done || state.status.phase === "error") {
         if (done && operation.goal === "running") state.applyFailure = null;
@@ -2036,7 +2073,7 @@
   }
   function clearSession(message = "") {
     stopTimers(); state.session++; state.authenticated = false; state.csrf = ""; state.busy = false;
-    state.config = null; state.draft = null; state.status = null; state.qq = null; state.runtimePolling = false; state.applyError = null; state.applyFailure = null;
+    state.config = null; state.draft = null; state.status = null; state.qq = null; invalidateRuntimeRead(); state.runtimeRevision = null; state.runtimeApplyTarget = null; state.applyError = null; state.applyFailure = null;
     state.configSave = { phase: "", message: "", kind: "" };
     state.autoReplyBaseEstimate = null; autoReplyBudgetControl = null;
     state.personaTemplates = {}; state.personaSelected = null; state.toolCatalog = []; state.pluginCatalog = []; pluginControls = null; $("persona-list").replaceChildren(); $("persona-text").value = ""; $("persona-new-name").value = "";
@@ -2115,7 +2152,7 @@
   function memoryIsCurrent(version, id) { return state.authenticated && state.memory.version === version && state.memory.selected?.id === id; }
   function clearMemorySelection() {
     state.memory.version++; state.memory.selected = null; state.memory.detail = null; state.memory.rows = []; state.memory.checked.clear();
-    state.memory.settingsDirty = false; state.memory.editorDirty = false; state.memory.editing = null; state.memory.preview = null; state.memory.conflict = false;
+    state.memory.settingsDirty = false; state.memory.editorDirty = false; state.memory.editing = null; state.memory.preview = null; state.memory.conflict = false; state.memory.conflictReason = "";
     settingInputs.clear(); $("conversation-settings-grid").replaceChildren(); $("memory-list").replaceChildren(); $("context-content").replaceChildren();
     $("selected-conversation").hidden = true; $("no-conversation").hidden = false; $("context-details").open = false;
     $("conversation-conflict").hidden = true; $("memory-editor-form").reset(); $("forget-preview").replaceChildren();
@@ -2151,15 +2188,24 @@
   }
   async function selectConversation(conversation) {
     clearMemorySelection(); state.memory.selected = clone(conversation); state.memory.pageMemories = 1;
+    const session = state.session;
     $("memory-keyword").value = ""; $("memory-subject").value = ""; $("memory-enabled").value = "";
     renderConversationList();
-    await reloadSelected(); await loadMemories();
+    await reloadSelected();
+    if (session === state.session && state.memory.selected?.id === conversation.id && state.memory.detail?.id === conversation.id && !state.memory.conflict) await loadMemories();
   }
   async function reloadSelected() {
-    const id = state.memory.selected?.id, version = state.memory.version; if (!id) return;
-    const detail = await api("/api/memory/conversations/" + encodeURIComponent(id));
-    if (!memoryIsCurrent(version, id)) return;
-    state.memory.detail = detail; state.memory.selected = detail; state.memory.conflict = false; state.memory.settingsDirty = false;
+    const id = state.memory.selected?.id; if (!id) return;
+    const version = ++state.memory.version, session = state.session;
+    // A poll begun before this reload may describe the configuration we just
+    // replaced. Retire it so it cannot invalidate the freshly read settings.
+    invalidateRuntimeRead();
+    let detail;
+    try { detail = await api("/api/memory/conversations/" + encodeURIComponent(id)); }
+    catch (error) { if (session !== state.session || !memoryIsCurrent(version, id)) return; throw error; }
+    finally { if (session === state.session) scheduleRuntime(); }
+    if (session !== state.session || !memoryIsCurrent(version, id)) return;
+    state.memory.detail = detail; state.memory.selected = detail; state.memory.conflict = false; state.memory.conflictReason = ""; state.memory.settingsDirty = false;
     $("no-conversation").hidden = true; $("selected-conversation").hidden = false; $("conversation-conflict").hidden = true;
     $("selected-scope-title").textContent = scopeTitle(detail); $("selected-scope-detail").textContent = scopeDescription(detail);
     $("memory-range-description").textContent = memoryRangeDescription(detail);
@@ -2290,7 +2336,7 @@
     return Array.from(bytes, (byte, index) => ([4, 6, 8, 10].includes(index) ? "-" : "") + byte.toString(16).padStart(2, "0")).join("");
   }
   function memoryConflict(error) {
-    if (error.status === 409) { state.memory.conflict = true; $("conversation-conflict").hidden = false; updateControls(); }
+    if (error.status === 409) { state.memory.conflict = true; state.memory.conflictReason = ""; updateControls(); }
   }
   function validateGroupPersonaResult(result, payload) {
     if (!result || result.status !== "completed" || result.request_id !== payload.request_id || result.bot_id !== payload.bot_id || result.persona !== payload.persona
@@ -2304,7 +2350,7 @@
     let message = `QQ ${result.bot_id} 的 ${result.affected_groups} 个群已使用「${result.persona}」，更新了 ${result.affected_conversations} 个已有会话。好友、全局默认、历史和记忆保持不变。`;
     const selected = state.memory.detail || state.memory.selected;
     if (selected?.scene === "group" && result.scopes.includes(selected.scope)) {
-      state.memory.version++; state.memory.conflict = true; state.memory.preview = null;
+      state.memory.version++; state.memory.conflict = true; state.memory.conflictReason = ""; state.memory.preview = null;
       $("conversation-conflict").hidden = false; if ($("forget-dialog").open) $("forget-dialog").close();
       if (state.memory.settingsDirty || state.memory.editorDirty) {
         message += " 当前会话的未保存编辑已保留，请重新载入后再继续。";
@@ -2381,6 +2427,15 @@
   async function mutateMemory(action, completed) {
     const detail = state.memory.detail;
     if (!detail || state.pendingOperation || state.memory.conflict) throw new Error("请先确认未完成操作或重新载入当前会话。");
+    if (action.op === "settings") {
+      const session = state.session, version = state.memory.version, id = detail.id;
+      const status = await readRuntimeStatus();
+      if (session !== state.session || !memoryIsCurrent(version, id) || state.memory.detail !== detail) return;
+      if (!status || !Object.hasOwn(status, "applied_revision") || !(status.applied_revision === null || typeof status.applied_revision === "string") || !Object.hasOwn(phases, status.phase)) throw new Error("未能确认当前运行配置，会话设置尚未保存。请刷新运行状态后重试。");
+      if (state.runtimeApplyTarget) throw new Error("应用请求已排队，尚未确认目标配置生效。会话设置尚未保存；请等待运行状态更新后重新载入会话。");
+      if (["starting", "stopping"].includes(status.phase)) throw new Error("运行配置正在切换，会话设置尚未保存。请等待完成后重新载入会话。");
+      if (state.pendingOperation || state.memory.conflict) throw new Error("运行配置或会话已变化，请重新载入后再保存。");
+    }
     await performMemory("/api/memory/mutate", { request_id: requestId(), conversation_id: detail.id, epoch: detail.epoch, memory_revision: detail.memory_revision, action }, completed);
   }
   function openMemoryEditor(record = null) {

@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 const SCAN_LIMIT: usize = 512;
 const CANDIDATE_LIMIT: usize = 128;
+const QUERY_MESSAGE_LIMIT: usize = 3;
+const QUERY_RECENT_SECONDS: i64 = 120;
 const REQUESTS_PER_HOUR: i64 = 120;
 const RETRY_DELAY: i64 = 300;
 const MIGRATION: &str = r#"
@@ -58,6 +60,42 @@ struct Request {
     bot_id: i64,
     plugin_epoch: i64,
     defaults: AiSettings,
+    once_query: Option<OnceQueryPermit>,
+}
+
+/// An ephemeral permit captured only when a paused direct turn is admitted.
+/// Its binding survives consumption of settings.once without authorizing a
+/// different sender, message, conversation, or epoch.
+#[derive(Clone, Debug)]
+pub(crate) struct OnceQueryPermit {
+    guard: ContextGuard,
+    source_key: String,
+    actor: i64,
+}
+
+impl OnceQueryPermit {
+    pub(super) fn capture(
+        conversation: &super::Conversation,
+        message: &crate::types::Incoming,
+        automatic: bool,
+    ) -> Option<Self> {
+        (conversation.settings.paused
+            && conversation.settings.once
+            && !automatic
+            && conversation.scope == message.key.scope)
+            .then(|| Self {
+                guard: conversation.guard.clone(),
+                source_key: message.key.key(),
+                actor: message.sender_id,
+            })
+    }
+
+    fn matches(&self, guard: &ContextGuard, source_key: &str, actor: i64) -> bool {
+        self.guard.conversation_id == guard.conversation_id
+            && self.guard.epoch == guard.epoch
+            && self.source_key == source_key
+            && self.actor == actor
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +140,18 @@ struct QuerySnapshot {
     request: Request,
     boundary: Boundary,
     source: QuerySource,
+    preceding: Vec<QuerySource>,
+}
+
+impl QuerySnapshot {
+    fn input(&self) -> String {
+        self.preceding
+            .iter()
+            .chain(std::iter::once(&self.source))
+            .map(|source| source.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn request(host: &Host, guard: &ContextGuard, subject: i64) -> Result<Request> {
@@ -118,7 +168,26 @@ fn request(host: &Host, guard: &ContextGuard, subject: i64) -> Result<Request> {
             .get("ai")
             .context("semantic AI plugin is disabled")?,
         defaults: host.config.plugins.ai.defaults.clone(),
+        once_query: None,
     })
+}
+
+fn query_request(
+    host: &Host,
+    guard: &ContextGuard,
+    subject: i64,
+    source_key: &str,
+    once_query: Option<&OnceQueryPermit>,
+) -> Result<Request> {
+    let mut request = request(host, guard, subject)?;
+    if let Some(permit) = once_query {
+        ensure!(
+            permit.matches(guard, source_key, subject),
+            "one-shot memory query permit does not match the admitted turn"
+        );
+        request.once_query = Some(permit.clone());
+    }
+    Ok(request)
 }
 
 fn boundary(db: &Connection, request: &Request) -> Result<Boundary> {
@@ -166,7 +235,7 @@ fn boundary(db: &Connection, request: &Request) -> Result<Boundary> {
     );
     let effective = super::resolve_settings(&request.defaults, &settings)?;
     ensure!(
-        effective.memory_read && !effective.paused,
+        effective.memory_read && (!effective.paused || request.once_query.is_some()),
         "semantic memory reads are disabled"
     );
     let access_revision = crate::access::require_enabled(db, &scope)?;
@@ -205,12 +274,90 @@ fn query_source(
     context: &Boundary,
     key: &str,
 ) -> Result<QuerySource> {
-    let source=db.query_row("SELECT key,content,id,received_at,access_revision FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND scope=?4 AND sender_id=?5 AND role='user' AND revoked=0 AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=?1)",params![key,request.guard.conversation_id,request.guard.epoch,context.scope,request.subject],|r|Ok(QuerySource {key:r.get(0)?,text:r.get(1)?,position:r.get(2)?,received_at:r.get(3)?,access_revision:r.get(4)?})).optional()?.context("semantic query source is unavailable")?;
+    let source=db.query_row("SELECT key,content,id,received_at,access_revision FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND scope=?4 AND sender_id=?5 AND role='user' AND revoked=0 AND COALESCE(origin_plugin,'') NOT IN('control','memory_only') AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=?1)",params![key,request.guard.conversation_id,request.guard.epoch,context.scope,request.subject],|r|Ok(QuerySource {key:r.get(0)?,text:r.get(1)?,position:r.get(2)?,received_at:r.get(3)?,access_revision:r.get(4)?})).optional()?.context("semantic query source is unavailable")?;
     ensure!(
         source.access_revision == context.access_revision,
         "semantic query access changed"
     );
     Ok(source)
+}
+
+/// Preserve a split question when its owner follows up before receiving an
+/// answer. Never use another speaker, conversation, or future message as input.
+fn preceding_query_sources(
+    db: &Connection,
+    request: &Request,
+    context: &Boundary,
+    current: &QuerySource,
+) -> Result<Vec<QuerySource>> {
+    let since = current.received_at.saturating_sub(QUERY_RECENT_SECONDS);
+    // Use the answered request's position, not its reply's row ID: a response
+    // to an older question may arrive after a newer, still unanswered question.
+    let answers = db.prepare(
+        "SELECT a.key,a.inbound_position FROM messages a
+         JOIN messages question ON question.id=a.inbound_position
+         JOIN outbox o ON o.scope=a.scope AND a.key=o.scope||':'||o.message_seq
+           AND o.conversation_id=a.conversation_id AND o.context_epoch=a.epoch
+         LEFT JOIN ai_recent_turns turn ON turn.reply_key=a.key
+         WHERE a.conversation_id=?1 AND a.epoch=?2 AND a.scope=?3
+           AND a.role='assistant' AND a.sender_id=?4 AND a.revoked=0
+           AND a.id<?5 AND a.inbound_position<?5 AND a.received_at>=?6
+           AND question.sender_id=?7 AND question.role='user' AND question.revoked=0
+           AND question.conversation_id=a.conversation_id AND question.epoch=a.epoch
+           AND question.scope=a.scope
+           AND o.origin_plugin='ai' AND o.state='confirmed'
+           AND (turn.reply_key IS NULL OR turn.completed_position<?5)
+           AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=a.key OR source_key=question.key)
+         ORDER BY a.inbound_position DESC LIMIT 8")?
+        .query_map(params![request.guard.conversation_id,request.guard.epoch,context.scope,request.bot_id,current.position,since,request.subject],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut answered_until = 0;
+    for (key, position) in answers {
+        if super::context::reply_is_valid(db, &key)? {
+            answered_until = position;
+            break;
+        }
+    }
+    let keys = db
+        .prepare(
+            "SELECT key FROM messages WHERE conversation_id=?1 AND epoch=?2 AND scope=?3
+         AND sender_id=?4 AND role='user' AND revoked=0 AND id<?5 AND id>?6
+         AND received_at>=?7 AND received_at<=?8 AND trim(content)!=''
+         AND access_revision=?10
+         AND COALESCE(origin_plugin,'') NOT IN('control','memory_only')
+         AND NOT EXISTS(SELECT 1 FROM ai_revoked_sources WHERE source_key=messages.key)
+         ORDER BY id DESC LIMIT ?9",
+        )?
+        .query_map(
+            params![
+                request.guard.conversation_id,
+                request.guard.epoch,
+                context.scope,
+                request.subject,
+                current.position,
+                answered_until,
+                since,
+                current.received_at,
+                QUERY_MESSAGE_LIMIT - 1,
+                context.access_revision
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut used = current.text.len();
+    let mut sources = Vec::new();
+    for key in keys {
+        let source = query_source(db, request, context, &key)?;
+        let cost = source.text.len().saturating_add(1);
+        if used.saturating_add(cost) > crate::embedding::MAX_TEXT_BYTES {
+            continue;
+        }
+        used += cost;
+        sources.push(source);
+    }
+    sources.reverse();
+    Ok(sources)
 }
 
 fn validate_index(db: &Connection, snapshot: &IndexSnapshot) -> Result<()> {
@@ -243,6 +390,12 @@ fn validate_query(db: &Connection, snapshot: &QuerySnapshot) -> Result<()> {
         )? == snapshot.source,
         "semantic query source changed"
     );
+    for source in &snapshot.preceding {
+        ensure!(
+            query_source(db, &snapshot.request, &snapshot.boundary, &source.key)? == *source,
+            "semantic preceding query source changed"
+        );
+    }
     Ok(())
 }
 
@@ -465,7 +618,7 @@ pub async fn index_next(host: &Host, cancel: &CancellationToken) -> Result<bool>
         let sql=format!("SELECT DISTINCT c.id,c.epoch,m.subject_id FROM ai_memories m JOIN ai_conversations source ON source.id=m.conversation_id JOIN ai_conversations c ON c.memory_scope=source.memory_scope LEFT JOIN ai_scope_modes sm ON sm.scope=c.scope LEFT JOIN scope_access sa ON sa.scope=c.scope LEFT JOIN scope_plugin_access pa ON pa.scope=c.scope AND pa.plugin='ai' LEFT JOIN ai_memory_vectors v ON v.memory_id=m.id AND v.namespace=?3 AND v.memory_version=m.version AND v.dimensions=?4 AND length(v.vector)=?4*4 LEFT JOIN ai_semantic_attempts a ON a.memory_id=m.id AND a.namespace=?3 WHERE {ELIGIBLE} AND c.scope LIKE ?2 AND m.subject_id>0 AND m.subject_id!=?5 AND (c.owner_id IS NULL OR c.owner_id=m.subject_id) AND COALESCE(sa.enabled,1)=1 AND COALESCE(pa.enabled,1)=1 AND COALESCE(json_extract(c.settings,'$.memory_read'),?6)=1 AND COALESCE(json_extract(c.settings,'$.paused'),?7)=0 AND c.id=c.scope||':v'||CASE WHEN c.scope LIKE '%:friend:%' THEN 0 ELSE COALESCE(sm.revision,0) END||CASE WHEN c.owner_id IS NULL THEN ':group' ELSE ':user:'||c.owner_id END AND c.mode=CASE WHEN c.scope LIKE '%:friend:%' THEN 'user' ELSE COALESCE(sm.mode,?8) END AND v.memory_id IS NULL AND (a.retry_after IS NULL OR a.retry_after<=?1) ORDER BY m.id LIMIT 48");
         let candidates=db.prepare(&sql)?.query_map(params![now(),format!("{bot_id}:%"),namespace,dimensions,bot_id,defaults.memory_read,defaults.paused,defaults.mode],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (id,epoch,subject) in candidates {
-            let request=Request {guard:ContextGuard {conversation_id:id,epoch},subject,bot_id,plugin_epoch,defaults:defaults.clone()};
+            let request=Request {guard:ContextGuard {conversation_id:id,epoch},subject,bot_id,plugin_epoch,defaults:defaults.clone(),once_query:None};
             if boundary(db,&request).is_ok() { return Ok(Some((request.guard,subject))); }
         }
         Ok(None)
@@ -574,22 +727,31 @@ async fn lexical_fallback(
     limit: usize,
     budget: usize,
     cancel: &CancellationToken,
+    once_query: Option<&OnceQueryPermit>,
 ) -> Result<Vec<Memory>> {
     ensure!(!cancel.is_cancelled(), "semantic recall cancelled");
-    let request = request(host, guard, subject)?;
+    let request = query_request(host, guard, subject, source_key, once_query)?;
     let key = source_key.to_owned();
     let query = query.to_owned();
     host.store
         .call(move |db| {
             let boundary = boundary(db, &request)?;
-            query_source(db, &request, &boundary, &key)?;
-            lexical(db, &request, &query, limit, budget)
+            let source = query_source(db, &request, &boundary, &key)?;
+            let preceding = preceding_query_sources(db, &request, &boundary, &source)?;
+            let snapshot = QuerySnapshot {
+                request,
+                boundary,
+                source,
+                preceding,
+            };
+            let query = format!("{}\n{query}", snapshot.input());
+            lexical(db, &snapshot.request, &query, limit, budget)
         })
         .await
 }
 
 /// Preserve lexical behavior whenever semantic service/cache is unavailable.
-/// Only the authoritative current human source text is sent to the embedder.
+/// Only authoritative, unanswered text from the current human is embedded.
 #[allow(clippy::too_many_arguments)]
 pub async fn retrieve(
     host: &Host,
@@ -601,35 +763,55 @@ pub async fn retrieve(
     budget: usize,
     cancel: &CancellationToken,
 ) -> Result<Vec<Memory>> {
-    let Some(embedding) = host.embedding.as_ref() else {
-        return host
-            .memory
-            .retrieve(guard, subject, query, limit, budget)
-            .await;
-    };
+    retrieve_for_turn(
+        host, guard, subject, source_key, query, limit, budget, cancel, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retrieve_for_turn(
+    host: &Host,
+    guard: &ContextGuard,
+    subject: i64,
+    source_key: &str,
+    query: &str,
+    limit: usize,
+    budget: usize,
+    cancel: &CancellationToken,
+    once_query: Option<&OnceQueryPermit>,
+) -> Result<Vec<Memory>> {
     if limit == 0 || budget == 0 {
         return Ok(Vec::new());
     }
+    let Some(embedding) = host.embedding.as_ref() else {
+        return lexical_fallback(
+            host, guard, subject, source_key, query, limit, budget, cancel, once_query,
+        )
+        .await;
+    };
     let namespace = namespace(embedding);
     let dimensions = embedding.dimensions();
-    let request = request(host, guard, subject)?;
+    let request = query_request(host, guard, subject, source_key, once_query)?;
     let key = source_key.to_owned();
     let ns = namespace.clone();
     let snapshot=host.store.call(move |db| {
         let boundary=boundary(db,&request)?;
         let source=query_source(db,&request,&boundary,&key)?;
+        let preceding=preceding_query_sources(db,&request,&boundary,&source)?;
         let exists:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ai_memory_vectors v JOIN ai_memories m ON m.id=v.memory_id WHERE m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND v.namespace=?4 AND v.dimensions=?5 AND length(v.vector)=?5*4 AND v.memory_version=m.version AND {ELIGIBLE})"),params![now(),boundary.memory_scope,subject,ns,dimensions],|r|r.get(0))?;
-        Ok(if exists {Some(QuerySnapshot {request,boundary,source})} else {None})
+        Ok(if exists {Some(QuerySnapshot {request,boundary,source,preceding})} else {None})
     }).await?;
     let Some(snapshot) = snapshot else {
         return lexical_fallback(
-            host, guard, subject, source_key, query, limit, budget, cancel,
+            host, guard, subject, source_key, query, limit, budget, cancel, once_query,
         )
         .await;
     };
     let outbound = snapshot.clone();
+    let input = snapshot.input();
     let response = embedding
-        .embed_text(&snapshot.source.text, cancel, async {
+        .embed_text(&input, cancel, async {
             ensure!(
                 !cancel.is_cancelled()
                     && host.milky.verified_bot_id() == Some(outbound.request.bot_id),
@@ -658,7 +840,7 @@ pub async fn retrieve(
         && !cancel.is_cancelled()
         && host.milky.verified_bot_id() == Some(snapshot.request.bot_id)
     {
-        let query = query.to_owned();
+        let query = format!("{input}\n{query}");
         let result = host
             .store
             .call(move |db| {
@@ -690,7 +872,7 @@ pub async fn retrieve(
         "semantic recall unavailable; using lexical recall"
     );
     lexical_fallback(
-        host, guard, subject, source_key, query, limit, budget, cancel,
+        host, guard, subject, source_key, query, limit, budget, cancel, once_query,
     )
     .await
 }
@@ -716,8 +898,11 @@ mod tests {
             CREATE VIRTUAL TABLE ai_memory_search USING fts5(memory_id UNINDEXED,terms);
             CREATE TABLE ai_memory_provenance(memory_id INTEGER,source_key TEXT,quote TEXT);
             CREATE TABLE ai_revoked_sources(source_key TEXT PRIMARY KEY,revoked_at INTEGER);
-            CREATE TABLE messages(id INTEGER PRIMARY KEY,key TEXT,scope TEXT,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,received_at INTEGER,access_revision INTEGER,revoked INTEGER);
-            INSERT INTO messages VALUES(1,'1:group:20:1','1:group:20','1:group:20:v0:group',1,7,'user','我想喝什么',1,0,0);").unwrap();
+            CREATE TABLE messages(id INTEGER PRIMARY KEY,key TEXT,scope TEXT,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,received_at INTEGER,access_revision INTEGER DEFAULT 0,revoked INTEGER DEFAULT 0,origin_plugin TEXT,inbound_position INTEGER);
+            CREATE TABLE outbox(scope TEXT,message_seq INTEGER,conversation_id TEXT,context_epoch INTEGER,origin_plugin TEXT,state TEXT);
+            CREATE TABLE ai_recent_turns(reply_key TEXT,completed_position INTEGER);
+            CREATE TABLE ai_context_invalidated(source_key TEXT PRIMARY KEY,invalidated_at INTEGER);
+            INSERT INTO messages VALUES(1,'1:group:20:1','1:group:20','1:group:20:v0:group',1,7,'user','我想喝什么',1,0,0,NULL,1);").unwrap();
         db.execute_batch(MIGRATION).unwrap();
         db.execute_batch(memory::scope::MIGRATION).unwrap();
         db
@@ -733,6 +918,7 @@ mod tests {
             bot_id: 1,
             plugin_epoch: 1,
             defaults: AiSettings::default(),
+            once_query: None,
         }
     }
 
@@ -768,13 +954,131 @@ mod tests {
     }
 
     fn query_snapshot(db: &Connection) -> QuerySnapshot {
+        snapshot_for_key(db, "1:group:20:1")
+    }
+
+    fn snapshot_for_key(db: &Connection, key: &str) -> QuerySnapshot {
         let request = request_for(7);
         let boundary = boundary(db, &request).unwrap();
-        let source = query_source(db, &request, &boundary, "1:group:20:1").unwrap();
+        let source = query_source(db, &request, &boundary, key).unwrap();
+        let preceding = preceding_query_sources(db, &request, &boundary, &source).unwrap();
         QuerySnapshot {
             request,
             boundary,
             source,
+            preceding,
+        }
+    }
+
+    fn query_message(db: &Connection, id: i64, at: i64, text: &str) {
+        db.execute("INSERT INTO messages(id,key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position) VALUES(?1,?2,'1:group:20',?3,1,7,'user',?4,?5,?1)",
+            params![id,format!("1:group:20:{id}"),CONVERSATION,text,at]).unwrap();
+    }
+
+    #[test]
+    fn follow_up_query_uses_only_recent_unanswered_sources_from_its_owner() {
+        let db = db();
+        db.execute(
+            "UPDATE messages SET content='我在哪个城市',received_at=100",
+            [],
+        )
+        .unwrap();
+        for id in 2..=13 {
+            query_message(&db, id, 190, "不可合并的内容");
+        }
+        db.execute_batch(
+            "UPDATE messages SET sender_id=8 WHERE id=2;
+            UPDATE messages SET scope='1:friend:7' WHERE id=3;
+            UPDATE messages SET conversation_id='other' WHERE id=4;
+            UPDATE messages SET epoch=0 WHERE id=5;
+            UPDATE messages SET origin_plugin='control' WHERE id=6;
+            UPDATE messages SET origin_plugin='memory_only' WHERE id=7;
+            UPDATE messages SET revoked=1 WHERE id=8;
+            INSERT INTO ai_revoked_sources VALUES('1:group:20:9',1);
+            UPDATE messages SET received_at=79 WHERE id=10;
+            UPDATE messages SET scope='2:group:20' WHERE id=11;
+            UPDATE messages SET received_at=201 WHERE id=12;
+            UPDATE messages SET access_revision=1 WHERE id=13;",
+        )
+        .unwrap();
+        query_message(&db, 20, 200, "回答我啊");
+        query_message(&db, 21, 200, "水位之后的消息");
+        let snapshot = snapshot_for_key(&db, "1:group:20:20");
+        assert_eq!(snapshot.input(), "我在哪个城市\n回答我啊");
+        assert_eq!(snapshot.preceding.len(), 1);
+        validate_query(&db, &snapshot).unwrap();
+        for id in 14..=19 {
+            query_message(&db, id, 199, &format!("片段{id}"));
+        }
+        let bounded = snapshot_for_key(&db, "1:group:20:20");
+        assert_eq!(bounded.input(), "片段18\n片段19\n回答我啊");
+    }
+
+    #[test]
+    fn follow_up_query_stops_at_confirmed_own_answers_without_losing_later_questions() {
+        for (state, completion, expected) in [
+            ("confirmed", 3, "后续问题\n回答我啊"),
+            ("submitted", 3, "我想喝什么\n后续问题\n回答我啊"),
+            ("confirmed", 4, "我想喝什么\n后续问题\n回答我啊"),
+        ] {
+            let db = db();
+            query_message(&db, 2, 2, "后续问题");
+            query_message(&db, 3, 3, "旧问题的回答");
+            db.execute(
+                "UPDATE messages SET role='assistant',sender_id=1,inbound_position=1 WHERE id=3",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO outbox VALUES('1:group:20',3,?1,1,'ai',?2)",
+                params![CONVERSATION, state],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO ai_recent_turns VALUES('1:group:20:3',?1)",
+                [completion],
+            )
+            .unwrap();
+            query_message(&db, 4, 4, "回答我啊");
+            assert_eq!(
+                snapshot_for_key(&db, "1:group:20:4").input(),
+                expected,
+                "{state} / {completion}"
+            );
+            // A confirmed reply to someone else cannot close this user's question.
+            db.execute("UPDATE messages SET sender_id=8 WHERE id=2", [])
+                .unwrap();
+            db.execute("UPDATE messages SET inbound_position=2 WHERE id=3", [])
+                .unwrap();
+            assert_eq!(
+                snapshot_for_key(&db, "1:group:20:4").input(),
+                "我想喝什么\n回答我啊"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_up_query_revalidates_every_included_source_before_embedding() {
+        for mutation in [
+            "UPDATE messages SET content='改写' WHERE id=1",
+            "UPDATE messages SET role='system' WHERE id=1",
+            "UPDATE messages SET sender_id=8 WHERE id=1",
+            "UPDATE messages SET scope='1:friend:7' WHERE id=1",
+            "UPDATE messages SET conversation_id='other' WHERE id=1",
+            "UPDATE messages SET epoch=0 WHERE id=1",
+            "UPDATE messages SET access_revision=1 WHERE id=1",
+            "UPDATE messages SET origin_plugin='memory_only' WHERE id=1",
+            "UPDATE messages SET revoked=1 WHERE id=1",
+            "INSERT INTO ai_revoked_sources VALUES('1:group:20:1',1)",
+            "DELETE FROM messages WHERE id=1",
+        ] {
+            let db = db();
+            query_message(&db, 2, 2, "回答我啊");
+            let snapshot = snapshot_for_key(&db, "1:group:20:2");
+            assert_eq!(snapshot.preceding.len(), 1);
+            validate_query(&db, &snapshot).unwrap();
+            db.execute(mutation, []).unwrap();
+            assert!(validate_query(&db, &snapshot).is_err(), "{mutation}");
         }
     }
 
@@ -847,6 +1151,7 @@ mod tests {
                 request,
                 boundary,
                 source,
+                preceding: vec![],
             };
             let found = semantic_candidates(&db, &snapshot, "model-a", &vector(0), 20).unwrap();
             if bot == 1 {
@@ -1267,7 +1572,7 @@ mod tests {
             dimensions: 64,
             ..Default::default()
         };
-        let host = Host::create(config).await.unwrap();
+        let mut host = Host::create(config).await.unwrap();
         host.milky.login().await.unwrap();
         let (own,other)=host.store.call(|db| {
             db.execute("INSERT INTO ai_scope_modes VALUES('1:group:20','group',0)",[])?;
@@ -1341,6 +1646,296 @@ mod tests {
                 ("memory_embedding_index".into(), 2, 6, 0),
                 ("memory_embedding_query".into(), 1, 3, 0)
             ]
+        );
+        // A short follow-up must retain the unresolved question as recall input.
+        host.store.call(|db| {
+            db.execute("UPDATE messages SET content='我在哪个城市' WHERE key='1:group:20:1'",[])?;
+            db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,inbound_position,learnable) VALUES('1:group:20:2','1:group:20',?1,1,7,'user','回答我啊',2,2,1)",[CONVERSATION])?;
+            Ok(())
+        }).await.unwrap();
+        fail.store(false, Ordering::SeqCst);
+        let recalled = retrieve(
+            &host,
+            &guard,
+            7,
+            "1:group:20:2",
+            "回答我啊",
+            5,
+            1000,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recalled.iter().map(|m| m.id).collect::<Vec<_>>(), vec![own]);
+        assert_eq!(
+            requests.recv().await.unwrap()["input"]["text"],
+            "我在哪个城市\n回答我啊"
+        );
+        // The same pending question must work when embeddings are disabled.
+        let embedding = Arc::get_mut(&mut host)
+            .expect("sole test host")
+            .embedding
+            .take()
+            .unwrap();
+        let city = host
+            .store
+            .call(|db| {
+                add(db, 8, "其他用户所在城市为他乡");
+                Ok(add(db, 7, "人物背景：所在城市为测试城"))
+            })
+            .await
+            .unwrap();
+        let recalled = retrieve(
+            &host,
+            &guard,
+            7,
+            "1:group:20:2",
+            "回答我啊",
+            5,
+            1000,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recalled.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![city]
+        );
+        assert!(requests.try_recv().is_err());
+        assert!(
+            retrieve(&host, &guard, 7, "unused", "", 0, 1000, &cancel)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            retrieve(&host, &guard, 7, "unused", "", 5, 0, &cancel)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Admission captures /ai once before the persisted permit is consumed.
+        // Context preparation must retain that exact turn's lexical recall, but
+        // a paused query or background index without the permit still fails.
+        let scope = crate::types::Scope {
+            bot_id: 1,
+            scene: crate::types::Scene::Group,
+            peer_id: 20,
+        };
+        let mut admitted = super::super::Conversation {
+            guard: guard.clone(),
+            scope: scope.clone(),
+            owner_id: None,
+            settings: AiSettings {
+                paused: true,
+                once: true,
+                ..AiSettings::default()
+            },
+        };
+        let incoming: crate::types::Incoming = serde_json::from_value(json!({
+            "key":{"scope":{"bot_id":1,"scene":"group","peer_id":20},"message_seq":2},
+            "sender_id":7,"text":"回答我啊","mentions":[],"quote_seq":null,"received_at":2
+        }))
+        .unwrap();
+        let once = OnceQueryPermit::capture(&admitted, &incoming, false).unwrap();
+        assert!(OnceQueryPermit::capture(&admitted, &incoming, true).is_none());
+        admitted.settings.once = false;
+        assert!(OnceQueryPermit::capture(&admitted, &incoming, false).is_none());
+        host.store.call(|db| {
+            db.execute("UPDATE ai_conversations SET settings='{\"paused\":true,\"once\":false}' WHERE id=?1",[CONVERSATION])?;
+            assert!(boundary(db, &request_for(7)).is_err(), "background/index request has no once permit");
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            retrieve(
+                &host,
+                &guard,
+                7,
+                "1:group:20:2",
+                "回答我啊",
+                5,
+                1000,
+                &cancel
+            )
+            .await
+            .is_err()
+        );
+        let context_request = |permit| super::super::context::ContextRequest {
+            guard: &guard,
+            scope: &scope,
+            source_key: "1:group:20:2",
+            actor: 7,
+            position: 2,
+            received_at: 2,
+            current: "回答我啊",
+            settings: &admitted.settings,
+            once_query: permit,
+            allow_continuity: false,
+        };
+        assert!(
+            super::super::context::prepare(&host, context_request(None), &cancel)
+                .await
+                .is_err()
+        );
+        let prepared = super::super::context::prepare(&host, context_request(Some(&once)), &cancel)
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .memory_texts()
+                .iter()
+                .any(|text| text.contains(&format!("记忆 #{city} /")))
+        );
+        // The permit authorizes this exact query, independent of whether the
+        // embedding service is enabled or succeeds. It never grants indexing.
+        Arc::get_mut(&mut host).expect("sole test host").embedding = Some(embedding);
+        assert!(
+            super::super::context::prepare(&host, context_request(None), &cancel)
+                .await
+                .is_err()
+        );
+        assert!(index_subject(&host, &guard, 7, &cancel).await.is_err());
+        assert!(!index_next(&host, &cancel).await.unwrap());
+        assert!(requests.try_recv().is_err());
+        let prepared = super::super::context::prepare(&host, context_request(Some(&once)), &cancel)
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .memory_texts()
+                .iter()
+                .any(|text| text.contains(&format!("记忆 #{city} /")))
+        );
+        assert_eq!(
+            requests.recv().await.unwrap()["input"]["text"],
+            "我在哪个城市\n回答我啊"
+        );
+        fail.store(true, Ordering::SeqCst);
+        let fallback = super::super::context::prepare(&host, context_request(Some(&once)), &cancel)
+            .await
+            .unwrap();
+        assert!(
+            fallback
+                .memory_texts()
+                .iter()
+                .any(|text| text.contains(&format!("记忆 #{city} /")))
+        );
+        assert_eq!(
+            requests.recv().await.unwrap()["input"]["text"],
+            "我在哪个城市\n回答我啊"
+        );
+        fail.store(false, Ordering::SeqCst);
+        for (subject, key) in [(8, "1:group:20:2"), (7, "1:group:20:1")] {
+            assert!(
+                retrieve_for_turn(
+                    &host,
+                    &guard,
+                    subject,
+                    key,
+                    "城市",
+                    5,
+                    1000,
+                    &cancel,
+                    Some(&once)
+                )
+                .await
+                .is_err()
+            );
+        }
+        let stale = ContextGuard {
+            epoch: guard.epoch + 1,
+            ..guard.clone()
+        };
+        assert!(
+            retrieve_for_turn(
+                &host,
+                &stale,
+                7,
+                "1:group:20:2",
+                "城市",
+                5,
+                1000,
+                &cancel,
+                Some(&once)
+            )
+            .await
+            .is_err()
+        );
+        host.store.call(|db| {
+            db.execute("UPDATE ai_conversations SET settings='{\"paused\":true,\"once\":false,\"memory_read\":false}' WHERE id=?1",[CONVERSATION])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            retrieve_for_turn(
+                &host,
+                &guard,
+                7,
+                "1:group:20:2",
+                "城市",
+                5,
+                1000,
+                &cancel,
+                Some(&once)
+            )
+            .await
+            .is_err()
+        );
+        host.store
+            .call(|db| {
+                db.execute(
+                    "UPDATE ai_conversations SET settings='{}' WHERE id=?1",
+                    [CONVERSATION],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        Arc::get_mut(&mut host).expect("sole test host").embedding = None;
+        host.store
+            .call(|db| {
+                db.execute(
+                    "INSERT INTO ai_revoked_sources VALUES('1:group:20:1',1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            retrieve(
+                &host,
+                &guard,
+                7,
+                "1:group:20:2",
+                "回答我啊",
+                5,
+                1000,
+                &cancel
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        host.store
+            .call(|db| {
+                db.execute("UPDATE messages SET revoked=1 WHERE key='1:group:20:2'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            retrieve(
+                &host,
+                &guard,
+                7,
+                "1:group:20:2",
+                "回答我啊",
+                5,
+                1000,
+                &cancel
+            )
+            .await
+            .is_err()
         );
         host.cancel.cancel();
         host.store.stop().await.unwrap();
