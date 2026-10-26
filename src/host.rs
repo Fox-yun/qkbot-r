@@ -75,9 +75,16 @@ impl Host {
             store.clone(),
             config.plugins.ai.max_memories_per_conversation,
         )
-        .with_global_memory_shared(config.plugins.ai.global_memory_shared);
+        .with_global_memory_shared(config.plugins.ai.global_memory_shared)
+        .with_summary_budget(config.plugins.ai.compaction.summary_budget);
         memory.init().await?;
         crate::plugins::ai::context::configure_policy(&store, &config.plugins.ai.defaults).await?;
+        crate::plugins::ai::context::policy::configure(
+            &store,
+            config.plugins.ai.context.cross_scene,
+        )
+        .await?;
+        crate::plugins::ai::personal::configure(&store, &config.plugins.ai.personal).await?;
         crate::plugins::ai::semantic::init(&store).await?;
         let embedding = if config.embedding.enabled && config.plugins.ai.enabled {
             Some(crate::embedding::Embedding::new(config.embedding.clone())?)

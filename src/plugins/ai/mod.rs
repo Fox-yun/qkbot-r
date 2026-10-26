@@ -4,6 +4,7 @@ pub mod context;
 pub mod learning;
 pub mod memory;
 pub mod memory_rebuild;
+pub mod personal;
 pub(crate) mod reply;
 pub mod semantic;
 mod sticker_reply;

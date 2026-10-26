@@ -1,4 +1,5 @@
-//! Chat Completions compatible transport. Tool execution is exclusively the host's job.
+//! Chat Completions and Responses transports. Tool execution belongs to the host.
+mod responses;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -16,10 +17,20 @@ pub(crate) const MAX_IMAGE_URL_BYTES: usize = 1_400_000;
 type SourceValidation<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
+    pub protocol: ApiProtocol,
     pub chat_completions_url: String,
+    pub responses_url: String,
     pub api_key: String,
     pub model: String,
     pub tool_calling: bool,
@@ -29,11 +40,22 @@ pub struct LlmConfig {
     pub max_response_bytes: usize,
 }
 
+impl LlmConfig {
+    pub fn endpoint_url(&self) -> &str {
+        match self.protocol {
+            ApiProtocol::ChatCompletions => &self.chat_completions_url,
+            ApiProtocol::Responses => &self.responses_url,
+        }
+    }
+}
+
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LlmConfig")
+            .field("protocol", &self.protocol)
             .field("chat_completions_url", &self.chat_completions_url)
+            .field("responses_url", &self.responses_url)
             .field("api_key", &"[redacted]")
             .field("model", &self.model)
             .field("tool_calling", &self.tool_calling)
@@ -48,7 +70,9 @@ impl std::fmt::Debug for LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            protocol: ApiProtocol::default(),
             chat_completions_url: String::new(),
+            responses_url: String::new(),
             api_key: String::new(),
             model: String::new(),
             tool_calling: true,
@@ -302,7 +326,7 @@ pub struct Llm {
 impl Llm {
     pub fn new(config: LlmConfig, http: reqwest::Client) -> Result<Self> {
         let endpoint =
-            reqwest::Url::parse(&config.chat_completions_url).context("invalid model endpoint")?;
+            reqwest::Url::parse(config.endpoint_url()).context("invalid model endpoint")?;
         ensure!(
             matches!(endpoint.scheme(), "http" | "https"),
             "model endpoint must use http or https"
@@ -662,6 +686,14 @@ impl Llm {
             // answer. They do not authorize another call after tools are closed.
             body["tool_choice"] = json!("none");
         }
+        if self.config.protocol == ApiProtocol::Responses {
+            body = responses::request(body)?;
+        } else {
+            // Private replay items must never be sent to the Chat Completions endpoint.
+            for message in body["messages"].as_array_mut().unwrap() {
+                message.as_object_mut().unwrap().remove(responses::REPLAY);
+            }
+        }
         let operation = async {
             if let Some((milky, generation)) = account {
                 milky.check_generation(generation)?;
@@ -733,8 +765,14 @@ impl Llm {
             }
             let value: Value =
                 serde_json::from_slice(&bytes).context("model response is not valid JSON")?;
-            let metadata = TruncationMetadata::from_response(&value);
-            let result = parse_response(value, &allowed_tools);
+            let metadata = match self.config.protocol {
+                ApiProtocol::ChatCompletions => TruncationMetadata::from_response(&value),
+                ApiProtocol::Responses => responses::metadata(&value),
+            };
+            let result = match self.config.protocol {
+                ApiProtocol::ChatCompletions => parse_response(value, &allowed_tools),
+                ApiProtocol::Responses => responses::parse(value, &allowed_tools),
+            };
             if result
                 .as_ref()
                 .is_err_and(|error| error.is::<TruncatedToolResponse>())

@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod learning;
 pub mod memory;
 pub mod models;
+pub mod personal;
 pub mod plugins;
 pub mod qq;
 pub mod qq_service;
@@ -105,6 +106,8 @@ pub fn router(state: Arc<AdminState>) -> Router {
         )
         .route("/api/budget", get(budget))
         .route("/api/context/overview", get(context::overview))
+        .route("/api/personal", get(personal::snapshot))
+        .route("/api/personal/mutate", post(personal::mutate))
         .route("/api/learning", get(learning::snapshot))
         .route("/api/learning/mutate", post(learning::mutate))
         .route("/api/learning/operations/{id}", get(learning::operation))

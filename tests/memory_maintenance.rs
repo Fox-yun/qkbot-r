@@ -21,7 +21,13 @@ struct Model {
     repair_barrier: Arc<Mutex<Option<Arc<RepairBarrier>>>>,
 }
 async fn model(State(state): State<Model>, Json(body): Json<Value>) -> Json<Value> {
-    let system = body["messages"]
+    let responses = body.get("input").is_some();
+    let messages = if responses {
+        &body["input"]
+    } else {
+        &body["messages"]
+    };
+    let system = messages
         .as_array()
         .unwrap()
         .iter()
@@ -30,7 +36,7 @@ async fn model(State(state): State<Model>, Json(body): Json<Value>) -> Json<Valu
         .collect::<Vec<_>>()
         .join("\n");
     state.systems.lock().unwrap().push(system);
-    let content = body["messages"].as_array().unwrap().last().unwrap()["content"]
+    let content = messages.as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
     let input: Value = serde_json::from_str(content).unwrap();
@@ -43,6 +49,13 @@ async fn model(State(state): State<Model>, Json(body): Json<Value>) -> Json<Valu
     }
     let answer = (state.respond)(&input);
     state.inputs.lock().unwrap().push(input);
+    if responses {
+        assert_eq!(body["store"], false);
+        assert!(body.get("tools").is_none());
+        return Json(json!({"model":"mock","status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":answer,"annotations":[]}]}
+        ],"usage":{"input_tokens":20,"output_tokens":10}}));
+    }
     Json(
         json!({"model":"mock","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":answer}}],"usage":{"prompt_tokens":20,"completion_tokens":10}}),
     )
@@ -71,6 +84,7 @@ async fn setup(
     config.app.database = ":memory:".into();
     config.milky.url = url.clone();
     config.llm.chat_completions_url = format!("{url}/model");
+    config.llm.responses_url = format!("{url}/model");
     config.llm.model = "mock".into();
     configure(&mut config);
     let host = Host::create(config).await.unwrap();
@@ -96,6 +110,184 @@ fn seed(
 }
 fn fenced(value: Value) -> String {
     format!("```json\n{value}\n```")
+}
+
+fn topic(batch: &Value, summary: String) -> Value {
+    json!({"topics":[{"title":"项目安排","participants":[7],"summary":summary,
+        "decisions":["周五确认方案"],"open_questions":["第二个方案还需确认"],"key_details":["预算8192"],
+        "sources":[batch["sources"][0]["key"]]}]})
+}
+
+#[tokio::test]
+async fn responses_background_commits_structured_summary_and_personal_fact() {
+    let (host, chat, model, server) = setup(
+        |c| {
+            c.llm.protocol = qkbot::llm::ApiProtocol::Responses;
+            c.llm.chat_completions_url = "http://127.0.0.1:1/inactive".into();
+            c.plugins.ai.defaults.recent_messages = 2;
+            c.plugins.ai.compaction.summary_budget = 8192;
+            c.plugins.ai.memory_input_budget = 32768;
+        },
+        |batch| {
+            assert_eq!(batch["structured_summary"], true);
+            json!({"summary":topic(batch,"讨论下周安排".into()),"changes":[
+                {"op":"upsert","id":null,"subject_id":7,"kind":"preference","text":"喜欢白茶",
+                "evidence":[{"source_key":"responses:1","quote":"喜欢白茶"}],"ttl_days":null}
+            ]})
+            .to_string()
+        },
+    )
+    .await;
+    host.store
+        .call(|db| {
+            for position in 1..=3 {
+                seed(db, "responses", 1, true, "{}", position)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    host.store.call(|db| {
+        let (summary, cursor, memory_cursor): (String,i64,i64) = db.query_row(
+            "SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='responses'", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        assert_eq!(serde_json::from_str::<Value>(&summary)?["topics"][0]["summary"], "讨论下周安排");
+        assert_eq!(cursor,1);
+        assert!(memory_cursor >= 1);
+        assert_eq!(db.query_row("SELECT count(*) FROM ai_memories WHERE subject_id=7 AND text='喜欢白茶'",[],|r|r.get::<_,i64>(0))?,1);
+        assert_eq!(db.query_row("SELECT count(*) FROM messages",[],|r|r.get::<_,i64>(0))?,3);
+        Ok(())
+    }).await.unwrap();
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn pressure_compacts_before_count_or_idle_threshold_and_preserves_recent_raw_turns() {
+    let (host, chat, model, server) = setup(
+        |c| {
+            c.plugins.ai.defaults.input_budget = 12000;
+            c.plugins.ai.defaults.recent_messages = 96;
+            c.plugins.ai.defaults.memory_write = false;
+            c.plugins.ai.compact_after_messages = 1000;
+            c.plugins.ai.compact_idle_secs = 86400;
+            c.plugins.ai.memory_input_budget = 32768;
+            c.plugins.ai.compaction.summary_budget = 8192;
+            c.plugins.ai.compaction.min_recent_messages = 4;
+        },
+        |batch| {
+            if batch["summary_enabled"] == false {
+                assert_eq!(batch["memory_write"], true);
+                return json!({"summary":"","changes":[{"op":"upsert","id":null,"subject_id":7,"kind":"preference","text":"喜欢白茶",
+                    "evidence":[{"source_key":"pressure:13","quote":"喜欢白茶"}],"ttl_days":null}]}).to_string();
+            }
+            assert_eq!(batch["structured_summary"], true);
+            assert_eq!(batch["summary_budget"], 8192);
+            // More than the former 1500-character cap, within the new topic budget.
+            json!({"summary":topic(batch,"项目细节".repeat(400)),"changes":[]}).to_string()
+        },
+    )
+    .await;
+    host.store
+        .call(|db| {
+            for position in 1..=12 {
+                seed(db, "pressure", 1, false, "{}", position)?;
+            }
+            db.execute(
+                "UPDATE messages SET content=?1,received_at=?2 WHERE conversation_id='pressure'",
+                params!["讨论长消息".repeat(100), qkbot::types::now()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    host.store.call(|db| {
+        let (summary,cursor):(String,i64)=db.query_row("SELECT summary,compacted_until FROM ai_conversations WHERE id='pressure'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        assert!(summary.chars().count()>1500);
+        assert!(serde_json::from_str::<Value>(&summary)?["topics"].is_array());
+        assert_eq!(cursor,8);
+        assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE conversation_id='pressure'",[],|r|r.get::<_,i64>(0))?,12);
+        assert!(db.query_row("SELECT completed_at FROM ai_context_compaction WHERE conversation_id='pressure'",[],|r|r.get::<_,i64>(0))?>0);
+        Ok(())
+    }).await.unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(
+        model.inputs.lock().unwrap().len(),
+        1,
+        "cooldown must prevent repeated compression"
+    );
+    host.store.call(|db| {
+        seed(db, "pressure", 1, true, "{}", 13)?;
+        db.execute("UPDATE ai_conversations SET settings='{\"memory_write\":true}' WHERE id='pressure'", [])?;
+        db.execute("UPDATE messages SET received_at=1 WHERE conversation_id='pressure'", [])?;
+        Ok(())
+    }).await.unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 2);
+    host.store
+        .call(|db| {
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM ai_memories WHERE subject_id=7",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT compacted_until FROM ai_conversations WHERE id='pressure'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                8
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn foreign_topic_source_does_not_advance_summary_but_valid_personal_fact_commits() {
+    let (host,chat,model,server)=setup(|c| {
+        c.plugins.ai.defaults.recent_messages=2;
+        c.plugins.ai.memory_input_budget=32768;
+        c.plugins.ai.compaction.summary_budget=8192;
+    },|batch| {
+        let mut summary=topic(batch,"讨论安排".into());
+        summary["topics"][0]["sources"]=json!(["999:friend:8:123"]);
+        json!({"summary":summary,"changes":[{"op":"upsert","id":null,"subject_id":7,"kind":"preference","text":"喜欢白茶",
+            "evidence":[{"source_key":batch["sources"][0]["key"],"quote":"喜欢白茶"}],"ttl_days":null}]}).to_string()
+    }).await;
+    host.store
+        .call(|db| {
+            for p in 1..=4 {
+                seed(db, "topics", 1, true, "{}", p)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    chat.compact_idle().await.unwrap();
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    host.store.call(|db| {
+        assert_eq!(db.query_row("SELECT compacted_until FROM ai_conversations WHERE id='topics'",[],|r|r.get::<_,i64>(0))?,0);
+        assert_eq!(db.query_row("SELECT count(*) FROM ai_memories WHERE subject_id=7",[],|r|r.get::<_,i64>(0))?,1);
+        assert_eq!(db.query_row("SELECT summary_reason FROM ai_memory_batch_results WHERE conversation_id='topics'",[],|r|r.get::<_,String>(0))?,"summary_evidence");
+        Ok(())
+    }).await.unwrap();
+    chat.shutdown().await;
+    host.store.stop().await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]
@@ -175,6 +367,39 @@ async fn one_idle_message_becomes_a_fact_without_compacting_recent_context() {
     chat.shutdown().await;
     host.store.stop().await.unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn background_extraction_respects_private_knowledge_audience_before_the_model() {
+    use qkbot::config::CrossScenePolicy;
+    for policy in [CrossScenePolicy::PrivateFollowup, CrossScenePolicy::Shared] {
+        let (host, chat, model, server) = setup(
+            move |config| config.plugins.ai.context.cross_scene = policy,
+            move |batch| {
+                let memories = batch["allowed_memories"].as_array().unwrap();
+                assert_eq!(
+                    memories.len(),
+                    usize::from(policy == CrossScenePolicy::Shared)
+                );
+                if policy == CrossScenePolicy::PrivateFollowup {
+                    assert!(!batch.to_string().contains("PRIVATE-EXTRACTION-FACT"));
+                }
+                json!({"summary":"","changes":[]}).to_string()
+            },
+        )
+        .await;
+        host.store.call(|db| {
+            seed(db,"audience",1,true,"{}",1)?;
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,owner_id) VALUES('private-source','1:friend:7','user',7)",[])?;
+            db.execute("INSERT INTO ai_memories(conversation_id,subject_id,kind,text,evidence,created_at,updated_at,origin) VALUES('private-source',7,'fact','PRIVATE-EXTRACTION-FACT','[]',1,1,'auto')",[])?;
+            Ok(())
+        }).await.unwrap();
+        chat.compact_idle().await.unwrap();
+        assert_eq!(model.inputs.lock().unwrap().len(), 1);
+        chat.shutdown().await;
+        host.store.stop().await.unwrap();
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -306,7 +531,7 @@ async fn summary_only_requests_disable_fact_mutations_and_preserve_existing_manu
 }
 
 #[tokio::test]
-async fn fenced_invalid_evidence_rejects_the_whole_batch_without_advancing_cursors() {
+async fn invalid_candidate_keeps_valid_sibling_and_retries_without_advancing_memory_cursor() {
     let (host, chat, model, server) = setup(
         |_| {},
         |batch| {
@@ -334,9 +559,10 @@ async fn fenced_invalid_evidence_rejects_the_whole_batch_without_advancing_curso
         let state:(i64,i64,String)=db.query_row("SELECT compacted_until,memory_processed_until,summary FROM ai_conversations WHERE id='invalid-evidence'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         assert_eq!(state,(0,0,"原摘要".into()));
         for table in ["ai_memories","ai_memory_provenance","ai_memory_search"] {
-            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,i64>(0))?,0,"{table}");
+            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,i64>(0))?,1,"{table}");
         }
         assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE conversation_id='invalid-evidence' AND revoked=0",[],|r|r.get::<_,i64>(0))?,1);
+        assert_eq!(db.query_row("SELECT status FROM ai_memory_batch_results WHERE conversation_id='invalid-evidence'",[],|r|r.get::<_,String>(0))?,"retry");
         Ok(())
     }).await.unwrap();
     chat.compact_idle().await.unwrap();
@@ -452,6 +678,16 @@ async fn oversized_old_summary_is_repaired_without_dropping_any_input_chunk() {
         Ok(())
     }).await.unwrap();
     // The repaired value can actually be used by the following normal batch.
+    host.store
+        .call(|db| {
+            db.execute(
+                "UPDATE ai_context_compaction SET last_attempt_at=0 WHERE conversation_id='old'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     chat.compact_idle().await.unwrap();
     assert!(
         model
@@ -488,9 +724,7 @@ const PENDING_REPAIR_FINAL_SUMMARY: &str = "用户7喜欢白茶；保留已有�
 fn pending_repair_candidate() -> String {
     // Stay within the character ceiling while exercising compression at the
     // configured default byte budget, even when that default is increased.
-    let budget = qkbot::plugins::ai::memory::summary_budget(
-        Config::default().plugins.ai.memory_input_budget,
-    );
+    let budget = Config::default().plugins.ai.compaction.summary_budget;
     let unit = "用户7喜欢白茶。";
     let candidate = unit.repeat(budget / unit.len() + 1);
     assert!(candidate.chars().count() <= 1500);
@@ -609,7 +843,7 @@ async fn oversized_new_summary_is_compressed_then_committed_with_original_valid_
 }
 
 #[tokio::test]
-async fn invalid_pending_summary_compression_cannot_partially_commit_facts_or_cursors() {
+async fn invalid_pending_summary_compression_preserves_valid_facts_and_retries_summary() {
     for failure in [
         "extra_changes",
         "still_oversized",
@@ -636,7 +870,14 @@ async fn invalid_pending_summary_compression_cannot_partially_commit_facts_or_cu
         ).await;
         seed_pending_repair(&host).await;
         chat.compact_idle().await.unwrap();
-        assert_pending_repair_not_committed(&host, 0).await;
+        host.store.call(|db| {
+            let state:(String,i64,i64)=db.query_row("SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='pending-repair'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(state,(PENDING_REPAIR_OLD_SUMMARY.into(),0,1));
+            let facts:Vec<String>=db.prepare("SELECT text FROM ai_memories")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            assert_eq!(facts,vec!["喜欢白茶"]);
+            assert_eq!(db.query_row("SELECT summary_reason FROM ai_memory_batch_results",[],|r|r.get::<_,String>(0))?,"summary_byte_budget");
+            Ok(())
+        }).await.unwrap();
         let attempts = model.inputs.lock().unwrap().len();
         assert_eq!(
             attempts, 2,
@@ -665,7 +906,13 @@ async fn compressed_summary_never_authorizes_an_original_invalid_evidence_quote(
     .await;
     seed_pending_repair(&host).await;
     chat.compact_idle().await.unwrap();
-    assert_pending_repair_not_committed(&host, 0).await;
+    host.store.call(|db| {
+        let state:(String,i64,i64)=db.query_row("SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='pending-repair'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        assert_eq!(state,(PENDING_REPAIR_FINAL_SUMMARY.into(),1,0));
+        assert_eq!(db.query_row("SELECT count(*) FROM ai_memories",[],|r|r.get::<_,i64>(0))?,0);
+        assert_eq!(db.query_row("SELECT status FROM ai_memory_batch_results",[],|r|r.get::<_,String>(0))?,"retry");
+        Ok(())
+    }).await.unwrap();
     chat.shutdown().await;
     host.store.stop().await.unwrap();
     server.abort();
@@ -760,7 +1007,13 @@ async fn pending_summary_compression_enforces_candidate_size_and_two_chunk_limit
         .await;
         seed_pending_repair(&host).await;
         chat.compact_idle().await.unwrap();
-        assert_pending_repair_not_committed(&host, 0).await;
+        host.store.call(|db| {
+            let state:(String,i64,i64)=db.query_row("SELECT summary,compacted_until,memory_processed_until FROM ai_conversations WHERE id='pending-repair'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(state,(PENDING_REPAIR_OLD_SUMMARY.into(),0,1));
+            assert_eq!(db.query_row("SELECT text FROM ai_memories",[],|r|r.get::<_,String>(0))?,"喜欢白茶");
+            assert_eq!(db.query_row("SELECT summary_reason FROM ai_memory_batch_results",[],|r|r.get::<_,String>(0))?,"summary_character_limit");
+            Ok(())
+        }).await.unwrap();
         let inputs = model.inputs.lock().unwrap().clone();
         assert_eq!(inputs.len(), if size == 8193 { 1 } else { 3 });
         if size == 7000 {
@@ -938,7 +1191,7 @@ async fn dated_event_is_learned_recalled_by_subject_and_expires_without_erasing_
 }
 
 #[tokio::test]
-async fn third_party_event_evidence_rejects_every_change_without_advancing_the_cursor() {
+async fn third_party_event_evidence_is_rejected_while_own_event_is_preserved() {
     let (host, chat, model, server) = setup(
         |_| {},
         |batch| {
@@ -974,9 +1227,9 @@ async fn third_party_event_evidence_rejects_every_change_without_advancing_the_c
             "SELECT summary,compacted_until,memory_processed_until,memory_revision FROM ai_conversations WHERE id='reported-event'",[],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         )?;
-        assert_eq!(state,("保留既有摘要".into(),0,0,0));
+        assert_eq!(state,("保留既有摘要".into(),0,0,1));
         for table in ["ai_memories","ai_memory_provenance","ai_memory_search"] {
-            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|row|row.get::<_,i64>(0))?,0);
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|row|row.get::<_,i64>(0))?,1);
         }
         assert_eq!(db.query_row("SELECT COUNT(*) FROM messages WHERE conversation_id='reported-event' AND revoked=0",[],|row|row.get::<_,i64>(0))?,2);
         Ok(())

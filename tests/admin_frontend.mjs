@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning, loadContextOverview, renderContextOverview, invalidateContextOverview, filterConfig, openConfigSection };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning, loadContextOverview, renderContextOverview, invalidateContextOverview, loadPersonal, renderPersonal, mutatePersonal, invalidatePersonal, filterConfig, openConfigSection };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -97,7 +97,7 @@ function harness() {
     result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
     result.plugins.ai.learning = { enabled: false, semantic_recall: true, recall_limit: 8, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
     Object.assign(result.limits, { learning_requests_per_hour: 4, learning_requests_per_day: 24, learning_max_input_budget: 8000, learning_max_output_tokens: 1200 });
-    result.plugins.ai.context = { enabled: true, recent_seconds: 7200, max_turns: 3, neighbors_before: 10, neighbors_after: 5, neighbor_seconds: 120, recall_budget: 3000, neighbor_budget: 1500 };
+    result.plugins.ai.context = { enabled: true, include_unanswered: true, cross_scene: "private_followup", recent_seconds: 7200, max_turns: 3, neighbors_before: 10, neighbors_after: 5, neighbor_seconds: 120, recall_budget: 3000, neighbor_budget: 1500 };
     result.plugins.ai.personas = { "默认": "自定义帮助群成员" };
     result.llm.api_key = ""; result.embedding.api_key = ""; result.milky.access_token = null; result.qq_login.token = "";
     result.app.database = "data/test.db"; return result;
@@ -1515,6 +1515,29 @@ async function prepareModels(h) {
   h.app.secretInputs.get("llm_api_key").value.value = "temporary-test-key";
 }
 
+test("Responses selection keeps both endpoints and discovers models for the selected protocol", async () => {
+  const h = harness(); await prepareModels(h);
+  const protocol = h.app.inputs.get("llm.protocol").control;
+  const chat = h.app.inputs.get("llm.chat_completions_url"), responses = h.app.inputs.get("llm.responses_url");
+  assert.equal(protocol.value, "chat_completions");
+  assert.equal(chat.wrapper.hidden, false); assert.equal(responses.wrapper.hidden, true);
+  responses.control.value = "https://models.example/v1";
+  protocol.value = "responses"; await protocol.emit("input");
+  assert.equal(chat.wrapper.hidden, true); assert.equal(responses.wrapper.hidden, false);
+  h.setHandler(async () => ({ body: { ...modelsResponse(), responses_url: "https://models.example/v1/responses" } }));
+  await h.app.fetchModels();
+  assert.equal(h.calls.at(-1).body.url, "https://models.example/v1");
+  assert.equal(responses.control.value, "https://models.example/v1/responses");
+  assert.equal(chat.control.value, "https://models.example/v1");
+  assert.equal(h.app.readForm().llm.protocol, "responses");
+  assert.equal(h.app.readForm().llm.model, "previous-model");
+  protocol.value = "chat_completions"; await protocol.emit("input");
+  assert.equal(h.app.state.models.items.length, 0);
+  assert.equal(chat.wrapper.hidden, false); assert.equal(responses.wrapper.hidden, true);
+  assert.equal(responses.control.value, "https://models.example/v1/responses");
+  assert.equal(h.app.secretInputs.get("llm_api_key").value.value, "temporary-test-key");
+});
+
 test("model discovery uses the current key and CSRF without saving, and keeps the current model and unrelated drafts", async () => {
   const h = harness(); await prepareModels(h);
   h.app.inputs.get("app.timezone").control.value = "Europe/London";
@@ -1564,6 +1587,8 @@ test("discovery has only one request in flight and no automatic first selection 
 
 test("URL/key changes including ABA, config reload, JSON edits and logout invalidate in-flight discovery", async () => {
   for (const change of [
+    async (h) => { const control = h.app.inputs.get("llm.protocol").control; control.value = "responses"; await control.emit("input"); },
+    async (h) => { const control = h.app.inputs.get("llm.protocol").control; control.value = "responses"; await control.emit("input"); control.value = "chat_completions"; await control.emit("input"); },
     async (h) => { const url = h.app.inputs.get("llm.chat_completions_url").control; url.value = "https://other.example/v1"; await url.emit("input"); },
     async (h) => { const url = h.app.inputs.get("llm.chat_completions_url").control; const old = url.value; url.value = "https://other.example/v1"; await url.emit("input"); url.value = old; await url.emit("input"); },
     async (h) => { const key = h.app.secretInputs.get("llm_api_key").value; key.value = "replacement-key"; await key.emit("input"); },
@@ -2348,9 +2373,27 @@ function contextSnapshot(h, overrides = {}) {
   };
 }
 
+test("topic summaries show unresolved items and literal sources, and compression target stays below trigger", async () => {
+  const h = harness(); await h.login();
+  h.app.state.view = "memory"; h.app.state.memory.selected = h.conversation();
+  const detail = { ...h.conversation(), summary: JSON.stringify({ topics: [{
+    title: "<img src=x onerror=alert(1)>", participants: [42], summary: "讨论搬家",
+    decisions: ["周五确认"], open_questions: ["费用待确认"], key_details: ["预算8192"], sources: ["1:group:10:100"],
+  }] }) };
+  h.setHandler(async () => ({ body: detail })); await h.app.loadContext();
+  assert.match(h.ids.get("context-content").textContent, /参与者：42.*未完成事项：\n费用待确认.*关键原文：\n预算8192.*来源：\n1:group:10:100/su);
+  assert.ok(h.ids.get("context-content").textContent.includes("<img src=x onerror=alert(1)>"));
+  assert.equal(h.document.querySelectorAll("#context-content img").length, 0);
+  const target = h.app.inputs.get("plugins.ai.compaction.target_percent").control;
+  target.value = h.app.inputs.get("plugins.ai.compaction.trigger_percent").control.value;
+  assert.throws(() => h.app.readForm(), /目标占用必须低于触发/u);
+  target.value = "20";
+  assert.equal(h.app.readForm().plugins.ai.compaction.target_percent, 20);
+});
+
 test("continuity window defaults to ten before and five after and saves typed bounded settings", async () => {
   const h = harness(); await h.login();
-  const group = h.app.groups.find((entry) => entry.title === "跨会话接续"); assert.equal(group.fields.length, 8);
+  const group = h.app.groups.find((entry) => entry.title === "跨会话接续"); assert.equal(group.fields.length, 10);
   assert.equal(h.app.inputs.get("plugins.ai.context.neighbors_before").control.value, "10");
   assert.equal(h.app.inputs.get("plugins.ai.context.neighbors_after").control.value, "5");
   h.app.openConfigSection("context");
@@ -2365,7 +2408,7 @@ test("continuity window defaults to ten before and five after and saves typed bo
     return { body: { phase: "running", applied_revision: "r2", loaded_plugins: [] } };
   });
   await h.app.saveConfig(true);
-  assert.deepEqual(saved.config.plugins.ai.context, { enabled: true, recent_seconds: 604800, max_turns: 32, neighbors_before: 15, neighbors_after: 7, neighbor_seconds: 180, recall_budget: 3000, neighbor_budget: 0 });
+  assert.deepEqual(saved.config.plugins.ai.context, { enabled: true, include_unanswered: true, cross_scene: "private_followup", recent_seconds: 604800, max_turns: 32, neighbors_before: 15, neighbors_after: 7, neighbor_seconds: 180, recall_budget: 3000, neighbor_budget: 0 });
   assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
 });
 
@@ -2429,6 +2472,23 @@ test("continuity empty, malformed and failed reads clear sources without a fake 
   assert.equal(h.ids.get("refresh-context-overview").disabled, false);
 });
 
+test("unanswered episodes and retry receipts render with separate IDs and literal source text", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "context";
+  const snapshot = contextSnapshot(h);
+  snapshot.counts.episodes = 1;
+  snapshot.recent.push({ ...snapshot.recent[0], kind: "episode", reply_key: null, assistant_text: null, user_text: "<script>原始话题</script>" });
+  snapshot.learning_batches = [{ conversation_id: "1:group:10:v0:group", epoch: 1, start_position: 0, through_position: 10, attempts: 3, status: "needs_review", summary_reason: "", rejected_count: 1, updated_at: 1792800000, reasons: ["evidence_not_exact_or_ineligible"] }];
+  h.setHandler(async () => ({ body: snapshot })); await h.app.loadContextOverview();
+  assert.notEqual(h.app.state.context.snapshot, null);
+  assert.match(h.ids.get("context-recent-list").textContent, /话题片段 #1.*<script>原始话题<\/script>/su);
+  assert.match(h.ids.get("context-learning-state").textContent, /待核对.*已尝试 3 次.*evidence_not_exact_or_ineligible/su);
+  assert.equal(h.document.querySelectorAll(".context-quote script").length, 0);
+  snapshot.learning_batches[0].conversation_id = "99:group:10:v0:group";
+  await h.app.loadContextOverview();
+  assert.equal(h.app.state.context.snapshot, null);
+  assert.equal(h.ids.get("context-learning-state").textContent, "");
+});
+
 test("continuity rejects late reads after navigation, logout and account changes", async () => {
   const h = harness(); await h.login(); h.app.state.view = "context";
   let resolve; h.setHandler(() => new Promise((done) => { resolve = done; }));
@@ -2454,4 +2514,39 @@ test("continuity cannot display another bot's source conversation or an account 
   resolve({ body: contextSnapshot(h) }); await pending;
   assert.equal(h.app.state.context.snapshot, null); assert.equal(h.ids.get("context-recent-list").textContent, "");
   assert.match(h.ids.get("context-overview-message").textContent, /账号已变化/u);
+});
+
+function personalSnapshot(user = "7") {
+  return { bot_id: "1", character_id: "default", enabled: true, page: 1, total_pages: 1, people: ["7", "8"], profile: user ? { user_id: user, revision: 3, events: [{ id: 1, version: 2, kind: "address", value: "<img src=x onerror=alert(1)>", scope: "1:friend:7", source_key: "1:friend:7:1", quote: "请叫我阿云", occurred_at: 10, expires_at: null, corrected: true }], memories: [{ id: 2, kind: "preference", text: "喜欢白茶", scope: "1:group:2", active: true }] } : null };
+}
+test("personal profiles render literal account-bound preferences and send independent revisions", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "personal";
+  h.setHandler(async (path) => ({ body: path.startsWith("/api/personal?") ? personalSnapshot() : { status: "applied", bot_id: "1", user_id: "7", character_id: "default", revision: 4 } }));
+  await h.app.loadPersonal("7");
+  assert.match(h.ids.get("personal-preferences").textContent, /<img src=x onerror=alert\(1\)>/u);
+  assert.equal(h.document.querySelectorAll("#personal-preferences img").length, 0);
+  assert.match(h.ids.get("personal-memories").textContent, /喜欢白茶/u);
+  await h.app.mutatePersonal({ op: "correct", id: 1, version: 2, value: "云同学" });
+  const request = h.calls.find((c) => c.path === "/api/personal/mutate");
+  assert.equal(request.body.bot_id, "1"); assert.equal(request.body.user_id, "7"); assert.equal(request.body.character_id, "default"); assert.equal(request.body.revision, 3);
+  assert.equal(request.body.action.value, "云同学"); assert.ok(request.body.request_id);
+});
+test("personal profiles reject foreign sources, subjects and replaced accounts", async () => {
+  for (const change of [(v) => { v.profile.events[0].scope = "2:friend:7"; }, (v) => { v.profile.user_id = "8"; }, (v) => { v.bot_id = "2"; }]) {
+    const h = harness(); await h.login(); h.app.state.view = "personal"; h.app.state.status = { online: true, bot_id: 1 };
+    const value = personalSnapshot(); change(value); h.setHandler(async () => ({ body: value })); await h.app.loadPersonal("7");
+    assert.equal(h.app.state.personal.snapshot, null); assert.equal(h.ids.get("personal-profile").hidden, true); assert.ok(h.app.state.personal.message);
+  }
+});
+test("late personal reads cannot restore a closed or signed-out profile", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "personal";
+  let release; h.setHandler(() => new Promise((resolve) => { release = resolve; }));
+  const loading = h.app.loadPersonal("7"); await Promise.resolve(); h.app.clearSession(); release({ body: personalSnapshot() }); await loading;
+  assert.equal(h.app.state.personal.snapshot, null); assert.equal(h.ids.get("personal-profile").hidden, true);
+});
+test("personal reset conflicts keep the server revision and show a readback instruction", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "personal";
+  h.setHandler(async (path) => path.includes("mutate") ? { status: 409, body: { error: "版本变化", code: "personal_conflict" } } : { body: personalSnapshot() });
+  await h.app.loadPersonal("7"); await h.app.mutatePersonal({ op: "reset" });
+  assert.equal(h.app.state.personal.snapshot.profile.revision, 3); assert.match(h.app.state.personal.message, /刷新核对/u); assert.equal(h.app.state.personal.saving, false);
 });

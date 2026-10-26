@@ -571,10 +571,22 @@ impl LearningConfig {
     }
 }
 
+/// Controls where source material may be used, independently of its subject.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossScenePolicy {
+    #[default]
+    PrivateFollowup,
+    SameScope,
+    Shared,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextConfig {
     pub enabled: bool,
+    pub include_unanswered: bool,
+    pub cross_scene: CrossScenePolicy,
     pub recent_seconds: u64,
     pub max_turns: usize,
     pub neighbors_before: usize,
@@ -588,6 +600,8 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            include_unanswered: true,
+            cross_scene: CrossScenePolicy::default(),
             recent_seconds: 7200,
             max_turns: 3,
             neighbors_before: 10,
@@ -637,6 +651,8 @@ pub struct AiConfig {
     pub auto_reply: AutoReplyConfig,
     pub learning: LearningConfig,
     pub context: ContextConfig,
+    pub personal: PersonalConfig,
+    pub compaction: CompactionConfig,
     pub keywords: Vec<String>,
     pub global_memory_shared: bool,
     pub read_group_background: bool,
@@ -658,6 +674,8 @@ impl Default for AiConfig {
             auto_reply: AutoReplyConfig::default(),
             learning: LearningConfig::default(),
             context: ContextConfig::default(),
+            personal: PersonalConfig::default(),
+            compaction: CompactionConfig::default(),
             keywords: vec!["小鱼".into()],
             global_memory_shared: true,
             read_group_background: true,
@@ -671,6 +689,82 @@ impl Default for AiConfig {
             memory_recall_budget: 1000,
             personas: BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactionConfig {
+    pub summary_budget: usize,
+    pub trigger_percent: usize,
+    pub target_percent: usize,
+    pub min_recent_messages: usize,
+    pub min_interval_seconds: u64,
+}
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            summary_budget: 2048,
+            trigger_percent: 70,
+            target_percent: 50,
+            min_recent_messages: 16,
+            min_interval_seconds: 180,
+        }
+    }
+}
+impl CompactionConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (256..=32_768).contains(&self.summary_budget),
+            "摘要预算须为 256..32768"
+        );
+        ensure!(
+            (50..=90).contains(&self.trigger_percent)
+                && (20..self.trigger_percent).contains(&self.target_percent),
+            "压缩目标须低于触发比例，目标至少20%，触发须为50..90%"
+        );
+        ensure!(
+            (2..=128).contains(&self.min_recent_messages),
+            "压缩保留消息下限须为2..128"
+        );
+        ensure!(
+            (30..=3600).contains(&self.min_interval_seconds),
+            "压缩冷却须为30..3600秒"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalConfig {
+    pub enabled: bool,
+    /// Stable identity, independent of the persona's prompt or group style.
+    pub character_id: String,
+    pub injection_budget: usize,
+}
+impl Default for PersonalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            character_id: "default".into(),
+            injection_budget: 2400,
+        }
+    }
+}
+impl PersonalConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.character_id.is_empty()
+                && self.character_id.len() <= 64
+                && self
+                    .character_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')),
+            "个人关系角色 ID 只能包含 1–64 个字母、数字、下划线或连字符"
+        );
+        ensure!(self.injection_budget <= 8000, "个人关系输入预算须为 0–8000");
+        Ok(())
     }
 }
 impl AiConfig {
@@ -880,6 +974,8 @@ impl Config {
         ai.auto_reply.validate()?;
         ai.learning.validate()?;
         ai.context.validate()?;
+        ai.personal.validate()?;
+        ai.compaction.validate()?;
         ensure!(ai.persona(&ai.defaults.persona).is_some(), "人设不存在");
         ensure!(
             ai.personas

@@ -69,6 +69,7 @@ pub struct ModelsRequest {
 pub struct ModelsView {
     pub models: Vec<String>,
     pub chat_completions_url: String,
+    pub responses_url: String,
     pub key_source: &'static str,
     pub environment_overrides_saved_key: bool,
 }
@@ -77,9 +78,10 @@ pub struct ModelsView {
 pub struct ModelEndpoints {
     pub models: reqwest::Url,
     pub chat_completions: reqwest::Url,
+    pub responses: reqwest::Url,
 }
 
-/// Accept a service base or a complete Chat Completions endpoint, preserving
+/// Accept a service base or either complete model endpoint, preserving
 /// custom path prefixes. Query parameters and URL credentials are not accepted.
 pub fn endpoints(input: &str) -> Result<ModelEndpoints, ModelsError> {
     if input.len() > 4096 || input.chars().any(char::is_control) {
@@ -96,15 +98,22 @@ pub fn endpoints(input: &str) -> Result<ModelEndpoints, ModelsError> {
         return Err(ModelsError::Invalid);
     }
     let path = base.path().trim_end_matches('/');
-    let prefix = path.strip_suffix("/chat/completions").unwrap_or(path);
+    let prefix = path
+        .strip_suffix("/chat/completions")
+        .or_else(|| path.strip_suffix("/responses"))
+        .unwrap_or(path);
     let model_path = format!("{prefix}/models");
     let chat_path = format!("{prefix}/chat/completions");
+    let responses_path = format!("{prefix}/responses");
     base.set_path(&model_path);
     let models = base.clone();
     base.set_path(&chat_path);
+    let chat_completions = base.clone();
+    base.set_path(&responses_path);
     Ok(ModelEndpoints {
         models,
-        chat_completions: base,
+        chat_completions,
+        responses: base,
     })
 }
 
@@ -117,7 +126,7 @@ fn credential(
     let (key, source) = match change {
         SecretChange::Keep => {
             if !saved.api_key.is_empty()
-                && endpoints(&saved.chat_completions_url)
+                && endpoints(saved.endpoint_url())
                     .map(|saved| saved.models != target.models)
                     .unwrap_or(true)
             {
@@ -231,6 +240,7 @@ impl ModelsService {
         Ok(ModelsView {
             models,
             chat_completions_url: target.chat_completions.to_string(),
+            responses_url: target.responses.to_string(),
             key_source: source,
             environment_overrides_saved_key: environment_set,
         })
@@ -261,6 +271,10 @@ mod tests {
                 "https://example.com/proxy/custom",
             ),
             ("http://localhost:9000/api", "http://localhost:9000/api"),
+            (
+                "https://example.com/proxy/v1/responses/",
+                "https://example.com/proxy/v1",
+            ),
         ] {
             let paths = endpoints(url).unwrap();
             assert_eq!(paths.models.as_str(), format!("{expected}/models"));
@@ -269,6 +283,8 @@ mod tests {
                 format!("{expected}/chat/completions")
             );
             assert_eq!(endpoints(paths.chat_completions.as_str()).unwrap(), paths);
+            assert_eq!(paths.responses.as_str(), format!("{expected}/responses"));
+            assert_eq!(endpoints(paths.responses.as_str()).unwrap(), paths);
         }
         for url in [
             "file:///tmp/provider",
@@ -280,6 +296,38 @@ mod tests {
         ] {
             assert_eq!(endpoints(url).unwrap_err(), ModelsError::Invalid);
         }
+    }
+
+    #[test]
+    fn responses_saved_key_uses_the_selected_endpoint_only() {
+        let saved = crate::llm::LlmConfig {
+            protocol: crate::llm::ApiProtocol::Responses,
+            responses_url: "https://new.example/proxy/v1/responses".into(),
+            chat_completions_url: "https://old.example/v1/chat/completions".into(),
+            api_key: "synthetic".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential(
+                &saved,
+                &endpoints("https://new.example/proxy/v1").unwrap(),
+                SecretChange::Keep,
+                false
+            )
+            .unwrap()
+            .0,
+            "synthetic"
+        );
+        assert_eq!(
+            credential(
+                &saved,
+                &endpoints(&saved.chat_completions_url).unwrap(),
+                SecretChange::Keep,
+                false
+            )
+            .unwrap_err(),
+            ModelsError::KeyRequired
+        );
     }
 
     #[test]

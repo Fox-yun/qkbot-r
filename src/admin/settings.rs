@@ -613,6 +613,7 @@ fn validate_stored(config: &Config) -> Result<()> {
     crate::plugins::assemble(config)?;
     for value in [
         &config.llm.chat_completions_url,
+        &config.llm.responses_url,
         &config.milky.url,
         &config.embedding.embeddings_url,
     ] {

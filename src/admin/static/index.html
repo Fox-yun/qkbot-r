@@ -54,6 +54,7 @@
         <nav class="workspace-tabs" aria-label="上下文与知识工作区">
           <button class="workspace-tab active" type="button" data-view="context" aria-current="page">对话接续<span>跨群与私聊</span></button>
           <button class="workspace-tab" type="button" data-view="memory">个人记忆<span>事实与偏好</span></button>
+          <button class="workspace-tab" type="button" data-view="personal">人物与关系<span>称呼、熟悉程度与边界</span></button>
           <button class="workspace-tab" type="button" data-view="learning">经验笔记<span>经验与用语</span></button>
         </nav>
       </div>
@@ -65,7 +66,8 @@
           <article class="card context-budget-card"><span class="section-label">已保存群聊最终上限 · 保守估算</span><h2 id="context-input-budget">—</h2><p class="hint">全局默认；按是否启用学习与记忆读取计算。</p><dl class="context-budget-list"><div><dt>普通输入预算</dt><dd id="context-ordinary-budget">—</dd></div><div><dt>其中：近期问答（含背景）</dt><dd id="context-recall-budget">—</dd></div><div><dt>其中：群聊背景上限</dt><dd id="context-neighbor-budget">—</dd></div><div><dt>独立笔记额度</dt><dd id="context-learning-budget">—</dd></div></dl><p class="hint" id="context-budget-note">普通输入与允许注入的笔记额度构成最终上限。</p><button class="text-button accent" type="button" data-config-section="knowledge">管理知识与预算 →</button></article>
         </div>
         <div id="context-counts" class="context-counts" aria-label="上下文与知识数据量"></div>
-        <article class="card source-browser"><div class="card-top"><div><span class="section-label">来源浏览</span><h2>最近完成的问答</h2></div><span class="badge neutral">只读预览</span></div><p class="hint">按来源标注，群友的发言保留原发言者；历史请求不会变成本轮操作授权。以下为已完成记录，不代表每轮都会召回。</p><p id="context-overview-message" class="muted" role="status" aria-live="polite">进入后加载最近问答。</p><div id="context-recent-list" class="context-recent-list"></div></article>
+        <article class="card"><h2>个人记忆整理状态</h2><div id="context-learning-state" aria-live="polite"></div></article>
+        <article class="card source-browser"><div class="card-top"><div><span class="section-label">来源浏览</span><h2>近期话题与问答</h2></div><span class="badge neutral">只读预览</span></div><p class="hint">按来源标注，群友的发言保留原发言者；历史请求不会变成本轮操作授权。以下为已收录的话题或完整问答，不代表每轮都会召回。</p><p id="context-overview-message" class="muted" role="status" aria-live="polite">进入后加载近期话题。</p><div id="context-recent-list" class="context-recent-list"></div></article>
         <div class="knowledge-guide"><span aria-hidden="true">↳</span><p>需要修改已记住的事实或交流经验？<button class="text-button accent" type="button" data-view="memory">管理个人记忆</button><span> / </span><button class="text-button accent" type="button" data-view="learning">管理经验笔记</button></p></div>
       </section>
 
@@ -119,6 +121,13 @@
             </div>
           </div>
         </div>
+      </section>
+
+      <section id="view-personal" class="view knowledge-view" aria-labelledby="personal-title" hidden>
+        <div class="section-heading"><div><h2 id="personal-title">人物与关系</h2><p class="muted">按真实 QQ 聚合个人记忆，按角色保留共同交流、称呼、偏好与边界。</p></div><button id="refresh-personal" class="button secondary" type="button">刷新档案</button></div>
+        <article class="card"><p id="personal-account" class="hint"></p><form id="personal-search" class="memory-filter"><input id="personal-user" inputmode="numeric" aria-label="人物 QQ" placeholder="输入人物 QQ"><button class="button primary" type="submit">查看人物</button></form><div id="personal-people" class="button-row"></div><div class="pagination"><button id="personal-prev" class="text-button" type="button">← 上一页</button><span id="personal-page" class="hint"></span><button id="personal-next" class="text-button" type="button">下一页 →</button></div><p id="personal-message" role="status" aria-live="polite"></p></article>
+        <article id="personal-profile" class="card" hidden><div class="card-top"><h2 id="personal-person"></h2><button id="reset-personal" class="button danger" type="button">重置此角色的关系</button></div><p class="hint">熟悉程度依据已确认的直接交流，同一场景每天最多记录一次。纠正、拒绝和离线不会扣分。每条偏好按来源场景使用，私聊内容默认不带入群聊。</p><h3>称呼、偏好与边界</h3><div id="personal-preferences"></div><h3>近期共同交流</h3><div id="personal-experiences"></div><h3>个人记忆（最近 100 条）</h3><p class="hint">事实与偏好的修改、证据查看和遗忘在「个人记忆」中按 QQ 管理。</p><div id="personal-memories"></div></article>
+        <article id="personal-editor" class="card" hidden><form id="personal-edit-form"><h2>纠正关系记录</h2><p class="hint">纠正保留原来源范围，并标为管理员修订；来源失效后不能恢复。</p><textarea id="personal-edit-value" rows="3" maxlength="160" required aria-label="关系记录内容"></textarea><div class="button-row"><button id="personal-save" class="button primary" type="submit">保存纠正</button><button id="personal-cancel" class="button secondary" type="button">取消</button></div></form></article>
       </section>
 
       <section id="view-learning" class="view knowledge-view" aria-labelledby="learning-title" hidden>

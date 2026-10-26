@@ -127,7 +127,7 @@ impl MockServer {
                                 if resource_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
                                 let Ok(response) = receive.await else { return; }; response
                             }
-                            "/v1/chat/completions" => {
+                            "/v1/chat/completions" | "/v1/responses" => {
                                 let (reply, receive) = oneshot::channel();
                                 if model_tx.send(ModelRequest { body, reply }).await.is_err() { return; }
                                 let Ok(response) = receive.await else { return; }; response
@@ -411,6 +411,7 @@ async fn learning_background_uses_its_quota_and_recall_invalidates_cross_group_r
     for forget_personal_memory in [false, true] {
         let mut mock = MockServer::start().await;
         let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.context.cross_scene = qkbot::config::CrossScenePolicy::Shared;
             config.plugins.ai.learning.enabled = true;
             config.plugins.ai.learn_all_group_messages = true;
             config.plugins.ai.defaults.summary = false;
@@ -1476,6 +1477,7 @@ async fn setup_with(
     config.milky.url = mock.url.clone();
     config.milky.bot_id = Some(123);
     config.llm.chat_completions_url = format!("{}/v1/chat/completions", mock.url);
+    config.llm.responses_url = format!("{}/v1/responses", mock.url);
     config.llm.model = "mock".into();
     config.llm.api_key = "synthetic".into();
     config.llm.max_concurrent_requests = 1;
@@ -2602,6 +2604,7 @@ async fn global_memory_shares_same_qq_across_groups_and_private_chat_without_his
         let (_temp, host, router) = setup_with(&mock, true, |config| {
             // Test the independent long-term sharing policy, without recent turns.
             config.plugins.ai.context.enabled = false;
+            config.plugins.ai.context.cross_scene = qkbot::config::CrossScenePolicy::Shared;
             // The enabled case deliberately uses the default setting.
             if !enabled {
                 config.plugins.ai.global_memory_shared = false;
@@ -2660,6 +2663,7 @@ async fn global_memory_shares_same_qq_across_groups_and_private_chat_without_his
 async fn forgetting_shared_memory_during_another_groups_model_wait_blocks_its_stale_reply() {
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.plugins.ai.context.cross_scene = qkbot::config::CrossScenePolicy::Shared;
         config.plugins.ai.defaults.summary = false;
         config.plugins.ai.defaults.memory_write = false;
     })
@@ -3346,6 +3350,70 @@ async fn confirmed_send_survives_ledger_failure_and_restart_never_replays_it() {
     assert_eq!(state, "unknown");
     within(Router::new(restarted).shutdown()).await.unwrap();
     assert!(mock.sends.try_recv().is_err());
+    mock.stop().await;
+}
+
+#[tokio::test]
+async fn responses_clock_round_preserves_reasoning_and_call_id_without_persisting_them() {
+    let mut mock = MockServer::start().await;
+    let (_temp, host, router) = setup_with(&mock, true, |config| {
+        config.llm.protocol = qkbot::llm::ApiProtocol::Responses;
+        config.llm.chat_completions_url = "http://127.0.0.1:1/inactive".into();
+        config.limits.max_model_calls = 2;
+    })
+    .await;
+    router
+        .dispatch(message(1, "what-time-is-it"))
+        .await
+        .unwrap();
+    let first = mock.model().await;
+    assert!(first.body.get("messages").is_none());
+    assert!(first.body.get("max_tokens").is_none());
+    assert_eq!(
+        first.body["max_output_tokens"],
+        host.config.plugins.ai.defaults.output_budget
+    );
+    assert_eq!(first.body["store"], false);
+    assert_eq!(first.body["stream"], false);
+    assert!(
+        first.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "clock_now" && tool["strict"] == false)
+    );
+    let output = json!([
+        {"type":"reasoning","id":"rs_clock","summary":[],"encrypted_content":"opaque-reasoning-marker"},
+        {"type":"function_call","id":"fc_clock","call_id":"clock-call-123","name":"clock_now","arguments":"{}","status":"completed"}
+    ]);
+    first.reply.send(json!({"model":"mock","status":"completed","output":output,"usage":{"input_tokens":20,"output_tokens":10}})).unwrap();
+    let last = mock.model().await;
+    assert!(last.body.get("tools").is_none());
+    assert_eq!(last.body["tool_choice"], "none");
+    let input = last.body["input"].as_array().unwrap();
+    assert_eq!(
+        &input[input.len() - 3..input.len() - 1],
+        output.as_array().unwrap()
+    );
+    let result = input.last().unwrap();
+    assert_eq!(result["type"], "function_call_output");
+    assert_eq!(result["call_id"], "clock-call-123");
+    let content: Value = serde_json::from_str(result["output"].as_str().unwrap()).unwrap();
+    assert_eq!(content["status"], "succeeded");
+    last.reply.send(json!({"model":"mock","status":"completed","output":[
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"time-read-via-responses","annotations":[]}]}
+    ],"usage":{"input_tokens":30,"output_tokens":5}})).unwrap();
+    assert_eq!(mock.sent().await, "time-read-via-responses");
+    wait_for_outbox(&host, "confirmed", 1).await;
+    within(router.shutdown()).await.unwrap();
+    let db = rusqlite::Connection::open(_temp.path().join("test.sqlite3")).unwrap();
+    (|| -> anyhow::Result<()> {
+        assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE content LIKE '%opaque-reasoning-marker%' OR content LIKE '%clock-call-123%'", [], |r| r.get::<_,i64>(0))?, 0);
+        assert_eq!(db.query_row("SELECT count(*) FROM messages WHERE role='assistant' AND content='time-read-via-responses'", [], |r| r.get::<_,i64>(0))?, 1);
+        Ok(())
+    })().unwrap();
+    assert!(mock.models.try_recv().is_err());
+    drop(host);
     mock.stop().await;
 }
 

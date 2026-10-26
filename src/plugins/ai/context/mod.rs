@@ -1,6 +1,9 @@
 //! One retrieval, budgeting and dependency boundary for conversational knowledge.
 pub mod assembly;
+pub mod compaction;
 pub mod continuity;
+pub mod policy;
+pub mod summary;
 
 #[cfg(test)]
 mod tests;
@@ -30,7 +33,10 @@ pub async fn init(store: &Store) -> Result<()> {
     store.migrate("ai_context_dependencies", 1, SCHEMA).await?;
     store
         .migrate("ai_context_dependencies", 2, POLICY_SCHEMA)
-        .await
+        .await?;
+    store.migrate("ai_context_dependencies", 3,
+        "CREATE TABLE ai_context_audience(id INTEGER PRIMARY KEY CHECK(id=1),policy TEXT NOT NULL);").await?;
+    compaction::init(store).await
 }
 
 /// Global defaults live outside the conversation row. Persist their relevant
@@ -112,6 +118,8 @@ pub struct ContextDependencyGuard {
     memories: Vec<MemoryDependency>,
     #[serde(default)]
     learning: Vec<learning::LearningCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    personal: Vec<super::personal::Dependency>,
 }
 
 impl From<learning::LearningCheck> for ContextDependencyGuard {
@@ -124,12 +132,48 @@ impl From<learning::LearningCheck> for ContextDependencyGuard {
 }
 
 impl ContextDependencyGuard {
+    pub(crate) fn source_keys(&self) -> Vec<String> {
+        self.continuity.source_keys()
+    }
+    pub fn allows_audience(
+        &self,
+        db: &Connection,
+        policy: crate::config::CrossScenePolicy,
+        scope: &Scope,
+        actor: i64,
+    ) -> Result<bool> {
+        for check in &self.personal {
+            if !check.allows_audience(db, policy, scope, actor)? {
+                return Ok(false);
+            }
+        }
+        let mut keys = self.continuity.source_keys();
+        for check in &self.learning {
+            keys.extend(check.source_keys(db)?);
+        }
+        for memory in &self.memories {
+            let origin: String = db.query_row("SELECT c.scope FROM ai_memories m JOIN ai_conversations c ON c.id=m.conversation_id WHERE m.id=?1", [memory.id], |r| r.get(0))?;
+            if !policy::allows_scope_key(policy, &origin, scope, actor) {
+                return Ok(false);
+            }
+            keys.extend(
+                db.prepare("SELECT source_key FROM ai_memory_provenance WHERE memory_id=?1")?
+                    .query_map([memory.id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        policy::allows_sources(db, policy, &keys, scope, actor)
+    }
+
     pub fn validate(&self, db: &Connection) -> Result<()> {
         ensure!(
             serde_json::to_vec(self)?.len() <= 262_144,
             "上下文来源依赖超过保存上限"
         );
         self.continuity.validate(db)?;
+        for check in &self.personal {
+            check.validate(db)?;
+        }
         for memory in &self.memories {
             let valid: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM ai_memories WHERE id=?1 AND version=?2 AND active=1 AND (expires_at IS NULL OR expires_at>?3))",
@@ -143,6 +187,11 @@ impl ContextDependencyGuard {
     }
 
     pub fn extend(&mut self, other: &Self) {
+        for check in &other.personal {
+            if !self.personal.contains(check) {
+                self.personal.push(check.clone());
+            }
+        }
         self.continuity.extend(&other.continuity);
         for memory in &other.memories {
             if !self
@@ -244,6 +293,24 @@ pub fn reply_is_valid(db: &Connection, key: &str) -> Result<bool> {
         .is_ok())
 }
 
+pub fn reply_allows_audience(
+    db: &Connection,
+    key: &str,
+    policy: crate::config::CrossScenePolicy,
+    scope: &Scope,
+    actor: i64,
+) -> Result<bool> {
+    let mut guard = ContextDependencyGuard::default();
+    if guard
+        .include_sources(db, &[key.to_owned()])
+        .and_then(|()| guard.validate(db))
+        .is_err()
+    {
+        return Ok(false);
+    }
+    guard.allows_audience(db, policy, scope, actor)
+}
+
 pub fn summary_guard(db: &Connection, guard: &ContextGuard) -> Result<ContextDependencyGuard> {
     if !dependency_tables_exist(db)? {
         return Ok(ContextDependencyGuard::default());
@@ -304,6 +371,7 @@ pub fn maintain(db: &Connection) -> Result<()> {
     }
     db.execute_batch("DELETE FROM ai_recent_turns WHERE NOT EXISTS(SELECT 1 FROM messages WHERE key=request_key) OR NOT EXISTS(SELECT 1 FROM messages WHERE key=reply_key);
         DELETE FROM ai_context_sources WHERE NOT EXISTS(SELECT 1 FROM messages WHERE key=source_key);
+        DELETE FROM ai_context_relations WHERE NOT EXISTS(SELECT 1 FROM messages WHERE key=source_key);
         DELETE FROM ai_context_reply_dependencies WHERE NOT EXISTS(SELECT 1 FROM messages WHERE key=reply_key);
         DELETE FROM ai_context_dependencies WHERE NOT EXISTS(SELECT 1 FROM messages WHERE key=derived_key);
         DELETE FROM ai_context_summary_dependencies WHERE NOT EXISTS(SELECT 1 FROM ai_conversations WHERE id=conversation_id AND summary!='');")?;
@@ -332,6 +400,7 @@ struct Knowledge {
 }
 
 pub struct PreparedContext {
+    personal: Option<super::personal::PersonalContext>,
     memories: Vec<Knowledge>,
     pub learning: Option<learning::LearningContext>,
     pub continuity: Vec<continuity::ContinuityDocument>,
@@ -339,7 +408,11 @@ pub struct PreparedContext {
 
 impl PreparedContext {
     pub fn memory_texts(&self) -> Vec<String> {
-        self.memories.iter().map(|m| m.text.clone()).collect()
+        self.personal
+            .iter()
+            .map(|p| p.text.clone())
+            .chain(self.memories.iter().map(|m| m.text.clone()))
+            .collect()
     }
     pub fn learning_texts(&self) -> Vec<String> {
         self.learning
@@ -357,7 +430,18 @@ impl PreparedContext {
         result: &assembly::AssemblyResult,
     ) -> Result<ContextDependencyGuard> {
         let mut guard = ContextDependencyGuard::default();
-        for memory in self.memories.iter().take(result.context.memory_count) {
+        let personal_count =
+            usize::from(self.personal.is_some() && result.context.memory_count > 0);
+        if personal_count > 0 {
+            guard
+                .personal
+                .push(self.personal.as_ref().unwrap().dependency.clone());
+        }
+        for memory in self
+            .memories
+            .iter()
+            .take(result.context.memory_count - personal_count)
+        {
             guard.memories.push(memory.dependency.clone());
             for key in &memory.sources {
                 guard.continuity.add_source_key(key.clone());
@@ -404,6 +488,14 @@ pub async fn prepare(
         vec![]
     };
     let guard = request.guard.clone();
+    let audience = request.scope.clone();
+    let actor = request.actor;
+    // A multi-author automatic batch is not a personal request by its last speaker.
+    let cross_scene = if request.allow_continuity {
+        host.config.plugins.ai.context.cross_scene
+    } else {
+        crate::config::CrossScenePolicy::SameScope
+    };
     let memories = host.store.call(move |db| {
         crate::host::check_guard(db, &guard)?;
         let mut result = Vec::new();
@@ -418,13 +510,18 @@ pub async fn prepare(
             let mut sources = db.prepare("SELECT source_key FROM ai_memory_provenance WHERE memory_id=?1")?
                 .query_map([candidate.id], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for evidence in &current.evidence { if !sources.contains(&evidence.source_key) { sources.push(evidence.source_key.clone()); } }
+            if !policy::allows_scope_key(cross_scene, &scope, &audience, actor)
+                || !policy::allows_sources(db, cross_scene, &sources, &audience, actor)? { continue; }
+            let mut inherited = ContextDependencyGuard::default();
+            inherited.include_sources(db, &sources)?;
+            if !inherited.allows_audience(db, cross_scene, &audience, actor)? { continue; }
             let origin = match current.origin.as_str() { "manual" => "管理员补充（不代表本人自述）", "auto" => "原始消息提取", _ => "历史记录" };
             result.push(Knowledge { text: format!("记忆 #{} / 关于用户 {} / {:?} / {} / 记录来源范围 {}（群限定事实勿泛化）：{}", candidate.id,current.subject_id,current.kind,origin,scope,current.text),
                 dependency: MemoryDependency {id:candidate.id,version}, sources });
         }
         Ok(result)
     }).await?;
-    let learning = if request.settings.memory_read
+    let mut learning = if request.settings.memory_read
         && !request.settings.paused
         && host.config.plugins.ai.learning.enabled
         && request.scope.scene == Scene::Group
@@ -445,6 +542,27 @@ pub async fn prepare(
     } else {
         None
     };
+    if let Some(mut notes) = learning.take() {
+        let audience = request.scope.clone();
+        learning = Some(
+            host.store
+                .call(move |db| {
+                    let mut indices = Vec::new();
+                    for index in 0..notes.texts.len() {
+                        let check = notes.check.selected(&[index]);
+                        let mut inherited = ContextDependencyGuard::from(check.clone());
+                        inherited.include_sources(db, &check.source_keys(db)?)?;
+                        if inherited.allows_audience(db, cross_scene, &audience, actor)? {
+                            indices.push(index);
+                        }
+                    }
+                    notes.texts = indices.iter().map(|i| notes.texts[*i].clone()).collect();
+                    notes.check = notes.check.selected(&indices);
+                    Ok(notes)
+                })
+                .await?,
+        );
+    }
     let continuity = if request.settings.memory_read
         && request.allow_continuity
         && !request.settings.paused
@@ -468,7 +586,21 @@ pub async fn prepare(
     } else {
         vec![]
     };
+    let personal =
+        if request.settings.memory_read && !request.settings.paused && request.allow_continuity {
+            let scope = request.scope.clone();
+            let config = host.config.plugins.ai.personal.clone();
+            let cutoff = Some((request.position, request.received_at));
+            host.store
+                .call(move |db| {
+                    super::personal::recall(db, &scope, actor, &config, cross_scene, cutoff)
+                })
+                .await?
+        } else {
+            None
+        };
     Ok(PreparedContext {
+        personal,
         memories,
         learning,
         continuity,

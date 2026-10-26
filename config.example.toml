@@ -28,7 +28,9 @@ max_response_bytes = 262144
 request_timeout_secs = 15
 
 [llm]
+protocol = "chat_completions" # chat_completions / responses；旧配置默认 Chat Completions
 chat_completions_url = "https://api.example.com/v1/chat/completions"
+responses_url = ""            # 选择 responses 时填写完整 /v1/responses 地址
 model = "your-model"
 api_key = ""
 tool_calling = true            # 上游不支持原生 tools 时设为 false
@@ -93,10 +95,24 @@ max_changes_per_run = 6        # 1..20
 max_note_chars = 2000          # 100..10000
 injection_budget = 12000       # 聊天时笔记的独立额外空间：0..64000；0=暂不注入但仍可学习，不占原聊天输入预算
 
+[plugins.ai.compaction]
+summary_budget = 2048          # 独立摘要额度；对话质量优先可配8192，并将memory_input_budget设32768
+trigger_percent = 70           # 裁剪前文字输入占用达到此比例时后台压缩
+target_percent = 50            # 压缩后目标，低于触发比例；不强行删除保留的完整轮次
+min_recent_messages = 16       # 压力下保留的最近原文下限
+min_interval_seconds = 180     # 摘要冷却；个人事实提炼不受此间隔限制
+
+[plugins.ai.personal]
+enabled = true
+character_id = "default"      # 稳定角色身份；修改人设文案不改变关系归属
+injection_budget = 2400       # 0–8000，计入普通输入预算；0 暂停关系注入
+
 [plugins.ai.context]
-enabled = true                # 同机器人、同 QQ 跨群与私聊接续；只登记明确触发且已确认发送的新问答
+enabled = true                # 同机器人、同 QQ 的近期问答与话题接续
+include_unanswered = true      # 不必等待机器人回复或长期记忆提炼，允许接续本人参与的原始话题片段
+cross_scene = "private_followup" # 默认群聊→本人私聊；same_scope 仅原场景；shared 显式允许跨群、私聊→群
 recent_seconds = 7200          # 最近问答时间范围：60..604800 秒
-max_turns = 3                  # 每轮最多候选问答数：1..32
+max_turns = 3                  # 每轮最多话题/完整问答片段数：1..32
 neighbors_before = 10          # 来源群聊前文条数：0..50，设 0 不读取前文
 neighbors_after = 5            # 来源群聊后文条数：0..50，设 0 不读取后文
 neighbor_seconds = 120         # 前后各自时间范围：1..3600 秒；不越过本轮消息水位

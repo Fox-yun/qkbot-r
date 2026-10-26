@@ -37,7 +37,7 @@
 
 ### 公共依赖
 
-三个分支都需要独立的 Milky 协议端和兼容 Chat Completions 的模型接口。SQLite 随 Rust 程序编译；聊天模型在远端调用，无需在服务器部署本地大模型。
+三个分支都需要独立的 Milky 协议端和远程模型接口。当前分支可在管理页选择 Chat Completions 或 Responses API，旧配置默认继续使用 Chat Completions，详见[模型配置说明](docs/user-guide.md#原生启动)。SQLite 随 Rust 程序编译；聊天模型在远端调用，无需在服务器部署本地大模型。
 
 本项目的扫码代理适配 **LLBot（LuckyLilliaBot）**。配套容器方案固定使用 `docker.io/linyuchen/llbot:8.3.2`，采用直连模式，无需在服务器另装桌面 QQ；首次登录仍需使用手机 QQ 扫码确认。运行模式与前置授权按 [LLBot 官方安装说明](https://luckylillia.com/guide/choice_install)配置。
 

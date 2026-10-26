@@ -671,7 +671,13 @@ fn semantic_candidates(
     Ok(best.into_iter().map(|(_, memory)| memory).collect())
 }
 
-fn fuse(lexical: Vec<Memory>, semantic: Vec<Memory>, limit: usize, budget: usize) -> Vec<Memory> {
+fn fuse(
+    lexical: Vec<Memory>,
+    semantic: Vec<Memory>,
+    limit: usize,
+    budget: usize,
+    query: &str,
+) -> Vec<Memory> {
     let mut found: HashMap<i64, (f64, usize, Memory)> = HashMap::new();
     for (origin, list) in [lexical, semantic].into_iter().enumerate() {
         for (rank, memory) in list.into_iter().enumerate() {
@@ -683,7 +689,14 @@ fn fuse(lexical: Vec<Memory>, semantic: Vec<Memory>, limit: usize, budget: usize
         }
     }
     let mut found: Vec<_> = found.into_values().collect();
-    found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let location_query = memory::requests_personal_location(query);
+    found.sort_by(|a, b| {
+        let location = |m: &Memory| location_query && memory::is_personal_location(&m.text);
+        location(&b.2)
+            .cmp(&location(&a.2))
+            .then_with(|| b.0.total_cmp(&a.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
     let mut used = 0usize;
     let mut result = Vec::new();
     for (_, _, memory) in found {
@@ -853,7 +866,7 @@ pub(crate) async fn retrieve_for_turn(
                 let lexical = lexical(db, &snapshot.request, &query, candidates, usize::MAX)?;
                 let semantic =
                     semantic_candidates(db, &snapshot, &namespace, &response.vector, candidates)?;
-                Ok(fuse(lexical, semantic, limit, budget))
+                Ok(fuse(lexical, semantic, limit, budget, &query))
             })
             .await;
         if let Ok(memories) = result {
@@ -1107,7 +1120,7 @@ mod tests {
         );
         let found = semantic_candidates(&db, &query, "model-a", &vector(0), 20).unwrap();
         assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), vec![own]);
-        assert_eq!(fuse(vec![], found, 5, 1000)[0].subject_id, 7);
+        assert_eq!(fuse(vec![], found, 5, 1000, "")[0].subject_id, 7);
         let before: (String, i64, i64) = db
             .query_row(
                 "SELECT summary,compacted_until,memory_processed_until FROM ai_conversations",
@@ -1392,16 +1405,41 @@ mod tests {
         let a = memory::get_memory(&db, first).unwrap().unwrap();
         let b = memory::get_memory(&db, second).unwrap().unwrap();
         let c = memory::get_memory(&db, third).unwrap().unwrap();
-        let fused = fuse(vec![a.clone(), b.clone()], vec![a.clone(), c], 2, 1000);
+        let fused = fuse(vec![a.clone(), b.clone()], vec![a.clone(), c], 2, 1000, "");
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].id, first);
         assert_ne!(fused[0].id, fused[1].id);
         let budget = memory::estimate_tokens(&a.text) + 16;
         assert_eq!(
-            fuse(vec![a.clone(), b.clone()], vec![a], 5, budget).len(),
+            fuse(vec![a.clone(), b.clone()], vec![a.clone()], 5, budget, "").len(),
             1
         );
-        assert!(fuse(vec![b], vec![], 5, 1).is_empty());
+        let mut home = b.clone();
+        home.text = "居住在星港市".into();
+        assert_eq!(
+            fuse(
+                vec![home.clone(), a.clone()],
+                vec![a.clone()],
+                1,
+                1000,
+                "聊点别的"
+            )[0]
+            .id,
+            a.id
+        );
+        assert_eq!(
+            fuse(
+                vec![home.clone(), a.clone()],
+                vec![a],
+                1,
+                1000,
+                "我家天气怎么样"
+            )[0]
+            .id,
+            home.id,
+            "a lexical home fact must survive fusion with a preference found by both retrievers"
+        );
+        assert!(fuse(vec![b], vec![], 5, 1, "我家天气").is_empty());
     }
 
     #[test]

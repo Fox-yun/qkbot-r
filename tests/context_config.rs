@@ -1,5 +1,51 @@
 use qkbot::config::{Config, ContextConfig};
 
+#[test]
+fn compaction_budget_and_pressure_configuration_is_independent_and_validated() {
+    let config=Config::from_toml("[plugins.ai.compaction]\nsummary_budget=8192\ntrigger_percent=70\ntarget_percent=50\nmin_recent_messages=16\nmin_interval_seconds=180").unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.plugins.ai.memory_input_budget, 8000);
+    assert_eq!(config.plugins.ai.compaction.summary_budget, 8192);
+    let restored = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.plugins.ai.compaction.summary_budget, 8192);
+    for setting in [
+        "summary_budget=0",
+        "trigger_percent=95",
+        "target_percent=70",
+        "min_recent_messages=1",
+        "min_interval_seconds=0",
+    ] {
+        assert!(
+            Config::from_toml(&format!("[plugins.ai.compaction]\n{setting}"))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn context_audience_defaults_are_explicit_and_unknown_policies_fail() {
+    let config = Config::from_toml("").unwrap();
+    assert!(config.plugins.ai.context.include_unanswered);
+    assert_eq!(
+        config.plugins.ai.context.cross_scene,
+        qkbot::config::CrossScenePolicy::PrivateFollowup
+    );
+    for policy in ["private_followup", "same_scope", "shared"] {
+        let input =
+            format!("[plugins.ai.context]\ncross_scene='{policy}'\ninclude_unanswered=false");
+        let config = Config::from_toml(&input).unwrap();
+        config.validate().unwrap();
+        assert!(!config.plugins.ai.context.include_unanswered);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["plugins"]["ai"]["context"]["cross_scene"],
+            policy
+        );
+    }
+    assert!(Config::from_toml("[plugins.ai.context]\ncross_scene='anything'").is_err());
+}
+
 fn context_value(config: &Config) -> serde_json::Value {
     serde_json::to_value(&config.plugins.ai.context).unwrap()
 }

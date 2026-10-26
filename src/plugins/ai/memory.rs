@@ -1,4 +1,5 @@
 //! Bounded lexical memory and context assembly. No embedding model or vector service.
+pub mod lifecycle;
 pub mod rebuild;
 pub mod scope;
 use anyhow::{Context, Result, bail, ensure};
@@ -19,6 +20,8 @@ const MAX_SOURCE_BYTES: usize = 24_000;
 const MAX_MEMORY_CHARS: usize = 180;
 /// Instructions and protocol framing are reserved separately from source data.
 pub(crate) const MEMORY_PROMPT_RESERVE: usize = 2200;
+pub(crate) const RELATIONSHIP_PROMPT_RESERVE: usize = 1000;
+pub(crate) const TOPIC_PROMPT_RESERVE: usize = 1800;
 const MIGRATION: &str = r#"
 CREATE TABLE ai_memories (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +144,10 @@ pub struct MessageSource {
     pub subject_id: i64,
     pub sender_nickname: Option<String>,
     pub sender_card: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentioned_ids: Vec<i64>,
     pub role: String,
     pub text: String,
     pub learnable: bool,
@@ -170,12 +177,15 @@ pub struct MemoryBatch {
     #[serde(skip)]
     summary_start: i64,
     pub sources: Vec<MessageSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personal: Option<super::personal::BatchPolicy>,
     #[serde(serialize_with = "serialize_allowed_memories")]
     pub allowed_memories: Vec<Memory>,
     pub memory_write: bool,
     pub summary_enabled: bool,
     /// Maximum bytes after the summary is JSON-escaped twice, as in the next input.
     pub summary_budget: usize,
+    pub structured_summary: bool,
 }
 
 /// An unchanged stored summary, including every CAS coordinate. Repair never
@@ -200,10 +210,7 @@ pub fn summary_cost(summary: &str) -> Result<usize> {
 }
 
 pub fn validate_summary(summary: &str, budget: usize) -> Result<()> {
-    ensure!(
-        summary.chars().count() <= 1500,
-        "summary exceeds 1500 characters"
-    );
+    super::context::summary::validate(summary)?;
     ensure!(
         summary_cost(summary)? <= budget,
         "summary exceeds next-input byte budget"
@@ -214,6 +221,7 @@ pub fn validate_summary(summary: &str, budget: usize) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchUpdate {
+    #[serde(deserialize_with = "super::context::summary::deserialize")]
     pub summary: String,
     #[serde(default)]
     pub changes: Vec<MemoryChange>,
@@ -222,6 +230,10 @@ pub struct BatchUpdate {
 /// Some compatible model providers wrap otherwise valid JSON in Markdown.
 /// Only remove one complete outer fence; the JSON and schema remain strict.
 pub(crate) fn parse_batch_update(content: &str) -> Result<BatchUpdate> {
+    parse_response(content)
+}
+
+fn parse_response<T: serde::de::DeserializeOwned>(content: &str) -> Result<T> {
     let content = content.trim();
     let json = if let Some(fenced) = content.strip_prefix("```") {
         let (language, remainder) = fenced
@@ -279,6 +291,7 @@ pub struct MemoryStore {
     store: Store,
     max_memories_per_conversation: usize,
     global_memory_shared: bool,
+    summary_budget: Option<usize>,
 }
 
 impl MemoryStore {
@@ -287,19 +300,51 @@ impl MemoryStore {
             store,
             max_memories_per_conversation,
             global_memory_shared: true,
+            summary_budget: None,
         }
     }
     pub fn with_global_memory_shared(mut self, enabled: bool) -> Self {
         self.global_memory_shared = enabled;
         self
     }
+    pub fn with_summary_budget(mut self, budget: usize) -> Self {
+        self.summary_budget = Some(budget);
+        self
+    }
+    fn effective_summary_budget(&self, input: usize) -> usize {
+        // Keep enough room to read a complete source even with legacy small inputs.
+        let reserve = MEMORY_PROMPT_RESERVE
+            + if input >= MEMORY_PROMPT_RESERVE + RELATIONSHIP_PROMPT_RESERVE + 512 {
+                RELATIONSHIP_PROMPT_RESERVE
+            } else {
+                0
+            }
+            + if self.summary_budget.is_some()
+                && input
+                    >= MEMORY_PROMPT_RESERVE
+                        + RELATIONSHIP_PROMPT_RESERVE
+                        + TOPIC_PROMPT_RESERVE
+                        + 512
+            {
+                TOPIC_PROMPT_RESERVE
+            } else {
+                0
+            };
+        self.summary_budget
+            .unwrap_or_else(|| summary_budget(input))
+            .min(input.saturating_sub(reserve + 512).max(128))
+    }
     pub async fn init(&self) -> Result<()> {
         self.store.migrate("ai_memory", 1, MIGRATION).await?;
         self.store.migrate("ai_memory", 2, CURSOR_MIGRATION).await?;
         self.store.migrate("ai_memory", 3, ADMIN_MIGRATION).await?;
         self.store.migrate("ai_memory", 4, scope::MIGRATION).await?;
+        self.store
+            .migrate("ai_memory", 5, lifecycle::MIGRATION)
+            .await?;
         super::learning::init(&self.store).await?;
         super::context::init(&self.store).await?;
+        super::personal::init(&self.store).await?;
         let enabled = self.global_memory_shared;
         self.store
             .call(move |db| {
@@ -465,6 +510,10 @@ impl MemoryStore {
         max_input_tokens: usize,
     ) -> Result<MemoryBatch> {
         let guard = guard.clone();
+        let summary_budget = self.effective_summary_budget(max_input_tokens);
+        let structured = self.summary_budget.is_some()
+            && max_input_tokens
+                >= MEMORY_PROMPT_RESERVE + RELATIONSHIP_PROMPT_RESERVE + TOPIC_PROMPT_RESERVE + 512;
         self.store
             .call(move |db| {
                 let mut batch = prepare_batch_modes(
@@ -474,14 +523,28 @@ impl MemoryStore {
                     memory_write,
                     summary_enabled,
                 )?;
-                batch.summary_budget = summary_budget(max_input_tokens);
+                batch.summary_budget = summary_budget;
+                batch.structured_summary = structured && batch.summary_enabled;
+                // Preserve low-budget fact extraction. Relationship proposals
+                // are optional and require their own instruction reservation.
+                if max_input_tokens < MEMORY_PROMPT_RESERVE + RELATIONSHIP_PROMPT_RESERVE + 512 {
+                    batch.personal = None;
+                }
+                let reserve = MEMORY_PROMPT_RESERVE
+                    + if batch.structured_summary {
+                        TOPIC_PROMPT_RESERVE
+                    } else {
+                        0
+                    }
+                    + if batch.personal.is_some() {
+                        RELATIONSHIP_PROMPT_RESERVE
+                    } else {
+                        0
+                    };
                 if batch.sources.is_empty() {
                     return Ok(batch);
                 }
-                let mut batch = fit_batch(
-                    batch,
-                    max_input_tokens.saturating_sub(MEMORY_PROMPT_RESERVE),
-                )?;
+                let mut batch = fit_batch(batch, max_input_tokens.saturating_sub(reserve))?;
                 freeze_batch_dependencies(db, &mut batch)?;
                 Ok(batch)
             })
@@ -495,14 +558,28 @@ impl MemoryStore {
             .await
     }
 
+    /// Automatic consolidation records each result independently while sharing
+    /// one frozen-source transaction. Explicit rebuilds retain strict commits.
+    pub async fn commit_learning_batch(
+        &self,
+        batch: MemoryBatch,
+        update: lifecycle::LearningUpdate,
+    ) -> Result<()> {
+        let maximum = self.max_memories_per_conversation;
+        self.store
+            .call(move |db| lifecycle::commit(db, &batch, update, maximum))
+            .await
+    }
+
     pub async fn summary_repair(
         &self,
         guard: &ContextGuard,
         input_budget: usize,
     ) -> Result<Option<SummaryRepair>> {
         let guard = guard.clone();
+        let budget = self.effective_summary_budget(input_budget);
         self.store
-            .call(move |db| prepare_summary_repair(db, &guard, summary_budget(input_budget)))
+            .call(move |db| prepare_summary_repair(db, &guard, budget))
             .await
     }
 
@@ -536,6 +613,7 @@ fn prepare_summary_repair(
 
 fn commit_summary_repair(db: &mut Connection, repair: SummaryRepair, summary: &str) -> Result<()> {
     validate_summary(summary, repair.summary_budget)?;
+    super::context::summary::validate_repair(&repair.summary, summary)?;
     ensure!(
         !summary.trim().is_empty(),
         "summary repair returned empty context"
@@ -580,7 +658,12 @@ fn source_by_key(
     if is_revoked(db, key)? {
         return Ok(None);
     }
-    Ok(db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card,received_at FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, received_at:source_received_at(r,10)?, subject_id:r.get(2)?, sender_nickname:r.get(8)?,sender_card:r.get(9)?,role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false })).optional()?)
+    let mut source = db.query_row("SELECT key,id,sender_id,role,content,learnable,inbound_position,COALESCE(origin_plugin,'')!='memory_only',sender_nickname,sender_card,received_at FROM messages WHERE key=?1 AND conversation_id=?2 AND epoch=?3 AND revoked=0", params![key, guard.conversation_id, guard.epoch], |r| Ok(MessageSource { key:r.get(0)?, position:r.get(1)?, received_at:source_received_at(r,10)?, subject_id:r.get(2)?, sender_nickname:r.get(8)?,sender_card:r.get(9)?,role:r.get(3)?, text:r.get(4)?, learnable:r.get(5)?,inbound_position:r.get(6)?,context_visible:r.get(7)?,summary_eligible:false,memory_eligible:false,reply_to_message_key:None,mentioned_ids:vec![] })).optional()?;
+    if let Some(source) = &mut source {
+        (source.reply_to_message_key, source.mentioned_ids) =
+            super::context::continuity::relationships(db, key)?;
+    }
+    Ok(source)
 }
 
 fn source_received_at(
@@ -735,7 +818,14 @@ pub(crate) fn retrieve(
     )?;
     purge_expired(db)?;
     let domain = scope::resolve(db, &guard.conversation_id)?;
-    let query = fts_query(query);
+    let location_query = requests_personal_location(query);
+    let expanded = if location_query {
+        // Reserve query terms before long follow-up text reaches the FTS term cap.
+        format!("家乡 老家 居住 住在 家在 住址 常住 来自 籍贯 所在 城市 家位于 {query}")
+    } else {
+        query.to_owned()
+    };
+    let query = fts_query(&expanded);
     let mut found = Vec::new();
     if !query.is_empty() {
         let mut stmt=db.prepare("SELECT m.id,m.subject_id,m.kind,m.text,m.evidence,m.expires_at,m.origin FROM ai_memory_search JOIN ai_memories m ON m.id=ai_memory_search.memory_id WHERE ai_memory_search MATCH ?1 AND m.conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND m.subject_id=?3 AND m.active=1 AND (m.expires_at IS NULL OR m.expires_at>?4) ORDER BY bm25(ai_memory_search),m.updated_at DESC,m.id DESC LIMIT ?5")?;
@@ -758,6 +848,10 @@ pub(crate) fn retrieve(
     }
     let mut used = 0;
     let mut result = Vec::new();
+    if location_query {
+        // Resolve the owner's implicit location before less relevant recent preferences.
+        found.sort_by_key(|m| !is_personal_location(&m.text));
+    }
     for memory in found {
         let cost = estimate_tokens(&memory.text) + 16;
         if used + cost > budget {
@@ -770,6 +864,39 @@ pub(crate) fn retrieve(
         result.push(memory);
     }
     Ok(result)
+}
+
+pub(crate) fn requests_personal_location(query: &str) -> bool {
+    let query = query.to_lowercase();
+    [
+        "我家",
+        "我老家",
+        "我住",
+        "我这里",
+        "我这边",
+        "我的家乡",
+        "my home",
+        "where i live",
+    ]
+    .iter()
+    .any(|term| query.contains(term))
+}
+
+pub(crate) fn is_personal_location(text: &str) -> bool {
+    [
+        "家乡",
+        "老家",
+        "居住",
+        "住在",
+        "家在",
+        "家位于",
+        "籍贯",
+        "来自",
+        "常住",
+        "住址",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
 }
 
 pub(crate) fn validate_text(text: &str) -> Result<()> {
@@ -938,6 +1065,12 @@ fn prepare_batch_modes(
         [&guard.conversation_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
+    let through = if memory_write {
+        lifecycle::pending_through(db, guard, memory_previous)?
+            .map_or(through, |pending| through.min(pending))
+    } else {
+        through
+    };
     let summary_valid = summary.is_empty() || super::context::summary_guard(db, guard).is_ok();
     // A revoked or changed dependency invalidates the whole derived baseline.
     // Restart only the summary cursor: facts already learned remain processed.
@@ -978,6 +1111,8 @@ fn prepare_batch_modes(
                     subject_id: r.get(2)?,
                     sender_nickname: r.get(9)?,
                     sender_card: r.get(10)?,
+                    reply_to_message_key: None,
+                    mentioned_ids: vec![],
                     role: r.get(3)?,
                     text: r.get(4)?,
                     learnable: r.get(5)?,
@@ -994,7 +1129,9 @@ fn prepare_batch_modes(
                 r.get::<_, bool>(6)?,
             ))
         })? {
-            let (source, revoked) = row?;
+            let (mut source, revoked) = row?;
+            (source.reply_to_message_key, source.mentioned_ids) =
+                super::context::continuity::relationships(db, &source.key)?;
             raw_rows += 1;
             if revoked
                 || is_revoked(db, &source.key)?
@@ -1026,7 +1163,7 @@ fn prepare_batch_modes(
         .filter(|s| s.memory_eligible)
         .map(|s| s.subject_id)
         .collect();
-    let allowed_memories = if memory_write {
+    let mut allowed_memories = if memory_write {
         let subjects = serde_json::to_string(&subjects)?;
         let domain = scope::resolve(db, &guard.conversation_id)?;
         let mut statement=db.prepare("SELECT id,subject_id,kind,text,evidence,expires_at,origin FROM ai_memories WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?1) AND subject_id IN (SELECT value FROM json_each(?2)) AND active=1 AND locked=0 AND origin='auto' AND (expires_at IS NULL OR expires_at>?3) ORDER BY updated_at DESC,id DESC LIMIT 16")?;
@@ -1037,6 +1174,25 @@ fn prepare_batch_modes(
     } else {
         Vec::new()
     };
+    // Consolidation sees the same audience boundary as chat. Otherwise a private
+    // fact supplied as an update target could leak through a new group summary.
+    if let Some(policy) = super::context::policy::configured(db)? {
+        let scope: String = db.query_row(
+            "SELECT scope FROM ai_conversations WHERE id=?1",
+            [&guard.conversation_id],
+            |r| r.get(0),
+        )?;
+        let scope = super::context::continuity::parse_scope(&scope)?;
+        let mut visible = Vec::new();
+        for memory in allowed_memories {
+            let mut dependencies = super::context::ContextDependencyGuard::default();
+            dependencies.include_memories(db, &[memory.id])?;
+            if dependencies.allows_audience(db, policy, &scope, memory.subject_id)? {
+                visible.push(memory);
+            }
+        }
+        allowed_memories = visible;
+    }
     let mut batch = MemoryBatch {
         guard: guard.clone(),
         dependencies: super::context::ContextDependencyGuard::default(),
@@ -1052,11 +1208,13 @@ fn prepare_batch_modes(
         },
         expected_summary: summary,
         summary_start,
+        personal: super::personal::batch_policy(db, &sources, memory_write)?,
         sources,
         allowed_memories,
         memory_write: memory_write && through_position > memory_previous,
         summary_enabled: summary_enabled && through_position > summary_start,
         summary_budget: usize::MAX,
+        structured_summary: false,
     };
     freeze_batch_dependencies(db, &mut batch)?;
     Ok(batch)
@@ -1105,6 +1263,20 @@ fn fit_batch(mut batch: MemoryBatch, max_bytes: usize) -> Result<MemoryBatch> {
     // The previous summary may be the only surviving copy of old context. Never cut it
     // mid-fact merely to fit a budget; remove optional records and complete new turns.
     loop {
+        if !batch.memory_write {
+            batch.personal = None;
+        }
+        if let Some(policy) = &mut batch.personal {
+            policy.source_keys.retain(|key| {
+                batch
+                    .sources
+                    .iter()
+                    .any(|s| s.key == *key && s.memory_eligible)
+            });
+            if policy.source_keys.is_empty() {
+                batch.personal = None;
+            }
+        }
         // Chat embeds this JSON as message content, which JSON-escapes it a second
         // time. Count that form so quotes/backslashes cannot defeat the input bound.
         let encoded = serde_json::to_string(&batch)?;
@@ -1137,7 +1309,7 @@ fn fit_batch(mut batch: MemoryBatch, max_bytes: usize) -> Result<MemoryBatch> {
     }
 }
 
-fn validate_evidence(
+pub(super) fn validate_evidence(
     db: &Connection,
     batch: &MemoryBatch,
     subject: i64,
@@ -1232,9 +1404,14 @@ fn commit_batch_with_limit(
 
 /// Only exact, application-owned validation labels become observable reason codes.
 /// Never emit an arbitrary storage error, its chain, or source/model content.
-fn memory_commit_failure_reason(error: &anyhow::Error) -> &'static str {
+pub(super) fn memory_commit_failure_reason(error: &anyhow::Error) -> &'static str {
     match error.to_string().as_str() {
-        "summary exceeds 1500 characters" => "summary_character_limit",
+        "summary exceeds 1500 characters" | "summary character limit exceeded" => {
+            "summary_character_limit"
+        }
+        "topic source outside summary evidence" | "topic participant outside summary evidence" => {
+            "summary_evidence"
+        }
         "summary exceeds next-input byte budget" => "summary_byte_budget",
         "too many memory changes" => "change_count",
         "chat observations must be preferences" | "personal background must be a fact" => {
@@ -1278,31 +1455,11 @@ struct MemoryCommitCounts {
     skipped_new: usize,
 }
 
-fn commit_batch_inner(
-    db: &mut Connection,
-    batch: &MemoryBatch,
-    update: BatchUpdate,
-    maximum: usize,
-) -> Result<MemoryCommitCounts> {
-    validate_summary(&update.summary, batch.summary_budget)?;
-    ensure!(
-        update.changes.len() <= MAX_CHANGES,
-        "too many memory changes"
-    );
-    ensure!(
-        batch.memory_write || update.changes.is_empty(),
-        "automatic memory writes are disabled"
-    );
-    ensure!(
-        batch.summary_enabled || update.summary.is_empty(),
-        "summary generation is disabled for this batch"
-    );
-    let tx = db.transaction()?;
-    check_guard(&tx, &batch.guard)?;
-    batch.dependencies.validate(&tx)?;
-    purge_expired(&tx)?;
-    let domain = scope::resolve(&tx, &batch.guard.conversation_id)?;
-    let (compacted, memory_processed, summary, revision): (i64, i64, String, i64) = tx.query_row(
+fn validate_batch_snapshot(db: &Connection, batch: &MemoryBatch) -> Result<String> {
+    check_guard(db, &batch.guard)?;
+    batch.dependencies.validate(db)?;
+    let domain = scope::resolve(db, &batch.guard.conversation_id)?;
+    let (compacted, memory_processed, summary, revision): (i64, i64, String, i64) = db.query_row(
         "SELECT compacted_until,memory_processed_until,summary,memory_revision FROM ai_conversations WHERE id=?1",
         [&batch.guard.conversation_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -1316,7 +1473,7 @@ fn commit_batch_inner(
     );
     // Validate the entire snapshot and every mutation before touching a row.
     for frozen in &batch.sources {
-        let current = source_by_key(&tx, &batch.guard, &frozen.key)?
+        let current = source_by_key(db, &batch.guard, &frozen.key)?
             .context("summary source was revoked or removed")?;
         ensure!(
             current.position == frozen.position
@@ -1327,51 +1484,92 @@ fn commit_batch_inner(
                 && current.subject_id == frozen.subject_id
                 && current.sender_nickname == frozen.sender_nickname
                 && current.sender_card == frozen.sender_card
+                && current.reply_to_message_key == frozen.reply_to_message_key
+                && current.mentioned_ids == frozen.mentioned_ids
                 && current.learnable == frozen.learnable
                 && current.context_visible == frozen.context_visible,
             "summary source changed"
         );
     }
+    Ok(domain)
+}
+
+fn validate_change(
+    db: &Connection,
+    batch: &MemoryBatch,
+    domain: &str,
+    change: &MemoryChange,
+) -> Result<()> {
+    let (id, subject, evidence) = match change {
+        MemoryChange::Upsert {
+            id,
+            subject_id,
+            kind,
+            text,
+            evidence,
+            ttl_days,
+        } => {
+            validate_text(text)?;
+            validate_ttl(*ttl_days)?;
+            validate_profile(*kind, text, evidence, *ttl_days)?;
+            (*id, *subject_id, evidence)
+        }
+    };
+    validate_evidence(db, batch, subject, evidence)?;
+    if let Some(id) = id {
+        let allowed = batch
+            .allowed_memories
+            .iter()
+            .find(|m| m.id == id && m.subject_id == subject)
+            .context("memory ID was not allowed for this subject")?;
+        let current = get_memory(db, id)?.context("memory no longer exists")?;
+        let eligible: bool = db.query_row("SELECT conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND origin='auto' AND active=1 AND locked=0 FROM ai_memories WHERE id=?1",params![id,domain],|row|row.get(0))?;
+        ensure!(
+            eligible,
+            "automatic changes cannot modify locked, manual, inactive, or foreign memories"
+        );
+        ensure!(
+            current.subject_id == allowed.subject_id
+                && current.kind == allowed.kind
+                && current.text == allowed.text
+                && current.evidence == allowed.evidence
+                && current.expires_at == allowed.expires_at
+                && current.origin == allowed.origin,
+            "memory changed while summarizing"
+        );
+    }
+    Ok(())
+}
+
+fn commit_batch_inner(
+    db: &mut Connection,
+    batch: &MemoryBatch,
+    update: BatchUpdate,
+    maximum: usize,
+) -> Result<MemoryCommitCounts> {
+    validate_summary(&update.summary, batch.summary_budget)?;
+    super::context::summary::validate_sources(db, batch, &update.summary)?;
+    ensure!(
+        update.changes.len() <= MAX_CHANGES,
+        "too many memory changes"
+    );
+    ensure!(
+        batch.memory_write || update.changes.is_empty(),
+        "automatic memory writes are disabled"
+    );
+    ensure!(
+        batch.summary_enabled || update.summary.is_empty(),
+        "summary generation is disabled for this batch"
+    );
+    let tx = db.transaction()?;
+    purge_expired(&tx)?;
+    let domain = validate_batch_snapshot(&tx, batch)?;
     let mut touched = HashSet::new();
     for change in &update.changes {
-        let (id, subject, evidence) = match change {
-            MemoryChange::Upsert {
-                id,
-                subject_id,
-                kind,
-                text,
-                evidence,
-                ttl_days,
-            } => {
-                validate_text(text)?;
-                validate_ttl(*ttl_days)?;
-                validate_profile(*kind, text, evidence, *ttl_days)?;
-                (*id, *subject_id, evidence)
-            }
-        };
-        validate_evidence(&tx, batch, subject, evidence)?;
+        validate_change(&tx, batch, &domain, change)?;
+        let MemoryChange::Upsert { id, .. } = change;
         if let Some(id) = id {
             ensure!(touched.insert(id), "duplicate memory mutation");
-            let allowed = batch
-                .allowed_memories
-                .iter()
-                .find(|m| m.id == id && m.subject_id == subject)
-                .context("memory ID was not allowed for this subject")?;
-            let current = get_memory(&tx, id)?.context("memory no longer exists")?;
-            let eligible: bool = tx.query_row("SELECT conversation_id IN (SELECT id FROM ai_conversations WHERE memory_scope=?2) AND origin='auto' AND active=1 AND locked=0 FROM ai_memories WHERE id=?1",params![id,domain],|row|row.get(0))?;
-            ensure!(
-                eligible,
-                "automatic changes cannot modify locked, manual, inactive, or foreign memories"
-            );
-            ensure!(
-                current.subject_id == allowed.subject_id
-                    && current.kind == allowed.kind
-                    && current.text == allowed.text
-                    && current.evidence == allowed.evidence
-                    && current.expires_at == allowed.expires_at
-                    && current.origin == allowed.origin,
-                "memory changed while summarizing"
-            );
         }
     }
     super::context::record_summary(&tx, batch)?;
@@ -1507,6 +1705,17 @@ fn assemble(input: &ContextInput) -> Vec<Value> {
     messages.push(json!({"role":"user","content":input.current}));
     messages.extend(input.tool_protocol.iter().cloned());
     messages
+}
+
+pub fn estimate_context(input: &ContextInput) -> Result<usize> {
+    let schema = if input.tool_schema.is_null() {
+        0
+    } else {
+        estimate_tokens(&serde_json::to_string(&input.tool_schema)?)
+    };
+    Ok(estimate_tokens(&serde_json::to_string(&assemble(input))?)
+        .saturating_add(schema)
+        .saturating_add(64))
 }
 
 pub fn build_context(mut input: ContextInput, max_input_tokens: usize) -> Result<BudgetedContext> {
@@ -1903,6 +2112,221 @@ mod tests {
             .map(|row| decode_memory(row?))
             .collect()
     }
+    fn lifecycle_db() -> Connection {
+        let db = db();
+        db.execute_batch(lifecycle::MIGRATION).unwrap();
+        db
+    }
+
+    fn automatic_change(subject: i64, key: &str, quote: &str) -> MemoryChange {
+        MemoryChange::Upsert {
+            id: None,
+            subject_id: subject,
+            kind: MemoryKind::Preference,
+            text: quote.into(),
+            evidence: evidence(key, quote),
+            ttl_days: None,
+        }
+    }
+
+    #[test]
+    fn automatic_candidates_commit_independently_and_retry_without_duplicate_facts() {
+        let mut db = lifecycle_db();
+        source(&db, "tea", 7, "喜欢白茶", "user");
+        let through = source(&db, "coffee", 8, "喜欢咖啡", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        lifecycle::commit(
+            &mut db,
+            &batch,
+            BatchUpdate {
+                summary: "两个人各有偏好".into(),
+                changes: vec![
+                    automatic_change(7, "tea", "喜欢白茶"),
+                    automatic_change(7, "coffee", "喜欢咖啡"),
+                ],
+            }
+            .into(),
+            256,
+        )
+        .unwrap();
+        assert_eq!(list_memories(&db, "group", None).unwrap().len(), 1);
+        assert_eq!(db.query_row("SELECT compacted_until,memory_processed_until FROM ai_conversations WHERE id='group'",[],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap(),(through,0));
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        assert!(!batch.summary_enabled);
+        lifecycle::commit(
+            &mut db,
+            &batch,
+            BatchUpdate {
+                summary: String::new(),
+                changes: vec![
+                    automatic_change(7, "tea", "喜欢白茶"),
+                    automatic_change(8, "coffee", "喜欢咖啡"),
+                ],
+            }
+            .into(),
+            256,
+        )
+        .unwrap();
+        let facts = list_memories(&db, "group", None).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(
+            facts.iter().map(|m| m.subject_id).collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT memory_processed_until FROM ai_conversations WHERE id='group'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            through
+        );
+    }
+
+    #[test]
+    fn oversized_automatic_summary_does_not_discard_valid_facts_or_advance_summary_cursor() {
+        let mut db = lifecycle_db();
+        let through = source(&db, "tea", 7, "喜欢白茶", "user");
+        let mut batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        batch.summary_budget = 16;
+        lifecycle::commit(
+            &mut db,
+            &batch,
+            BatchUpdate {
+                summary: "超长摘要".repeat(30),
+                changes: vec![automatic_change(7, "tea", "喜欢白茶")],
+            }
+            .into(),
+            256,
+        )
+        .unwrap();
+        assert_eq!(list_memories(&db, "group", None).unwrap().len(), 1);
+        assert_eq!(db.query_row("SELECT compacted_until,memory_processed_until FROM ai_conversations WHERE id='group'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap(),(0,through));
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        assert!(!batch.memory_write);
+        lifecycle::commit(
+            &mut db,
+            &batch,
+            BatchUpdate {
+                summary: "短摘要".into(),
+                changes: vec![],
+            }
+            .into(),
+            256,
+        )
+        .unwrap();
+        assert!(
+            lifecycle::overview(&db, 1)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn automatic_rejections_have_bounded_retries_and_durable_review_status() {
+        let mut db = lifecycle_db();
+        let through = source(&db, "tea", 7, "喜欢白茶", "user");
+        for attempt in 1..=3 {
+            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+            let summary = if batch.summary_enabled {
+                "偏好".into()
+            } else {
+                String::new()
+            };
+            lifecycle::commit(
+                &mut db,
+                &batch,
+                BatchUpdate {
+                    summary,
+                    changes: vec![
+                        automatic_change(7, "tea", "喜欢白茶"),
+                        automatic_change(8, "tea", "喜欢白茶"),
+                    ],
+                }
+                .into(),
+                256,
+            )
+            .unwrap();
+            assert_eq!(list_memories(&db, "group", None).unwrap().len(), 1);
+            assert_eq!(
+                db.query_row(
+                    "SELECT memory_processed_until FROM ai_conversations WHERE id='group'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                if attempt < 3 { 0 } else { through }
+            );
+        }
+        let pending = lifecycle::overview(&db, 1).unwrap();
+        assert_eq!(pending[0]["status"], "needs_review");
+        assert_eq!(pending[0]["attempts"], 3);
+        assert_eq!(
+            pending[0]["reasons"],
+            json!(["evidence_not_exact_or_ineligible"])
+        );
+        assert!(!pending.to_string().contains("喜欢白茶"));
+    }
+
+    #[test]
+    fn malformed_candidate_does_not_discard_a_valid_sibling_but_root_duplicates_are_rejected() {
+        let mut db = lifecycle_db();
+        let through = source(&db, "tea", 7, "喜欢白茶", "user");
+        let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+        let update=lifecycle::parse(r#"{"summary":"偏好","changes":[{"op":"upsert","subject_id":7,"kind":"preference","text":"喜欢白茶","evidence":[{"source_key":"tea","quote":"喜欢白茶"}]},{"op":"upsert","subject_id":7,"subject_id":8}]}"#).unwrap();
+        lifecycle::commit(&mut db, &batch, update, 256).unwrap();
+        assert_eq!(list_memories(&db, "group", None).unwrap().len(), 1);
+        assert_eq!(
+            lifecycle::overview(&db, 1).unwrap()[0]["reasons"],
+            json!(["candidate_schema"])
+        );
+        assert!(lifecycle::parse(r#"{"summary":"a","summary":"b","changes":[]}"#).is_err());
+    }
+
+    #[test]
+    fn source_changes_and_storage_errors_still_rollback_every_automatic_result() {
+        for revoke in [true, false] {
+            let mut db = lifecycle_db();
+            let through = source(&db, "tea", 7, "喜欢白茶", "user");
+            let batch = prepare_batch(&db, &guard(), through, true).unwrap();
+            if revoke {
+                db.execute("UPDATE messages SET revoked=1 WHERE key='tea'", [])
+                    .unwrap();
+            } else {
+                db.execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON ai_memory_candidate_results BEGIN SELECT RAISE(ABORT,'simulated failure'); END;").unwrap();
+            }
+            assert!(
+                lifecycle::commit(
+                    &mut db,
+                    &batch,
+                    BatchUpdate {
+                        summary: "偏好".into(),
+                        changes: vec![automatic_change(7, "tea", "喜欢白茶")]
+                    }
+                    .into(),
+                    256
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM ai_memories", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(db.query_row("SELECT compacted_until+memory_processed_until FROM ai_conversations WHERE id='group'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM ai_memory_batch_results", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE scope_access(scope TEXT PRIMARY KEY,enabled INTEGER,revision INTEGER); CREATE TABLE ai_conversations(id TEXT PRIMARY KEY,scope TEXT NOT NULL DEFAULT '1:group:2',epoch INTEGER,summary TEXT NOT NULL DEFAULT '',compacted_until INTEGER NOT NULL DEFAULT 0); CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,conversation_id TEXT,epoch INTEGER,sender_id INTEGER,role TEXT,content TEXT,learnable INTEGER,revoked INTEGER DEFAULT 0,inbound_position INTEGER DEFAULT 0,origin_plugin TEXT,sender_nickname TEXT,sender_card TEXT,received_at INTEGER NOT NULL DEFAULT 1); INSERT INTO ai_conversations(id,epoch) VALUES('group',1),('private',1);").unwrap();

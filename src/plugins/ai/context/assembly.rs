@@ -12,6 +12,8 @@ const CONTINUITY_LABEL: &str =
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextUsage {
+    pub untrimmed_estimated_tokens: usize,
+    pub history_estimated_tokens: usize,
     pub base_budget: usize,
     pub continuity_budget: usize,
     pub learning_budget: usize,
@@ -80,6 +82,14 @@ pub fn assemble_with_builder(
         .checked_add(learning_budget)
         .context("combined context budget overflow")?;
     let continuity_budget = continuity_budget.min(base_budget / 2);
+    let untrimmed = super::super::memory::estimate_context(&input)?;
+    let history_cost = input
+        .history
+        .iter()
+        .flatten()
+        .try_fold(0usize, |sum, message| {
+            Ok::<_, anyhow::Error>(sum.saturating_add(serde_json::to_string(message)?.len() + 1))
+        })?;
     let mut selected_continuity = select(continuity, continuity_budget, true)?;
     let mut continuity_cost = selected_cost(&selected_continuity);
     let mut context = loop {
@@ -130,6 +140,8 @@ pub fn assemble_with_builder(
     let continuity_indices = selected_continuity.iter().map(|s| s.index).collect();
     let learning_indices = selected_learning.iter().map(|s| s.index).collect();
     let usage = ContextUsage {
+        untrimmed_estimated_tokens: untrimmed.saturating_add(continuity_cost),
+        history_estimated_tokens: history_cost,
         base_budget,
         continuity_budget,
         learning_budget,
@@ -247,6 +259,24 @@ mod tests {
                 estimate_tokens(&serde_json::to_string(schema).unwrap())
             }
             + 64
+    }
+
+    #[test]
+    fn pressure_estimate_keeps_history_before_budget_trimming() {
+        let mut source = input();
+        source.history = (0..12)
+            .map(|i| {
+                vec![json!({"role":"user", "content":format!("{i}{}", "讨论细节".repeat(150))})]
+            })
+            .collect();
+        let result = assemble(source, &[], &[], 12000, 3000, 0).unwrap();
+        assert!(result.usage.untrimmed_estimated_tokens > 12000);
+        assert!(result.usage.history_estimated_tokens > 12000);
+        assert!(result.context.estimated_tokens <= 12000);
+        assert!(
+            result.context.messages.len() < 14,
+            "actual request still honors the hard cap"
+        );
     }
 
     #[test]

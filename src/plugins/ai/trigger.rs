@@ -587,6 +587,7 @@ impl Ingress {
                     trigger && reason != Some(Reason::Automatic),
                     keep,
                 )?;
+                super::context::continuity::register_relationships(&tx, &message)?;
                 tx.commit()?;
                 Ok(Some((settings, reason)))
             })

@@ -332,3 +332,82 @@ async fn learning_crud_receipts_revisions_history_and_rollback_work_without_mode
     assert_eq!(panel.snapshot().await["revision"], 5);
     panel.stop().await;
 }
+
+#[tokio::test]
+async fn personal_routes_bind_account_character_csrf_and_idempotent_revision() {
+    let panel = Panel::start().await;
+    assert_eq!(
+        panel
+            .client
+            .get(format!("{}/api/personal", panel.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        panel
+            .request(Method::GET, "/api/personal?bot_id=456")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let initial = panel
+        .request(Method::GET, "/api/personal?bot_id=123&user_id=789")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial: Value = initial.json().await.unwrap();
+    assert_eq!(initial["profile"]["revision"], 0);
+    let mut body = json!({"bot_id":"123","user_id":"789","character_id":"default","revision":0,"request_id":"personal-reset","action":{"op":"reset"}});
+    assert_eq!(
+        panel
+            .client
+            .post(format!("{}/api/personal/mutate", panel.url))
+            .header("cookie", &panel.cookie)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for _ in 0..2 {
+        let response = panel
+            .request(Method::POST, "/api/personal/mutate")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["revision"], 1);
+    }
+    body["request_id"] = json!("stale");
+    assert_eq!(
+        panel
+            .request(Method::POST, "/api/personal/mutate")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    body["revision"] = json!(1);
+    body["character_id"] = json!("other");
+    assert_eq!(
+        panel
+            .request(Method::POST, "/api/personal/mutate")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    panel.stop().await;
+}

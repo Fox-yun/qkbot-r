@@ -641,6 +641,8 @@ async fn context_overview_tracks_applied_policy_and_rejects_invalid_windows() {
 
     let policy = json!({
         "enabled": true,
+        "include_unanswered": true,
+        "cross_scene": "private_followup",
         "recent_seconds": 3600,
         "max_turns": 4,
         "neighbors_before": 12,

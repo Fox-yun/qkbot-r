@@ -21,6 +21,7 @@
     contacts: { version: 0, loading: false, saving: null, phase: "idle", message: "", botId: "", generation: null, groups: [], friends: [], fetchedAt: null, scene: "group", query: "", page: 1, totalPages: 1 },
     learning: { version: 0, loading: false, saving: false, snapshot: null, editing: null, dirty: false, conflict: false, message: "" },
     context: { version: 0, loading: false, snapshot: null, message: "" },
+    personal: { version: 0, loading: false, saving: false, snapshot: null, selected: "", page: 1, editing: null, message: "" },
     configCategory: "all",
   };
   const inputs = new Map();
@@ -76,9 +77,11 @@
     field("limits.learning_max_output_tokens", "学习输出 token 上限", "number", "限制后台模型输出的笔记变更内容。", { min: 256, max: 8192 }),
   ];
   const contextFields = [
-    field("plugins.ai.context.enabled", "跨群与私聊接续", "check", "同一机器人账号、同一用户可以接续最近完成的问答。群聊背景保留出处与发言者，不会归为当前用户的记忆。保存并应用后生效。", { full: true }),
+    field("plugins.ai.context.enabled", "跨群与私聊接续", "check", "按当前用户召回近期话题与完整问答，保留每条发言的作者和出处。保存并应用后生效。", { full: true }),
+    field("plugins.ai.context.include_unanswered", "接续尚未回复的话题", "check", "群里未触发机器人或回复尚未送达，也可使用本人参与的原始消息片段。", { full: true }),
+    field("plugins.ai.context.cross_scene", "跨场景使用范围", "select", "同时约束话题、个人记忆及派生材料；QQ 提及不会扩大读取范围。", { choices: [["private_followup", "群聊可接到本人私聊（默认）"], ["same_scope", "仅原群或原私聊"], ["shared", "同一用户跨群和私聊共享"]], full: true }),
     field("plugins.ai.context.recent_seconds", "近期问答有效期（秒）", "number", "默认 7200 秒，即最近 2 小时；最多保留 7 天的接续范围。", { min: 60, max: 604800 }),
-    field("plugins.ai.context.max_turns", "最多召回问答轮数", "number", "默认 3 轮；只读取已经成功发送的完整问答。", { min: 1, max: 32 }),
+    field("plugins.ai.context.max_turns", "最多召回话题片段数", "number", "默认 3 段；先保留核心内容，再分配前后文预算。机器人回答必须确认发送。", { min: 1, max: 32 }),
     field("plugins.ai.context.neighbors_before", "核心问答之前的群消息数", "number", "默认前 10 条。设为 0 不读取前文。", { min: 0, max: 50 }),
     field("plugins.ai.context.neighbors_after", "核心问答之后的群消息数", "number", "默认后 5 条。设为 0 不读取后文，始终截止于当前请求之前。", { min: 0, max: 50 }),
     field("plugins.ai.context.neighbor_seconds", "前后文各自时间窗口（秒）", "number", "同时限制数量和时间，默认向前、向后各 120 秒；重叠背景会去重。", { min: 1, max: 3600, full: true }),
@@ -86,8 +89,10 @@
     field("plugins.ai.context.neighbor_budget", "群聊背景预算上限（估算）", "number", "默认 1500，包含在近期问答预算内，不能超过近期问答预算。设为 0 停止注入背景；空间不足时先减少背景。", { min: 0, max: 64000 }),
   ];
   const groups = [
-    { title: "模型接口", description: "兼容 Chat Completions 的远程 API；获取模型列表不会保存密钥或发送聊天请求。", models: true, fields: [
+    { title: "模型接口", description: "支持 Chat Completions 和 Responses API；获取模型列表不会保存密钥或发送聊天请求。", models: true, fields: [
+      field("llm.protocol", "请求协议", "select", "聊天、图片识别、个人记忆整理和经验学习使用所选协议；切换后请核对接口地址。", { choices: [["chat_completions", "Chat Completions"], ["responses", "Responses API"]] }),
       field("llm.chat_completions_url", "API 地址", "text", "可填写基础地址或 /v1 后获取模型列表，成功后补全聊天接口路径。直接手填模型时，请使用服务商的完整聊天接口地址。", { full: true, placeholder: "https://…/v1 或 https://…/v1/chat/completions" }),
+      field("llm.responses_url", "Responses API 地址", "text", "获取模型列表后补全 /responses 路径；直接手填模型时使用完整地址。未选中协议的地址保留。", { full: true, placeholder: "https://…/v1/responses" }),
       { secret: "llm_api_key", label: "模型 API 密钥" },
       field("llm.model", "手动填写模型名称", "text", "使用服务商提供的准确模型 ID；获取列表不会替换当前模型。"),
       field("llm.max_concurrent_requests", "最大并发请求", "number", "前台聊天和后台整理共用请求额度。", { min: 1 }),
@@ -125,6 +130,11 @@
     ] },
     { title: "自动接话", description: "全局策略仅用于已在「群与好友」单独开启自动接话的聊天；每个群聊和私聊默认关闭。保存并应用后生效。真实 @、关键词和引用机器人消息的明确触发仍优先，不受自动接话的合并等待与冷却限制。", autoReply: true, fields: autoReplyFields },
     { title: "跨会话接续", description: "以完整问答为核心，按需附带前 10 条、后 5 条群聊消息。数量、时间和预算都可以调整；召回资料保留来源隔离。", fields: contextFields },
+    { title: "人物与关系", description: "个人档案按机器人账号与真实 QQ 关联；关系另按稳定角色隔离，不随人设文案变化重置。", fields: [
+      field("plugins.ai.personal.enabled", "启用个人关系", "check", "从确认交流积累熟悉程度，从有依据的明确表达学习称呼、互动偏好和边界。"),
+      field("plugins.ai.personal.character_id", "稳定角色 ID", "text", "默认 default。1–64 个字母、数字、下划线或连字符；只有独立角色才更换。"),
+      field("plugins.ai.personal.injection_budget", "个人关系输入上限", "number", "计入普通输入预算；0 暂停注入。", { min: 0, max: 8000 }),
+    ] },
     { title: "学习笔记", description: "独立记录同一机器人账号的群聊交流经验，不替代个人记忆，也不从私聊取材。可在「学习笔记」页人工管理、锁定和查看历史；来源被遗忘的内容不能通过回滚复活。", fields: learningFields },
     { title: "人设", description: "从列表选择默认人设，也可编辑自定义内容。会话可单独选择已保存的人设。", personas: true, fields: [
       field("plugins.ai.defaults.persona", "默认人设", "persona", "选择后随配置一起保存；下方可预览模板和编辑自定义人设。", { full: true }),
@@ -182,6 +192,11 @@
       field("plugins.ai.compact_idle_secs", "闲置整理等待（秒）", "number", "", { min: 1 }),
       field("plugins.ai.memory_input_budget", "整理输入预算（估算）", "number", "默认 8000，供后台提炼与摘要整理使用；普通聊天的输入预算单独配置。", { min: 3072, max: 262144 }),
       field("plugins.ai.memory_output_budget", "整理输出 token 上限", "number", "", { min: 256, max: 8192 }),
+      field("plugins.ai.compaction.summary_budget", "话题摘要预算（估算）", "number", "独立限制摘要大小；保存参与者、结论、待办和来源。整理输入过小时自动限制到可读回范围。", { min: 256, max: 32768 }),
+      field("plugins.ai.compaction.trigger_percent", "压缩触发占用（%）", "number", "按裁剪前的文字输入估算触发后台整理，前台对话优先。", { min: 50, max: 90 }),
+      field("plugins.ai.compaction.target_percent", "压缩目标占用（%）", "number", "须低于触发比例；关键问题和最近完整轮次优先保留。", { min: 20, max: 89 }),
+      field("plugins.ai.compaction.min_recent_messages", "压缩后至少保留原文条数", "number", "完整问答不拆开；不超过会话的最近消息上限。", { min: 2, max: 128 }),
+      field("plugins.ai.compaction.min_interval_seconds", "摘要压缩最短间隔（秒）", "number", "只约束摘要压缩，不延迟独立记忆提炼。", { min: 30, max: 3600 }),
       field("plugins.ai.max_memories_per_conversation", "长期记忆存储容量", "number", "全域共享开启时按同一机器人账号内每个 QQ 计；关闭时按来源会话计。降低容量不会删除已有记忆。", { min: 1 }),
       field("plugins.ai.memory_recall_limit", "每轮最多召回记忆", "number", "", { min: 1 }),
       field("plugins.ai.memory_recall_budget", "召回记忆预算（估算）", "number", "", { min: 64 }),
@@ -311,7 +326,12 @@
     state.models.version++; state.models.items = []; state.models.manual = true; state.models.message = ""; state.models.kind = "";
     renderModels();
   }
+  function modelProtocol() { return inputs.get("llm.protocol")?.control.value || "chat_completions"; }
+  function modelEndpointPath() { return modelProtocol() === "responses" ? "llm.responses_url" : "llm.chat_completions_url"; }
   function renderModels() {
+    for (const path of ["llm.chat_completions_url", "llm.responses_url"]) {
+      const field = inputs.get(path); if (field) field.wrapper.hidden = path !== modelEndpointPath();
+    }
     const model = inputs.get("llm.model"), list = $("model-list"), current = model?.control.value || "";
     list.replaceChildren();
     if (!state.models.items.includes(current)) {
@@ -330,7 +350,8 @@
   function modelsCurrent(request) {
     try {
       return state.authenticated && state.session === request.session && state.models.version === request.version && state.revision === request.revision
-        && inputs.get("llm.chat_completions_url")?.control.value.trim() === request.url
+        && modelProtocol() === request.protocol
+        && inputs.get(modelEndpointPath())?.control.value.trim() === request.url
         && canonical(secretChange(secretInputs.get("llm_api_key"))) === request.key;
     } catch { return false; }
   }
@@ -338,19 +359,20 @@
     if (!state.authenticated || !state.config || state.models.loading || state.busy || state.jsonDirty || state.pendingOperation || state.stale) return;
     let request;
     try {
-      const url = inputs.get("llm.chat_completions_url").control.value.trim(), key = secretChange(secretInputs.get("llm_api_key"));
+      const url = inputs.get(modelEndpointPath()).control.value.trim(), key = secretChange(secretInputs.get("llm_api_key"));
       if (!url) throw new Error("请先填写 API 地址。");
-      request = { session: state.session, version: state.models.version, revision: state.revision, url, key: canonical(key) };
+      request = { session: state.session, version: state.models.version, revision: state.revision, protocol: modelProtocol(), url, key: canonical(key) };
       state.models.loading = true; state.models.message = ""; state.models.kind = ""; renderModels();
       const result = await api("/api/llm/models", "POST", { revision: request.revision, url, api_key: key });
       if (!modelsCurrent(request)) return;
       const ids = result.models;
       if (!Array.isArray(ids) || ids.length > 4096 || ids.some((id) => typeof id !== "string" || !id || id.trim() !== id || new TextEncoder().encode(id).length > 256 || /[\p{Cc}]/u.test(id))) throw new Error("服务返回的模型列表格式无效，请手动填写模型名称。");
-      const endpoint = new URL(result.chat_completions_url), origin = new URL(url);
+      const endpointUrl = request.protocol === "responses" ? result.responses_url : result.chat_completions_url;
+      const endpoint = new URL(endpointUrl), origin = new URL(url);
       if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.origin !== origin.origin || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error("服务返回的聊天接口地址无效，原地址已保留。");
       state.models.items = [...new Set(ids)]; state.models.manual = !ids.length;
-      const control = inputs.get("llm.chat_completions_url").control;
-      if (control.value !== result.chat_completions_url) { control.value = result.chat_completions_url; markDirty(); }
+      const control = inputs.get(modelEndpointPath()).control;
+      if (control.value !== endpointUrl) { control.value = endpointUrl; markDirty(); }
       const source = { temporary: "本次使用填写的新密钥。", environment: "本次使用环境变量中的密钥。", file: "本次使用已保存密钥。", none: "本次未使用密钥。" }[result.key_source] || "";
       state.models.message = (ids.length ? `已获取 ${state.models.items.length} 个模型，请从列表选择；当前模型保持不变。` : "服务未返回可用模型，请手动填写模型名称。") + source
         + (result.environment_overrides_saved_key ? " 保存后，环境变量仍优先于文件中的密钥。" : "");
@@ -644,7 +666,7 @@
     control.addEventListener("input", () => {
       error.hidden = true; error.textContent = ""; control.removeAttribute("aria-invalid");
       control.setAttribute("aria-describedby", hint.id);
-      if (definition.path === "llm.chat_completions_url") invalidateModels();
+      if (["llm.chat_completions_url", "llm.responses_url", "llm.protocol"].includes(definition.path)) invalidateModels();
       if (definition.path === "llm.model") renderModels();
       if (definition.path.startsWith("embedding.")) invalidateEmbeddingTest();
       if (definition.path.startsWith("plugins.web_search.")) invalidateSearchTest();
@@ -905,18 +927,23 @@
   }
 
   function validateContext(config) {
+    const personal = get(config, "plugins.ai.personal");
+    if (personal && (typeof personal.enabled !== "boolean" || !/^[A-Za-z0-9_-]{1,64}$/u.test(personal.character_id) || !Number.isSafeInteger(personal.injection_budget) || personal.injection_budget < 0 || personal.injection_budget > 8000)) throw new Error("人物与关系配置无效，请检查角色 ID 与预算。");
     const policy = get(config, "plugins.ai.context");
     if (!policy || typeof policy.enabled !== "boolean") throw new Error("跨会话接续配置不完整，请重新载入配置。");
+    if (typeof policy.include_unanswered !== "boolean" || !["private_followup", "same_scope", "shared"].includes(policy.cross_scene)) throw new Error("跨场景策略配置无效，请重新载入配置。");
     for (const def of contextFields.filter((entry) => entry.type === "number")) {
       const value = get(config, def.path);
       if (!Number.isSafeInteger(value) || value < def.min || value > def.max) throw new Error(`「${def.label}」需要填写 ${def.min}–${def.max} 范围内的整数。`);
     }
     if (policy.neighbor_budget > policy.recall_budget) throw new Error("群聊背景预算不能超过近期问答预算。");
+    const compaction = config.plugins.ai.compaction;
+    if (compaction && compaction.target_percent >= compaction.trigger_percent) throw new Error("压缩目标占用必须低于触发占用。");
   }
 
   function configGroupCategory(group) {
     if (group.fields === contextFields) return "context";
-    if (["学习笔记", "上下文与记忆"].includes(group.title)) return "knowledge";
+    if (["学习笔记", "上下文与记忆", "人物与关系"].includes(group.title)) return "knowledge";
     if (["人设", "会话与触发", "自动接话"].includes(group.title)) return "conversation";
     if (["模型接口", "向量接口（Embedding）", "Milky 消息接口", "QQ 登录管理"].includes(group.title)) return "connection";
     return "tools";
@@ -1222,6 +1249,7 @@
     }
     if (state.learning.snapshot && status.online && status.bot_id != null && state.learning.snapshot.bot_id !== String(status.bot_id)) { invalidateLearning(); state.learning.conflict = Boolean(state.learning.dirty); state.learning.message = "机器人账号已变化，请刷新学习笔记。"; renderLearning(); }
     if (state.context.snapshot && status.online && status.bot_id != null && state.context.snapshot.bot_id !== String(status.bot_id)) { invalidateContextOverview(); state.context.message = "机器人账号已变化，请刷新接续记录。"; renderContextOverview(); }
+    if (state.personal.snapshot && status.online && status.bot_id != null && state.personal.snapshot.bot_id !== String(status.bot_id)) invalidatePersonal();
     const contacts = state.contacts;
     if ((contacts.botId || contacts.loading) && ((contacts.generation != null && status.runtime_generation != null && contacts.generation !== status.runtime_generation) || (contacts.botId && status.online && status.bot_id != null && String(status.bot_id) !== contacts.botId))) {
       invalidateContacts("机器人连接或账号已变化，请刷新联系人列表。");
@@ -1948,7 +1976,7 @@
       else notice("当前状态：" + String(state.status.phase) + "。请稍后再次查询。", "warning");
     }
   }
-  const knowledgeViews = ["context", "memory", "learning"];
+  const knowledgeViews = ["context", "memory", "personal", "learning"];
   function invalidateContextOverview() {
     const context = state.context;
     context.version++; context.loading = false; context.snapshot = null; context.message = "";
@@ -1960,14 +1988,25 @@
       || ["turns", "memories", "notes"].some((key) => !Number.isSafeInteger(value.counts[key]) || value.counts[key] < 0)
       || !Array.isArray(value.recent) || value.recent.length > 100 || (value.message != null && typeof value.message !== "string")) throw new Error("接续概览格式无效，请刷新核对。");
     validateContext({ plugins: { ai: { context: value.config } } });
+    if (value.counts.episodes != null && (!Number.isSafeInteger(value.counts.episodes) || value.counts.episodes < 0)) throw new Error("话题数量格式无效。");
     const ids = new Set();
     for (const turn of value.recent) {
-      if (!turn || !Number.isSafeInteger(turn.id) || turn.id < 1 || ids.has(turn.id) || !contactId(turn.user_id) || !contactId(turn.peer_id)
+      const kind = turn?.kind || "turn", id = `${kind}:${turn?.id}`;
+      if (!turn || !["turn", "episode"].includes(kind) || !Number.isSafeInteger(turn.id) || turn.id < 1 || ids.has(id) || !contactId(turn.user_id) || !contactId(turn.peer_id)
         || !["group", "friend"].includes(turn.scene) || typeof turn.conversation_id !== "string" || !Number.isSafeInteger(turn.completed_at)
-        || typeof turn.request_key !== "string" || typeof turn.reply_key !== "string"
+        || typeof turn.request_key !== "string" || (kind === "episode" ? turn.reply_key !== null : typeof turn.reply_key !== "string")
         || ["user_text", "assistant_text"].some((key) => turn[key] != null && typeof turn[key] !== "string")) throw new Error("问答来源格式无效，请刷新核对。");
       if (!turn.conversation_id.startsWith(`${value.bot_id}:${turn.scene}:${turn.peer_id}:`)) throw new Error("问答来源会话与当前账号不一致，请刷新核对。");
-      ids.add(turn.id);
+      ids.add(id);
+    }
+    if (value.learning_batches != null) {
+      if (!Array.isArray(value.learning_batches) || value.learning_batches.length > 20) throw new Error("记忆整理状态格式无效。");
+      for (const batch of value.learning_batches) {
+        if (!batch || typeof batch.conversation_id !== "string" || !value.bot_id || !batch.conversation_id.startsWith(value.bot_id + ":")
+          || !["complete", "retry", "needs_review"].includes(batch.status) || typeof batch.summary_reason !== "string"
+          || ["epoch", "start_position", "through_position", "attempts", "rejected_count", "updated_at"].some((key) => !Number.isSafeInteger(batch[key]) || batch[key] < 0)
+          || (batch.reasons != null && (!Array.isArray(batch.reasons) || batch.reasons.length > 32 || batch.reasons.some((r) => typeof r !== "string" || r.length > 64)))) throw new Error("记忆整理状态格式无效。");
+      }
     }
     if (value.bot_id === null && value.recent.length) throw new Error("尚未确认机器人账号，不能展示问答来源。");
   }
@@ -1980,8 +2019,9 @@
   function renderContextOverview() {
     const context = state.context, snapshot = context.snapshot, policy = snapshot?.config;
     badge("context-enabled", !snapshot ? "待同步" : snapshot.enabled ? "已开启" : "已关闭", !snapshot ? "neutral" : snapshot.enabled ? "good" : "neutral");
-    $("context-window").textContent = policy ? `最近 ${contextDuration(policy.recent_seconds)} · ${policy.max_turns} 轮问答` : "等待同步已应用设置";
-    $("context-window-detail").textContent = snapshot ? `当前运行配置${snapshot.bot_id ? " · 机器人 QQ " + snapshot.bot_id : " · 尚未确认机器人账号"}。群聊与私聊按同一用户接续。` : "读取当前运行配置后，展示接续范围与来源。";
+    $("context-window").textContent = policy ? `最近 ${contextDuration(policy.recent_seconds)} · ${policy.max_turns} 段话题` : "等待同步已应用设置";
+    const audience = { private_followup: "群聊可接到本人私聊", same_scope: "仅原场景", shared: "同一用户跨群和私聊共享" };
+    $("context-window-detail").textContent = snapshot ? `当前运行配置${snapshot.bot_id ? " · 机器人 QQ " + snapshot.bot_id : " · 尚未确认机器人账号"}。${audience[policy?.cross_scene] || audience.private_followup}；${policy?.include_unanswered === false ? "仅完整问答" : "包含未回复话题"}。` : "读取当前运行配置后，展示接续范围与来源。";
     $("context-neighbors").textContent = policy ? `群聊背景 · 前 ${policy.neighbors_before} / 后 ${policy.neighbors_after} 条` : "群聊背景 · 待同步";
     $("context-time-window").textContent = policy ? `前后各 ${contextDuration(policy.neighbor_seconds)}` : "时间范围 · 待同步";
     const saved = state.config?.plugins?.ai;
@@ -1996,14 +2036,21 @@
     $("refresh-context-overview").textContent = context.loading ? "正在同步…" : "刷新记录";
     $("context-overview-message").textContent = context.message || (context.loading ? "正在读取当前账号的问答来源…" : snapshot?.message || "");
     $("context-counts").replaceChildren(); $("context-recent-list").replaceChildren();
+    $("context-learning-state").replaceChildren();
     if (!snapshot) return;
-    for (const [key, name, detail] of [["turns", "预览问答", "本次读取的有效记录"], ["memories", "个人记忆", "事实、偏好、任务与事件"], ["notes", "经验笔记", "交流经验、纠正与用语"]]) {
+    for (const [key, name, detail] of [["turns", "预览问答", "本次读取的有效记录"], ["episodes", "话题原文", "尚未形成完整问答的片段"], ["memories", "个人记忆", "事实、偏好、任务与事件"], ["notes", "经验笔记", "交流经验、纠正与用语"]]) {
       const item = element("div", "context-count"), copy = element("div");
       copy.append(element("span", "", name), element("p", "hint", detail));
-      item.append(element("strong", "", snapshot.counts[key].toLocaleString("zh-CN")), copy); $("context-counts").append(item);
+      item.append(element("strong", "", (snapshot.counts[key] || 0).toLocaleString("zh-CN")), copy); $("context-counts").append(item);
+    }
+    const failures = snapshot.learning_batches || [];
+    $("context-learning-state").append(element("p", "hint", failures.length ? "有效记忆已独立保存。下列批次仍有待处理结果；达到 3 次尝试后保留诊断，可在个人记忆中核对并按需重建来源。" : "近期没有待重试或待核对的个人记忆批次。"));
+    for (const batch of failures) {
+      const status = batch.status === "needs_review" ? "待核对" : batch.status === "retry" ? "等待重试" : "摘要待重试";
+      $("context-learning-state").append(element("p", "", `${batch.conversation_id} · ${status} · 已尝试 ${batch.attempts} 次 · 未通过 ${batch.rejected_count} 项${batch.summary_reason ? " · 摘要：" + batch.summary_reason : ""}${batch.reasons?.length ? " · 原因：" + batch.reasons.join("、") : ""}`));
     }
     if (!snapshot.recent.length) {
-      $("context-recent-list").append(element("div", "context-empty", snapshot.bot_id ? "还没有可预览的问答。机器人成功发送回复后，会在这里显示对应的来源记录。" : "连接机器人后，这里会显示当前 QQ 账号的近期问答。"));
+      $("context-recent-list").append(element("div", "context-empty", snapshot.bot_id ? "还没有可预览的话题。记录到可用发言后，会在这里显示对应的来源。" : "连接机器人后，这里会显示当前 QQ 账号的近期话题。"));
       return;
     }
     for (const turn of snapshot.recent) {
@@ -2012,9 +2059,10 @@
       const meta = element("span", "context-turn-meta", `用户 ${turn.user_id} · ${dateText(turn.completed_at)}`);
       heading.append(source, meta, element("span", "context-turn-expand", "查看来源")); item.append(heading);
       const body = element("div", "context-turn-body"), tags = element("div", "source-tags");
-      tags.append(element("span", "", "机器人 " + snapshot.bot_id), element("span", "", "会话 " + turn.conversation_id), element("span", "", "已完成问答 #" + turn.id));
+      tags.append(element("span", "", "机器人 " + snapshot.bot_id), element("span", "", "会话 " + turn.conversation_id), element("span", "", (turn.kind === "episode" ? "话题片段 #" : "已完成问答 #") + turn.id));
       body.append(tags);
       for (const [title, text, key] of [["用户原文", turn.user_text, turn.request_key], ["机器人回复", turn.assistant_text, turn.reply_key]]) {
+        if (turn.kind === "episode" && !key) continue;
         const quote = element("div", "context-quote");
         quote.append(element("span", "section-label", title), element("p", "", text == null ? "原文当前不可用。" : text || "（无文字内容）"), element("code", "source-key", key)); body.append(quote);
       }
@@ -2041,8 +2089,83 @@
     } finally { if (current()) { context.loading = false; renderContextOverview(); } }
   }
 
+  function invalidatePersonal() {
+    const p = state.personal; p.version++; p.snapshot = null; p.loading = false; p.saving = false; p.editing = null; p.message = "";
+    $("personal-edit-value").value = ""; renderPersonal();
+  }
+  const personalCurrent = (version, session) => state.authenticated && state.view === "personal" && state.personal.version === version && state.session === session;
+  function validatePersonal(value, selected) {
+    const positive = (n) => Number.isSafeInteger(n) && n > 0;
+    if (!value || !/^[1-9][0-9]*$/u.test(value.bot_id) || !/^[A-Za-z0-9_-]{1,64}$/u.test(value.character_id) || typeof value.enabled !== "boolean" || !positive(value.page) || !positive(value.total_pages) || !Array.isArray(value.people) || value.people.length > 20 || value.people.some((id) => typeof id !== "string" || !/^[1-9][0-9]*$/u.test(id))) throw new Error("人物档案格式无效。");
+    if (state.status?.online && state.status.bot_id != null && String(state.status.bot_id) !== value.bot_id) throw new Error("机器人账号已变化，请刷新档案。");
+    if (!selected) { if (value.profile !== null) throw new Error("返回了未请求的人物。"); return; }
+    const p = value.profile;
+    if (!p || p.user_id !== selected || !Number.isSafeInteger(p.revision) || p.revision < 0 || !Array.isArray(p.events) || p.events.length > 192 || !Array.isArray(p.memories) || p.memories.length > 100) throw new Error("人物或关系版本无效。");
+    const scope = (s) => typeof s === "string" && new RegExp(`^${value.bot_id}:(group|friend):[1-9][0-9]*$`, "u").test(s);
+    const ids = new Set();
+    for (const e of p.events) {
+      if (!positive(e.id) || ids.has(e.id) || !positive(e.version) || !["interaction", "address", "style", "boundary"].includes(e.kind) || typeof e.value !== "string" || e.value.length > 640 || typeof e.quote !== "string" || !scope(e.scope) || typeof e.source_key !== "string" || !e.source_key.startsWith(e.scope + ":") || !Number.isSafeInteger(e.occurred_at)) throw new Error("关系记录的来源或内容无效。");
+      ids.add(e.id);
+    }
+    for (const m of p.memories) if (!positive(m.id) || typeof m.text !== "string" || !scope(m.scope) || typeof m.kind !== "string" || typeof m.active !== "boolean") throw new Error("个人记忆格式无效。");
+  }
+  async function loadPersonal(selected = state.personal.selected) {
+    const p = state.personal;
+    if (p.saving || !state.authenticated) return;
+    if (selected && !/^[1-9][0-9]*$/u.test(selected)) { p.message = "请输入有效 QQ 号。"; renderPersonal(); return; }
+    const version = ++p.version, session = state.session, bot = p.snapshot?.bot_id;
+    p.selected = selected; p.snapshot = null; p.editing = null; p.loading = true; p.message = ""; renderPersonal();
+    const query = new URLSearchParams({ page: String(p.page) });
+    if (selected) query.set("user_id", selected); if (bot) query.set("bot_id", bot);
+    try {
+      const value = await api("/api/personal?" + query);
+      if (!personalCurrent(version, session)) return;
+      validatePersonal(value, selected); p.snapshot = value;
+    } catch (error) { if (personalCurrent(version, session)) p.message = error.message || "读取个人档案失败。"; }
+    finally { if (personalCurrent(version, session)) { p.loading = false; renderPersonal(); } }
+  }
+  function renderPersonal() {
+    const p = state.personal, s = p.snapshot, profile = s?.profile;
+    $("personal-account").textContent = s ? `机器人 ${s.bot_id} · 角色 ${s.character_id} · ${s.enabled ? "已启用" : "已停用"}` : "读取服务器确认的机器人账号与角色后显示档案。";
+    $("personal-message").textContent = p.loading ? "正在读取人物档案…" : p.message;
+    $("refresh-personal").disabled = p.loading || p.saving || !state.authenticated;
+    $("personal-prev").disabled = !s || s.page <= 1 || p.saving; $("personal-next").disabled = !s || s.page >= s.total_pages || p.saving;
+    $("personal-page").textContent = s ? `第 ${s.page} / ${s.total_pages} 页` : "";
+    $("personal-people").replaceChildren();
+    for (const id of s?.people || []) { const b = element("button", "button secondary", `QQ ${id}`); b.type = "button"; b.disabled = p.saving; b.addEventListener("click", () => { $("personal-user").value = id; void loadPersonal(id); }); $("personal-people").append(b); }
+    $("personal-profile").hidden = !profile; $("personal-editor").hidden = !p.editing; $("personal-save").disabled = p.saving;
+    $("personal-preferences").replaceChildren(); $("personal-experiences").replaceChildren(); $("personal-memories").replaceChildren();
+    if (!profile) return;
+    $("personal-person").textContent = `QQ ${profile.user_id}`; $("reset-personal").disabled = p.saving;
+    const names = { address: "称呼", style: "互动偏好", boundary: "边界", interaction: "已确认的直接交流" };
+    for (const e of profile.events) {
+      const card = element("div", "context-fragment"), title = element("p", "", names[e.kind] + (e.corrected ? " · 管理员修订" : ""));
+      card.append(title, element("p", "", e.value), element("p", "hint", `${e.scope} · ${new Date(e.occurred_at * 1000).toLocaleString()} · ${e.source_key}`));
+      if (e.quote) card.append(element("p", "hint", "来源原文：“" + e.quote + "”"));
+      if (e.kind !== "interaction") { const edit = element("button", "text-button accent", "纠正"); edit.type = "button"; edit.disabled = p.saving; edit.addEventListener("click", () => { p.editing = e; $("personal-edit-value").value = e.value; $("personal-editor").hidden = false; }); card.append(edit); }
+      const remove = element("button", "text-button danger-text", "删除这条关系记录"); remove.type = "button"; remove.disabled = p.saving; remove.addEventListener("click", () => { if (window.confirm("删除此关系记录？事实记忆仍由个人记忆管理。")) void mutatePersonal({ op: "delete", id: e.id, version: e.version }); }); card.append(remove);
+      $(e.kind === "interaction" ? "personal-experiences" : "personal-preferences").append(card);
+    }
+    if (!profile.events.some((e) => e.kind !== "interaction")) $("personal-preferences").append(element("p", "hint", "暂无有来源的称呼、偏好或边界记录。"));
+    if (!profile.events.some((e) => e.kind === "interaction")) $("personal-experiences").append(element("p", "hint", "暂无可用的已确认交流。"));
+    for (const m of profile.memories) { const card = element("div", "context-fragment"); card.append(element("p", "", m.text), element("p", "hint", `#${m.id} · ${m.kind} · ${m.scope} · ${m.active ? "启用" : "停用"}`)); $("personal-memories").append(card); }
+  }
+  async function mutatePersonal(action) {
+    const p = state.personal, snapshot = p.snapshot, profile = snapshot?.profile;
+    if (!profile || p.saving) return;
+    const version = p.version, session = state.session;
+    p.saving = true; p.message = "正在保存关系记录…"; renderPersonal();
+    try {
+      const result = await api("/api/personal/mutate", "POST", { bot_id: snapshot.bot_id, user_id: profile.user_id, character_id: snapshot.character_id, revision: profile.revision, request_id: requestId(), action });
+      if (result.status !== "applied" || result.bot_id !== snapshot.bot_id || result.user_id !== profile.user_id || result.character_id !== snapshot.character_id || !Number.isSafeInteger(result.revision) || result.revision <= profile.revision) throw new Error("关系修改响应不匹配。");
+      if (!personalCurrent(version, session)) return;
+      p.saving = false; p.editing = null; await loadPersonal(profile.user_id);
+    } catch (error) { if (personalCurrent(version, session)) { p.message = (error.message || "保存结果未确认。") + " 请刷新核对后再操作。"; p.saving = false; renderPersonal(); } }
+  }
+
   function showView(view) {
-    if (!["overview", "qq", "contacts", "config", "context", "memory", "learning", "stickers"].includes(view)) return;
+    if (!["overview", "qq", "contacts", "config", "context", "memory", "personal", "learning", "stickers"].includes(view)) return;
+    if (state.view === "personal" && view !== "personal") invalidatePersonal();
     if (state.view === "contacts" && view !== "contacts") invalidateContacts();
     if (state.view === "stickers" && view !== "stickers") invalidateStickers();
     if (state.view === "learning" && view !== "learning") invalidateLearning();
@@ -2052,15 +2175,16 @@
     document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view || node.dataset.view === "context" && knowledgeViews.includes(view); node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
     document.querySelectorAll(".workspace-tab").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
     $("knowledge-header").hidden = !knowledgeViews.includes(view);
-    $("page-name").textContent = "工作空间 / " + ({ overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "设置与人设", context: "上下文与知识", memory: "上下文与知识", learning: "上下文与知识", stickers: "图库管理" }[view]);
+    $("page-name").textContent = "工作空间 / " + ({ overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "设置与人设", context: "上下文与知识", memory: "上下文与知识", personal: "上下文与知识", learning: "上下文与知识", stickers: "图库管理" }[view]);
     if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
     if (view === "qq") scheduleQq(0);
     if (view === "contacts" && state.contacts.phase !== "ready") void loadContacts();
     if (view === "stickers") void refreshStickers();
     if (view === "learning") void loadLearning();
     if (view === "context") void loadContextOverview();
+    if (view === "personal") void loadPersonal();
   }
-  const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty || state.learning.dirty;
+  const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty || state.learning.dirty || Boolean(state.personal.editing);
   function authView(result) {
     state.authenticated = Boolean(result.authenticated); state.csrf = result.csrf_token || ""; state.setupRequired = Boolean(result.setup_required);
     $("setup-code-field").hidden = !state.setupRequired; $("setup-confirm-field").hidden = !state.setupRequired;
@@ -2082,6 +2206,7 @@
     invalidateContacts(); state.contacts.query = ""; $("contacts-search").value = "";
     invalidateStickers(true);
     invalidateLearning(true);
+    invalidatePersonal(); state.personal.selected = ""; state.personal.page = 1; $("personal-user").value = "";
     invalidateContextOverview();
     $("config-fields").append($("persona-manager"), $("model-picker"));
     inputs.clear(); secretInputs.clear(); $("config-groups").replaceChildren(); $("config-json").value = "";
@@ -2254,6 +2379,18 @@
   }
   function renderContext(detail) {
     $("context-content").replaceChildren(element("p", "hint", "当前有效上下文 " + detail.context_count + " 条 · 摘要" + (detail.settings.summary ? "启用" : "未启用")));
+    let document; try { document = JSON.parse(detail.summary); } catch { /* legacy text */ }
+    if (Array.isArray(document?.topics) && document.topics.length && document.topics.every((topic) => topic && typeof topic === "object")) {
+      for (const topic of document.topics) {
+        const card = element("article", "context-card");
+        card.append(element("h3", "", String(topic.title || "话题")), element("p", "hint", "参与者：" + (Array.isArray(topic.participants) ? topic.participants.join("、") : "—")), element("p", "", String(topic.summary || "")));
+        for (const [key, label] of [["decisions", "结论"], ["open_questions", "未完成事项"], ["key_details", "关键原文"], ["sources", "来源"]]) {
+          if (Array.isArray(topic[key]) && topic[key].length) card.append(element("p", "source-text", label + "：\n" + topic[key].map(String).join("\n")));
+        }
+        $("context-content").append(card);
+      }
+      return;
+    }
     $("context-content").append(element("pre", "source-text", detail.summary || "尚无摘要。"));
   }
   async function loadContext() {
@@ -2543,6 +2680,13 @@
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelectorAll("[data-config-category]").forEach((button) => button.addEventListener("click", () => filterConfig(button.dataset.configCategory)));
   document.querySelectorAll("[data-config-section]").forEach((button) => button.addEventListener("click", () => openConfigSection(button.dataset.configSection)));
+  $("refresh-personal").addEventListener("click", () => { void loadPersonal(); });
+  $("personal-search").addEventListener("submit", (event) => { event.preventDefault(); void loadPersonal($("personal-user").value.trim()); });
+  $("personal-prev").addEventListener("click", () => { state.personal.page = Math.max(1, state.personal.page - 1); void loadPersonal(); });
+  $("personal-next").addEventListener("click", () => { state.personal.page++; void loadPersonal(); });
+  $("personal-cancel").addEventListener("click", () => { state.personal.editing = null; renderPersonal(); });
+  $("personal-edit-form").addEventListener("submit", (event) => { event.preventDefault(); const e = state.personal.editing; if (e) void mutatePersonal({ op: "correct", id: e.id, version: e.version, value: $("personal-edit-value").value.trim() }); });
+  $("reset-personal").addEventListener("click", () => { if (window.confirm("重置此用户与当前角色的关系？称呼、边界和共同交流记录将清除，个人事实仍保留。")) void mutatePersonal({ op: "reset" }); });
   $("refresh-context-overview").addEventListener("click", () => { void loadContextOverview(); });
   document.querySelector(".brand").addEventListener("click", (event) => { event.preventDefault(); showView("overview"); });
   $("config-form").addEventListener("submit", (event) => event.preventDefault());

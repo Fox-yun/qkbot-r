@@ -180,6 +180,20 @@ async fn disabled_scope_releases_background_slot_without_cancelling_other_scopes
     interrupted.abort();
     assert!(interrupted.await.unwrap_err().is_cancelled());
     assert!(host.llm.as_ref().unwrap().has_capacity());
+    // Cancellation releases the slot immediately, but the new per-conversation
+    // compression cooldown still prevents a hot loop of model requests.
+    completed(compact(&chat)).await;
+    assert!(observed.try_recv().is_err());
+    host.store
+        .call(|db| {
+            db.execute(
+                "UPDATE ai_context_compaction SET last_attempt_at=0 WHERE conversation_id=?1",
+                [conversation(4)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let final_task = compact(&chat);
     let shutdown_request = next_request(&mut observed).await;
     assert_eq!(shutdown_request.conversation(), conversation(4));
