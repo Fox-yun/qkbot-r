@@ -454,6 +454,12 @@ async fn reviewed_notes_wait_for_an_administrator_and_mutations_are_idempotent()
             let snapshot = snapshot(db, 1, &Filter::default())?;
             assert_eq!(snapshot["items"].as_array().unwrap().len(), 1);
             assert!(snapshot["outcomes"]["periods"].is_array());
+            let sources = snapshot["items"][0]["sources"].as_array().unwrap();
+            let source = sources.iter().find(|s| s["source_key"] == "1:group:50:3").unwrap();
+            assert_eq!(source["messages"][0]["scope"], "1:group:50");
+            assert_eq!(source["messages"][0]["message_seq"], "3");
+            assert!(source["messages"][0]["sender_id"].is_string());
+            assert_eq!(source["messages"][0]["quote"], "燕尾服笑死");
             Ok(())
         })
         .await
@@ -508,6 +514,17 @@ async fn impressions_follow_the_exact_fact_versions_and_their_audience() {
                 {"text":"引用不存在的记忆","memory_ids":[ids[0], 9999]}
             ]}))?;
             assert_eq!(stored, 1);
+            let view = snapshot(db, 1, &Filter::default())?;
+            assert_eq!(view["items"][0]["item"]["subject_id"], 7);
+            let sources: Vec<_> = view["items"][0]["sources"].as_array().unwrap().iter()
+                .filter(|source| source["role"] == "memory").collect();
+            assert_eq!(sources.len(), 2);
+            for source in sources {
+                assert_eq!(source["subject_id"], "7");
+                assert_eq!(source["messages"][0]["scope"], "1:friend:7");
+                assert_eq!(source["messages"][0]["sender_id"], "7");
+                assert!(source["messages"][0]["received_at"].is_i64());
+            }
             let texts = recall_texts(db, &friend, 7, CrossScenePolicy::PrivateFollowup)?;
             assert!(texts.iter().any(|t| t.contains("人物印象") && t.contains("备考")));
             // Private facts do not reach a group, even for the same person.
@@ -531,4 +548,47 @@ fn bonus_reranking_keeps_order_without_statistics() {
     let db = Connection::open_in_memory().unwrap();
     let items = vec![3, 1, 2];
     assert_eq!(stats::rerank(&db, items.clone(), |i| *i).unwrap(), items);
+}
+
+#[tokio::test]
+async fn management_sources_keep_retained_locations_and_reject_foreign_or_replaced_memories() {
+    let host = host_with(|_| {}).await;
+    host.store.call(|db| {
+        let group = scope(Scene::Group, 50);
+        let guard = conversation(db, &group, None)?;
+        let key = human(db, &group, &guard, 1, 7, "原始发言", 100, true)?;
+        let source = Source::evidence(&key, "原始发言", "原始发言");
+        let first = management::source_snapshot(db, 1, source.clone())?;
+        assert_eq!(first["messages"][0]["sender_id"], "7");
+        assert_eq!(first["messages"][0]["received_at"], 100);
+        db.execute("DELETE FROM messages WHERE key=?1", [&key])?;
+        let retained = management::source_snapshot(db, 1, source)?;
+        assert_eq!(retained["messages"][0]["source_key"], key);
+        assert_eq!(retained["messages"][0]["quote"], "原始发言");
+        assert!(retained["messages"][0]["sender_id"].is_null());
+        assert!(retained["messages"][0]["received_at"].is_null());
+
+        let foreign = Scope { bot_id: 2, ..group };
+        let foreign_guard = conversation(db, &foreign, None)?;
+        let foreign_key = human(db, &foreign, &foreign_guard, 2, 8, "其他账号的发言", 100, true)?;
+        let hidden = management::source_snapshot(db, 1, Source::evidence(&foreign_key, "其他账号的发言", "其他账号的发言"))?;
+        assert_eq!(hidden["messages"], json!([]));
+        for (id, conversation_id) in [(10, guard.conversation_id), (11, foreign_guard.conversation_id)] {
+            db.execute("INSERT INTO ai_memories(id,conversation_id,subject_id,kind,text,evidence,created_at,updated_at) VALUES(?1,?2,7,'event','备考','[]',100,100)", params![id, conversation_id])?;
+            db.execute("INSERT INTO ai_memory_provenance(memory_id,source_key,quote) VALUES(?1,?2,'原始发言'),(?1,?3,'其他账号的发言')", params![id, key, foreign_key])?;
+        }
+        let memory = management::source_snapshot(db, 1, Source::memory(10, 1))?;
+        assert_eq!(memory["subject_id"], "7");
+        assert_eq!(memory["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(memory["messages"][0]["source_key"], key);
+        let foreign_memory = management::source_snapshot(db, 1, Source::memory(11, 1))?;
+        assert!(foreign_memory["subject_id"].is_null());
+        assert_eq!(foreign_memory["messages"], json!([]));
+        db.execute("UPDATE ai_memories SET version=2 WHERE id=10", [])?;
+        let changed = management::source_snapshot(db, 1, Source::memory(10, 1))?;
+        assert!(changed["subject_id"].is_null());
+        assert_eq!(changed["messages"], json!([]));
+        Ok(())
+    }).await.unwrap();
+    host.store.stop().await.unwrap();
 }

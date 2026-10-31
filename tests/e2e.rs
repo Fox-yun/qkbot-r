@@ -604,52 +604,58 @@ async fn long_automatic_policy_does_not_block_explicit_requests() {
 
 #[tokio::test]
 async fn auto_reply_custom_cooldown_expires_at_its_configured_duration() {
-    let mut mock = MockServer::start().await;
-    let (_temp, host, router) = setup_with(&mock, true, |config| {
-        config.plugins.ai.auto_reply.cooldown_seconds = 1;
-        config.plugins.ai.auto_reply.debounce_ms = 100;
-        config.plugins.ai.auto_reply.max_wait_ms = 200;
-    })
-    .await;
-    set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
-    router
-        .dispatch(ordinary_message(1, "first-topic"))
-        .await
-        .unwrap();
-    mock.model()
-        .await
-        .reply
-        .send(answer("first-answer"))
-        .unwrap();
-    assert_eq!(mock.sent().await, "first-answer");
-    wait_for_outbox(&host, "confirmed", 1).await;
-    router
-        .dispatch(ordinary_message(2, "topic-during-one-second-cooldown"))
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), mock.models.recv())
+    for direct in [false, true] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.auto_reply.cooldown_seconds = 1;
+            config.plugins.ai.auto_reply.debounce_ms = 100;
+            config.plugins.ai.auto_reply.max_wait_ms = 200;
+        })
+        .await;
+        set_auto_reply(&host, &router, &message(0, "").key.scope, true).await;
+        router
+            .dispatch(if direct {
+                message(1, "first-topic")
+            } else {
+                ordinary_message(1, "first-topic")
+            })
             .await
-            .is_err()
-    );
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    router
-        .dispatch(ordinary_message(3, "topic-after-one-second-cooldown"))
-        .await
-        .unwrap();
-    let request = mock.model().await;
-    assert!(
-        request.body["messages"].as_array().unwrap().last().unwrap()["content"]
-            .as_str()
-            .unwrap()
-            .contains("topic-after-one-second-cooldown")
-    );
-    request.reply.send(answer("<NO_REPLY>")).unwrap();
-    within(router.shutdown()).await.unwrap();
-    assert!(mock.models.try_recv().is_err());
-    assert!(mock.sends.try_recv().is_err());
-    drop(host);
-    mock.stop().await;
+            .unwrap();
+        mock.model()
+            .await
+            .reply
+            .send(answer("first-answer"))
+            .unwrap();
+        assert_eq!(mock.sent().await, "first-answer");
+        wait_for_outbox(&host, "confirmed", 1).await;
+        router
+            .dispatch(ordinary_message(2, "topic-during-one-second-cooldown"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), mock.models.recv())
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        router
+            .dispatch(ordinary_message(3, "topic-after-one-second-cooldown"))
+            .await
+            .unwrap();
+        let request = mock.model().await;
+        assert!(
+            request.body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("topic-after-one-second-cooldown")
+        );
+        request.reply.send(answer("<NO_REPLY>")).unwrap();
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -787,6 +793,7 @@ async fn auto_reply_batches_messages_and_reuses_model_persona_history_and_memory
     let mut mock = MockServer::start().await;
     let (_temp, host, router) = setup_with(&mock, true, |config| {
         config.llm.model = "shared-chat-model".into();
+        config.plugins.ai.auto_reply.cooldown_seconds = 3;
         config.plugins.ai.defaults.persona = "test-persona".into();
         config.plugins.ai.personas.insert(
             "test-persona".into(),
@@ -803,6 +810,9 @@ async fn auto_reply_batches_messages_and_reuses_model_persona_history_and_memory
         .unwrap();
     mock.sent().await;
     wait_for_outbox(&host, "confirmed", 1).await;
+    // The seed direct reply now cools automatic participation too. Wait for
+    // it to expire before testing batching, shared context and silent turns.
+    tokio::time::sleep(Duration::from_millis(3100)).await;
     let conversation = qkbot::plugins::ai::conversation(&host, &first)
         .await
         .unwrap();
@@ -850,7 +860,7 @@ async fn auto_reply_batches_messages_and_reuses_model_persona_history_and_memory
     }
     request.reply.send(answer(" \n<NO_REPLY>\t ")).unwrap();
 
-    // Silence must neither produce an outbox row nor consume the 30-second
+    // Silence must neither produce an outbox row nor consume the 3-second
     // automatic-send cooldown; the next ordinary message may be considered.
     router
         .dispatch(ordinary_message(4, "a-new-topic-after-silence"))
@@ -1075,6 +1085,73 @@ async fn auto_reply_batch_reads_an_earlier_image_with_its_original_message_key()
     assert!(mock.sends.try_recv().is_err());
     drop(host);
     mock.stop().await;
+}
+
+#[tokio::test]
+async fn auto_reply_direct_replies_cool_the_chat_even_when_send_ack_is_lost() {
+    for lose_ack in [false, true] {
+        let mut mock = MockServer::start().await;
+        let (_temp, host, router) = setup_with(&mock, true, |config| {
+            config.plugins.ai.defaults.mode = "user".into();
+            config.plugins.ai.auto_reply.debounce_ms = 100;
+            config.plugins.ai.auto_reply.max_wait_ms = 200;
+        })
+        .await;
+        let scope = message(0, "").key.scope;
+        let mut other_group = ordinary_message(1, "another-group-can-still-participate");
+        other_group.key.scope.peer_id = 654;
+        set_auto_reply(&host, &router, &scope, true).await;
+        set_auto_reply(&host, &router, &other_group.key.scope, true).await;
+        mock.drop_send_ack.store(lose_ack, Ordering::Relaxed);
+
+        // Neither chat has started an automatic turn yet. Direct replies must
+        // establish cooldown even when there is no automatic activity entry.
+        for (index, incoming) in [
+            message(1, "explicit-mention"),
+            ordinary_message(3, "小鱼 explicit-keyword-during-cooldown"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            router.dispatch(incoming).await.unwrap();
+            mock.model()
+                .await
+                .reply
+                .send(answer("direct-answer"))
+                .unwrap();
+            assert_eq!(mock.sent().await, "direct-answer");
+            wait_for_outbox(
+                &host,
+                if lose_ack { "unknown" } else { "confirmed" },
+                index as i64 + 1,
+            )
+            .await;
+
+            let mut followup = ordinary_message(index as i64 * 2 + 2, "ordinary-followup");
+            followup.sender_id = 999;
+            router.dispatch(followup).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), mock.models.recv())
+                    .await
+                    .is_err(),
+                "a direct reply must cool automatic turns for all users in this chat"
+            );
+        }
+
+        router.dispatch(other_group).await.unwrap();
+        let request = mock.model().await;
+        assert!(
+            request.body["messages"]
+                .to_string()
+                .contains("another-group-can-still-participate")
+        );
+        request.reply.send(answer("<NO_REPLY>")).unwrap();
+        within(router.shutdown()).await.unwrap();
+        assert!(mock.models.try_recv().is_err());
+        assert!(mock.sends.try_recv().is_err());
+        drop(host);
+        mock.stop().await;
+    }
 }
 
 #[tokio::test]

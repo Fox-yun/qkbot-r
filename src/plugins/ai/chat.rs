@@ -782,19 +782,21 @@ impl Chat {
             };
             if let Err(error) = delivered {
                 tracing::warn!(error=%error,"AI delivery failed");
-            } else if automatic
-                && matches!(
-                    delivered,
-                    Ok(crate::milky::SendOutcome::Confirmed { .. }
-                        | crate::milky::SendOutcome::Unknown { .. })
-                )
-            {
+            } else if matches!(
+                delivered,
+                Ok(crate::milky::SendOutcome::Confirmed { .. }
+                    | crate::milky::SendOutcome::Unknown { .. })
+            ) {
+                // Every visible reply quiets automatic participation in this chat;
+                // explicit triggers still bypass automatic cooldown.
                 // Ambiguous sends can already be visible on QQ, so also cool down.
                 let cooldown = self.adaptive_cooldown(&scope_key).await;
-                if let Some(activity) = self.automatic.lock().unwrap().get_mut(&scope_key) {
-                    activity.last_sent = Some(Instant::now());
-                    activity.cooldown = cooldown;
-                }
+                let base = self.automatic_cooldown();
+                let mut activities = self.automatic.lock().unwrap();
+                activities.retain(|_, activity| activity.active || activity.cooling(base));
+                let activity = activities.entry(scope_key).or_default();
+                activity.last_sent = Some(Instant::now());
+                activity.cooldown = cooldown;
             }
         }
     }

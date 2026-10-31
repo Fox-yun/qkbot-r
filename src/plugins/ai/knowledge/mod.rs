@@ -8,6 +8,7 @@
 //! persona, permissions, tool access or the standard of help.
 pub mod behavior;
 pub mod extract;
+mod management;
 pub mod outcomes;
 pub mod reflection;
 pub mod stats;
@@ -966,8 +967,11 @@ pub fn snapshot(db: &Connection, bot: i64, filter: &Filter) -> Result<Value> {
     for item in items {
         let stats = stats::read(db, &format!("knowledge:{}", item.id))?;
         let valid = usable(db, &item).is_ok();
-        rendered
-            .push(json!({"item":item,"sources":sources(db,item.id)?,"stats":stats,"usable":valid}));
+        let sources = sources(db, item.id)?
+            .into_iter()
+            .map(|source| management::source_snapshot(db, bot, source))
+            .collect::<Result<Vec<_>>>()?;
+        rendered.push(json!({"item":item,"sources":sources,"stats":stats,"usable":valid}));
     }
     let counts = db
         .prepare("SELECT kind,status,count(*) FROM ai_knowledge WHERE bot_id=?1 GROUP BY kind,status")?

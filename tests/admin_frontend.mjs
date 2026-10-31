@@ -6,7 +6,7 @@ import { webcrypto } from "node:crypto";
 
 // Minimal DOM doubles exercise request/state behavior without dependencies or a provider.
 const html = readFileSync(new URL("../src/admin/static/index.html", import.meta.url), "utf8");
-const script = readFileSync(new URL("../src/admin/static/app.js", import.meta.url), "utf8");
+const script = readFileSync(new URL("../src/admin/static/app.js", import.meta.url), "utf8").replace(/\r\n/gu, "\n");
 function harness() {
   const nodes = new Set(), ids = new Map(), calls = [], timers = new Map();
   let timerId = 0, handler = async (path) => ({ body: path === "/api/auth/state" ? { setup_required: false, authenticated: false } : {} });
@@ -2556,7 +2556,8 @@ function knowledgeSnapshot() {
   return { bot_id: "1", enabled: true, page: 1, total_pages: 1, counts: [{ kind: "joke", status: "pending", count: 1 }],
     outcomes: { periods: [{ period: "24h", rows: [{ automatic: true, replies: 4, engaged: 1, corrected: 2, positive: 0, quoted: 1, avg_first_response_secs: 12 }] }] },
     items: [{ item: { id: 5, bot_id: 1, kind: "joke", subject: "scope", subject_id: 0, scope: "1:group:50", character_id: "", domain: "", text: "<img src=x onerror=alert(1)>泡泡梗", origin: "auto", confidence: 0.8, importance: 3, status: "pending", locked: false, version: 2, created_at: 1, updated_at: 1, expires_at: null },
-      sources: [{ source_key: "1:group:50:3", role: "evidence", quote: "泡泡梗笑死", source_hash: "", memory_version: null }], stats: null, usable: false }] };
+      sources: [{ source_key: "1:group:50:3", role: "evidence", quote: "泡泡梗笑死", source_hash: "", memory_version: null, subject_id: null,
+        messages: [{ source_key: "1:group:50:3", scope: "1:group:50", message_seq: "3", sender_id: "7", received_at: 10, quote: "泡泡梗笑死" }] }], stats: null, usable: false }] };
 }
 test("knowledge review renders literal items with outcomes and approves the exact version", async () => {
   const h = harness(); await h.login(); h.app.state.view = "knowledge";
@@ -2565,14 +2566,43 @@ test("knowledge review renders literal items with outcomes and approves the exac
   assert.match(h.ids.get("knowledge-items").textContent, /<img src=x onerror=alert\(1\)>泡泡梗/u);
   assert.equal(h.document.querySelectorAll("#knowledge-items img").length, 0);
   assert.match(h.ids.get("knowledge-items").textContent, /本群的梗 · 待审核/u);
+  assert.match(h.ids.get("knowledge-items").textContent, /相关人物：QQ 7/u);
+  assert.match(h.ids.get("knowledge-items").textContent, /群聊 50 · 发言者 QQ 7 · 消息 #3/u);
   assert.match(h.ids.get("knowledge-outcomes").textContent, /主动接话 4 次，有人回应 25%，被否定 2 次/u);
   await h.app.mutateKnowledge(h.app.state.knowledge.snapshot.items[0].item, { op: "approve" });
   const request = h.calls.find((c) => c.path === "/api/knowledge/mutate");
   assert.equal(request.body.bot_id, "1"); assert.equal(request.body.id, 5); assert.equal(request.body.version, 2);
   assert.deepEqual(request.body.action, { op: "approve" }); assert.ok(request.body.request_id);
 });
+test("knowledge review shows people and every memory source without guessing missing senders", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "knowledge";
+  const value = knowledgeSnapshot(), row = value.items[0];
+  Object.assign(row.item, { kind: "impression", subject: "user", subject_id: 7, scope: "" });
+  row.sources = [{ source_key: "memory:12", role: "memory", quote: "", source_hash: "", memory_version: 3, subject_id: "7",
+    messages: [
+      { source_key: "1:friend:7:91", scope: "1:friend:7", message_seq: "91", sender_id: "7", received_at: 10, quote: "<script>最近在备考</script>" },
+      { source_key: "1:group:50:92", scope: "1:group:50", message_seq: "92", sender_id: null, received_at: null, quote: "考试压力大" },
+    ] }];
+  h.setHandler(async () => ({ body: value })); await h.app.loadKnowledge();
+  const content = h.ids.get("knowledge-items").textContent;
+  assert.match(content, /相关人物：QQ 7/u);
+  assert.match(content, /对话来源（2 条消息）/u);
+  assert.match(content, /人物记忆 #12 · 引用版本 3 · QQ 7/u);
+  assert.match(content, /私聊 7 · 发言者 QQ 7 · 消息 #91/u);
+  assert.match(content, /群聊 50 · 发言账号未保留 · 消息 #92/u);
+  assert.match(content, /<script>最近在备考<\/script>/u);
+  assert.equal(h.document.querySelectorAll("#knowledge-items script").length, 0);
+  row.sources[0].messages = []; row.sources[0].subject_id = null;
+  await h.app.loadKnowledge();
+  assert.match(h.ids.get("knowledge-items").textContent, /来源消息已不可用或记忆版本已变化/u);
+  assert.doesNotMatch(h.ids.get("knowledge-items").textContent, /考试压力大/u);
+});
+
 test("knowledge review rejects malformed items and replaced accounts", async () => {
-  for (const change of [(v) => { v.items[0].item.kind = "secret"; }, (v) => { v.bot_id = "2"; }, (v) => { v.items[0].item.status = "deleted"; }]) {
+  for (const change of [(v) => { v.items[0].item.kind = "secret"; }, (v) => { v.bot_id = "2"; }, (v) => { v.items[0].item.status = "deleted"; },
+    (v) => { v.items[0].item.bot_id = 2; }, (v) => { v.items[0].item.scope = "2:group:50"; },
+    (v) => { v.items[0].sources[0].messages[0].scope = "2:friend:7"; },
+    (v) => { v.items[0].sources[0].messages[0].source_key = "1:group:51:3"; }]) {
     const h = harness(); await h.login(); h.app.state.view = "knowledge"; h.app.state.status = { online: true, bot_id: 1 };
     const value = knowledgeSnapshot(); change(value); h.setHandler(async () => ({ body: value })); await h.app.loadKnowledge();
     assert.equal(h.app.state.knowledge.snapshot, null); assert.ok(h.app.state.knowledge.message);

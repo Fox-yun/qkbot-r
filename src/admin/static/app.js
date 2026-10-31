@@ -2202,12 +2202,22 @@
   const knowledgeCurrent = (version, session) => state.authenticated && state.view === "knowledge" && state.knowledge.version === version && state.session === session;
   function validateKnowledgeSnapshot(value) {
     const positive = (n) => Number.isSafeInteger(n) && n > 0;
+    const account = (id) => typeof id === "string" && /^[1-9][0-9]*$/u.test(id);
+    const scope = (key) => typeof key === "string" && key.startsWith(value.bot_id + ":") && /^[1-9][0-9]*:(group|friend):[1-9][0-9]*$/u.test(key);
     if (!value || !/^[1-9][0-9]*$/u.test(value.bot_id) || typeof value.enabled !== "boolean" || !positive(value.page) || !positive(value.total_pages) || !Array.isArray(value.items) || value.items.length > 20 || !Array.isArray(value.counts)) throw new Error("相处与经历数据格式无效。");
     if (state.status?.online && state.status.bot_id != null && String(state.status.bot_id) !== value.bot_id) throw new Error("机器人账号已变化，请刷新。");
     const ids = new Set();
     for (const row of value.items) {
       const item = row?.item;
       if (!item || !positive(item.id) || ids.has(item.id) || !positive(item.version) || !Object.hasOwn(knowledgeKinds, item.kind) || !Object.hasOwn(knowledgeStatus, item.status) || typeof item.text !== "string" || item.text.length > 640 || typeof item.locked !== "boolean" || !Array.isArray(row.sources) || typeof row.usable !== "boolean") throw new Error("相处与经历条目无效。");
+      if (String(item.bot_id) !== value.bot_id || !["user", "scope", "bot"].includes(item.subject) || (item.subject === "scope" ? item.subject_id !== 0 : !positive(item.subject_id)) || (item.scope !== "" && !scope(item.scope))) throw new Error("条目的人物或对话归属无效。");
+      for (const source of row.sources) {
+        if (!source || !["evidence", "context", "reply", "memory"].includes(source.role) || typeof source.source_key !== "string" || typeof source.quote !== "string" || !Array.isArray(source.messages) || (source.subject_id != null && !account(source.subject_id))) throw new Error("条目来源无效。");
+        if (source.role === "memory" ? !/^memory:[1-9][0-9]*$/u.test(source.source_key) || !positive(source.memory_version) : !source.source_key.startsWith(value.bot_id + ":")) throw new Error("来源账号或记忆版本无效。");
+        for (const message of source.messages) {
+          if (!message || !scope(message.scope) || typeof message.message_seq !== "string" || !/^-?[0-9]+$/u.test(message.message_seq) || message.source_key !== message.scope + ":" + message.message_seq || (message.sender_id != null && !account(message.sender_id)) || (message.received_at != null && !Number.isSafeInteger(message.received_at)) || typeof message.quote !== "string") throw new Error("来源消息的账号或位置无效。");
+        }
+      }
       ids.add(item.id);
     }
   }
@@ -2235,6 +2245,37 @@
     }
     return lines.length ? lines : ["暂无回复效果统计。回复发出后经过观察窗口才会计入。"];
   }
+  function knowledgeScopeTitle(scope) {
+    const parts = scope.split(":");
+    return parts.length === 3 ? `${parts[1] === "group" ? "群聊" : "私聊"} ${parts[2]}` : "对话来源见下方";
+  }
+  function knowledgePeople(row, bot) {
+    const people = new Set();
+    if (row.item.subject === "user") people.add(String(row.item.subject_id));
+    for (const source of row.sources) {
+      if (source.subject_id) people.add(source.subject_id);
+      for (const message of source.messages) if (message.sender_id && message.sender_id !== bot) people.add(message.sender_id);
+    }
+    return people.size ? `相关人物：${[...people].map((id) => "QQ " + id).join("、")}` : row.item.subject === "bot" ? `相关账号：机器人 QQ ${bot}` : "相关人物：来源中未保留人物账号";
+  }
+  function renderKnowledgeSources(sources, bot) {
+    const details = element("details", "learning-sources");
+    const messages = new Set(sources.flatMap((source) => source.messages.map((message) => message.source_key)));
+    details.append(element("summary", "text-button", `对话来源（${messages.size} 条消息）`));
+    for (const source of sources) {
+      const label = source.role === "memory" ? `人物记忆 #${source.source_key.slice(7)} · 引用版本 ${source.memory_version}${source.subject_id ? " · QQ " + source.subject_id : ""}` : ({ evidence: "真人原文", context: "对话上下文", reply: "机器人原话" }[source.role]);
+      details.append(element("p", "hint", label));
+      if (!source.messages.length) details.append(element("p", "hint", "来源消息已不可用或记忆版本已变化。"));
+      for (const message of source.messages) {
+        const sender = message.sender_id ? `${message.sender_id === bot ? "机器人" : "发言者"} QQ ${message.sender_id}` : "发言账号未保留";
+        const time = message.received_at == null ? "" : ` · ${new Date(message.received_at * 1000).toLocaleString()}`;
+        details.append(element("p", "hint learning-source", `${knowledgeScopeTitle(message.scope)} · ${sender} · 消息 #${message.message_seq}${time}`));
+        if (message.quote) details.append(element("p", "context-quote", message.quote));
+      }
+    }
+    if (!sources.length) details.append(element("p", "hint", "没有保存对话来源。"));
+    return details;
+  }
   function renderKnowledge() {
     const k = state.knowledge, s = k.snapshot;
     $("knowledge-account").textContent = s ? `机器人 ${s.bot_id} · ${s.enabled ? "已启用" : "已停用"}` : "读取服务器确认的机器人账号后显示。";
@@ -2249,8 +2290,9 @@
     for (const row of s.items) {
       const item = row.item, card = element("div", "context-fragment");
       card.append(element("p", "", `${knowledgeKinds[item.kind]} · ${knowledgeStatus[item.status]}${item.locked ? " · 已锁定" : ""}${row.usable ? "" : " · 当前不可用"}`), element("p", "", item.text));
-      card.append(element("p", "hint", `${item.scope || "多来源"} · 可信度 ${Number(item.confidence).toFixed(1)} · 重要度 ${item.importance} · ${new Date(item.updated_at * 1000).toLocaleString()}`));
-      for (const source of row.sources.slice(0, 6)) if (source.quote) card.append(element("p", "hint", `${source.role === "reply" ? "机器人原话" : "来源原文"}：“${source.quote}”`));
+      card.append(element("p", "hint", knowledgePeople(row, s.bot_id)));
+      card.append(element("p", "hint", `${knowledgeScopeTitle(item.scope)} · 可信度 ${Number(item.confidence).toFixed(1)} · 重要度 ${item.importance} · ${new Date(item.updated_at * 1000).toLocaleString()}`));
+      card.append(renderKnowledgeSources(row.sources, s.bot_id));
       const actions = [];
       if (item.status !== "active") actions.push(["启用", { op: "approve" }, "text-button accent"]);
       if (item.status !== "rejected") actions.push(["拒绝", { op: "reject" }, "text-button"]);
