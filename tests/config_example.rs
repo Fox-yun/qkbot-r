@@ -26,6 +26,10 @@ fn shipped_example_parses_and_constructs_clients_without_network() {
     assert_eq!(config.plugins.ai.memory_input_budget, 8000);
     assert_eq!(config.plugins.ai.auto_reply, AutoReplyConfig::default());
     assert_eq!(config.plugins.ai.learning, LearningConfig::default());
+    assert_eq!(
+        config.plugins.ai.knowledge,
+        qkbot::config::KnowledgeConfig::default()
+    );
     assert_eq!(config.limits.learning_requests_per_hour, 4);
     assert_eq!(config.limits.learning_requests_per_day, 24);
     assert_eq!(config.limits.learning_max_input_budget, 8000);
@@ -206,6 +210,9 @@ fn auto_reply_custom_policy_roundtrips_through_toml_and_admin_json() {
         max_wait_ms: 12_000,
         max_messages: 16,
         max_age_seconds: 45,
+        adaptive_cooldown: true,
+        max_cooldown_seconds: 600,
+        ..AutoReplyConfig::default()
     };
     config.validate().unwrap();
     let toml_roundtrip = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
@@ -511,4 +518,43 @@ fn larger_workloads_are_configurable_without_changing_lightweight_defaults() {
     // Capacity is a finite, explicit storage policy rather than an RSS target.
     config.plugins.ai.max_memories_per_conversation = 0;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn knowledge_defaults_are_conservative_and_bounds_are_validated() {
+    let legacy = Config::from_toml("[plugins.ai]\nkeywords = ['小鱼']").unwrap();
+    legacy.validate().unwrap();
+    let knowledge = &legacy.plugins.ai.knowledge;
+    // Features without extra model requests are on; model-backed jobs and
+    // recall of other members' facts need an explicit choice.
+    assert!(
+        knowledge.enabled
+            && knowledge.episodes
+            && knowledge.self_memory
+            && knowledge.importance_ranking
+    );
+    assert!(!knowledge.impressions && !knowledge.behavior && !knowledge.group_public_recall);
+    assert!(!knowledge.behavior_require_review);
+    assert!(
+        !legacy.plugins.ai.auto_reply.adaptive_cooldown
+            && legacy.plugins.ai.auto_reply.outcome_hints
+    );
+    for fields in [
+        "injection_budget = 8001",
+        "impression_interval_hours = 0",
+        "impression_interval_hours = 721",
+        "behavior_interval_seconds = 59",
+        "behavior_interval_seconds = 86401",
+        "outcome_window_seconds = 59",
+        "outcome_window_seconds = 1801",
+    ] {
+        let config = Config::from_toml(&format!("[plugins.ai.knowledge]\n{fields}")).unwrap();
+        assert!(config.validate().is_err(), "accepted {fields}");
+    }
+    assert!(Config::from_toml("[plugins.ai.knowledge]\nunknown = 1").is_err());
+    let config = Config::from_toml("[plugins.ai.auto_reply]\nmax_cooldown_seconds = 3601").unwrap();
+    assert!(config.validate().is_err());
+    // A ceiling below the base cooldown is accepted and simply never lengthens it.
+    let config = Config::from_toml("[plugins.ai.auto_reply]\ncooldown_seconds = 600\nmax_cooldown_seconds = 60\nadaptive_cooldown = true").unwrap();
+    config.validate().unwrap();
 }

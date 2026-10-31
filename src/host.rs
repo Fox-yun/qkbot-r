@@ -85,6 +85,12 @@ impl Host {
         )
         .await?;
         crate::plugins::ai::personal::configure(&store, &config.plugins.ai.personal).await?;
+        crate::plugins::ai::knowledge::configure(
+            &store,
+            &config.plugins.ai.knowledge,
+            &config.plugins.ai.personal.character_id,
+        )
+        .await?;
         crate::plugins::ai::semantic::init(&store).await?;
         let embedding = if config.embedding.enabled && config.plugins.ai.enabled {
             Some(crate::embedding::Embedding::new(config.embedding.clone())?)
@@ -788,6 +794,15 @@ impl Router {
             // Learning is an independent best-effort job; failures do not change
             // existing notes or prevent normal chat and maintenance work.
             tracing::warn!(error_kind=%error, "learning maintenance deferred");
+        }
+        if let Some(bot_id) = self.host.milky.verified_bot_id()
+            && self.host.config.plugins.ai.enabled
+            && self.host.config.plugins.ai.knowledge.enabled
+            && let Err(error) =
+                crate::plugins::ai::knowledge::run(&self.host, bot_id, &self.host.cancel).await
+        {
+            // Outcomes, interaction notes and impressions are best-effort too.
+            tracing::warn!(error_kind=%error, "knowledge maintenance deferred");
         }
         memory_result?;
         Ok(())

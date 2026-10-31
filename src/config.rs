@@ -460,6 +460,12 @@ pub struct AutoReplyConfig {
     pub max_wait_ms: u64,
     pub max_messages: usize,
     pub max_age_seconds: u64,
+    /// Show recent engagement with this chat's automatic replies to the model.
+    pub outcome_hints: bool,
+    /// Lengthen the cooldown, within max_cooldown_seconds, when recent
+    /// automatic replies were mostly ignored or corrected.
+    pub adaptive_cooldown: bool,
+    pub max_cooldown_seconds: u64,
 }
 
 impl Default for AutoReplyConfig {
@@ -471,6 +477,9 @@ impl Default for AutoReplyConfig {
             max_wait_ms: 5000,
             max_messages: 8,
             max_age_seconds: 120,
+            outcome_hints: true,
+            adaptive_cooldown: false,
+            max_cooldown_seconds: 300,
         }
     }
 }
@@ -502,6 +511,11 @@ impl AutoReplyConfig {
             (5..=600).contains(&self.max_age_seconds)
                 && self.max_age_seconds * 1000 >= self.max_wait_ms,
             "自动接话批次有效期须为 5..600 秒，且不短于最长等待"
+        );
+        // A ceiling below the base cooldown simply disables lengthening.
+        ensure!(
+            self.max_cooldown_seconds <= 3600,
+            "自适应冷却上限须为 0..3600 秒"
         );
         Ok(())
     }
@@ -652,6 +666,7 @@ pub struct AiConfig {
     pub learning: LearningConfig,
     pub context: ContextConfig,
     pub personal: PersonalConfig,
+    pub knowledge: KnowledgeConfig,
     pub compaction: CompactionConfig,
     pub keywords: Vec<String>,
     pub global_memory_shared: bool,
@@ -675,6 +690,7 @@ impl Default for AiConfig {
             learning: LearningConfig::default(),
             context: ContextConfig::default(),
             personal: PersonalConfig::default(),
+            knowledge: KnowledgeConfig::default(),
             compaction: CompactionConfig::default(),
             keywords: vec!["小鱼".into()],
             global_memory_shared: true,
@@ -689,6 +705,69 @@ impl Default for AiConfig {
             memory_recall_budget: 1000,
             personas: BTreeMap::new(),
         }
+    }
+}
+
+/// Knowledge types kept in the unified store: shared episodes, the bot's own
+/// statements, person impressions and interaction notes, plus reply outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnowledgeConfig {
+    pub enabled: bool,
+    /// Per-turn bytes for unified knowledge, inside the ordinary input budget.
+    pub injection_budget: usize,
+    /// Extracted together with existing personal facts; no extra model request.
+    pub episodes: bool,
+    pub self_memory: bool,
+    /// Rank recalled personal facts by importance, use and reinforcement.
+    pub importance_ranking: bool,
+    /// Background summaries of a person's facts; uses the memory request quota.
+    pub impressions: bool,
+    pub impression_interval_hours: u64,
+    /// Learn group interaction notes from reactions to replies; uses the
+    /// learning request quota.
+    pub behavior: bool,
+    pub behavior_require_review: bool,
+    pub behavior_interval_seconds: u64,
+    /// Recall a mentioned or quoted member's facts stated in this same group.
+    pub group_public_recall: bool,
+    /// How long after a reply its reactions are collected.
+    pub outcome_window_seconds: u64,
+}
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            injection_budget: 2000,
+            episodes: true,
+            self_memory: true,
+            importance_ranking: true,
+            impressions: false,
+            impression_interval_hours: 24,
+            behavior: false,
+            behavior_require_review: false,
+            behavior_interval_seconds: 1800,
+            group_public_recall: false,
+            outcome_window_seconds: 300,
+        }
+    }
+}
+impl KnowledgeConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.injection_budget <= 8000, "统一知识输入预算须为 0–8000");
+        ensure!(
+            (1..=720).contains(&self.impression_interval_hours),
+            "人物印象整理间隔须为 1..720 小时"
+        );
+        ensure!(
+            (60..=86_400).contains(&self.behavior_interval_seconds),
+            "相处经验整理间隔须为 60..86400 秒"
+        );
+        ensure!(
+            (60..=1800).contains(&self.outcome_window_seconds),
+            "回复效果观察窗口须为 60..1800 秒"
+        );
+        Ok(())
     }
 }
 
@@ -975,6 +1054,7 @@ impl Config {
         ai.learning.validate()?;
         ai.context.validate()?;
         ai.personal.validate()?;
+        ai.knowledge.validate()?;
         ai.compaction.validate()?;
         ensure!(ai.persona(&ai.defaults.persona).is_some(), "人设不存在");
         ensure!(

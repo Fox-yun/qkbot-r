@@ -120,6 +120,8 @@ pub struct ContextDependencyGuard {
     learning: Vec<learning::LearningCheck>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     personal: Vec<super::personal::Dependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    knowledge: Vec<super::knowledge::Dependency>,
 }
 
 impl From<learning::LearningCheck> for ContextDependencyGuard {
@@ -144,6 +146,11 @@ impl ContextDependencyGuard {
     ) -> Result<bool> {
         for check in &self.personal {
             if !check.allows_audience(db, policy, scope, actor)? {
+                return Ok(false);
+            }
+        }
+        for item in &self.knowledge {
+            if !item.allows_audience(db, policy, scope, actor)? {
                 return Ok(false);
             }
         }
@@ -183,10 +190,18 @@ impl ContextDependencyGuard {
         for learning in &self.learning {
             learning.validate(db)?;
         }
+        for item in &self.knowledge {
+            item.validate(db)?;
+        }
         Ok(())
     }
 
     pub fn extend(&mut self, other: &Self) {
+        for item in &other.knowledge {
+            if !self.knowledge.contains(item) {
+                self.knowledge.push(item.clone());
+            }
+        }
         for check in &other.personal {
             if !self.personal.contains(check) {
                 self.personal.push(check.clone());
@@ -277,6 +292,10 @@ impl ContextDependencyGuard {
         continuity::register_reply(db, position, key, &self.continuity)?;
         db.execute("INSERT OR REPLACE INTO ai_context_reply_dependencies(reply_key,dependencies) VALUES(?1,?2)",
             params![key, serde_json::to_string(self)?])?;
+        // Only material that reached a confirmed reply counts as used.
+        let memories: Vec<i64> = self.memories.iter().map(|m| m.id).collect();
+        let knowledge: Vec<i64> = self.knowledge.iter().map(|k| k.id).collect();
+        super::knowledge::stats::record_recall(db, &memories, &knowledge)?;
         Ok(())
     }
 }
@@ -391,11 +410,18 @@ pub struct ContextRequest<'a> {
     /// Multi-author automatic participation cannot be attributed to the last
     /// speaker as a request to resume their personal conversations.
     pub allow_continuity: bool,
+    /// Members the current message mentions or quotes, for same-group recall.
+    pub referenced: &'a [i64],
+}
+
+enum KnowledgeDependency {
+    Memory(MemoryDependency),
+    Item(super::knowledge::Dependency),
 }
 
 struct Knowledge {
     text: String,
-    dependency: MemoryDependency,
+    dependency: KnowledgeDependency,
     sources: Vec<String>,
 }
 
@@ -442,7 +468,10 @@ impl PreparedContext {
             .iter()
             .take(result.context.memory_count - personal_count)
         {
-            guard.memories.push(memory.dependency.clone());
+            match &memory.dependency {
+                KnowledgeDependency::Memory(m) => guard.memories.push(m.clone()),
+                KnowledgeDependency::Item(k) => guard.knowledge.push(k.clone()),
+            }
             for key in &memory.sources {
                 guard.continuity.add_source_key(key.clone());
             }
@@ -464,6 +493,70 @@ impl PreparedContext {
         guard.validate(db)?;
         Ok(guard)
     }
+}
+
+/// Same-group public facts about referenced members, bounded per member.
+fn group_public(
+    db: &Connection,
+    guard: &ContextGuard,
+    audience: &Scope,
+    members: &[i64],
+    query: &str,
+) -> Result<Vec<Knowledge>> {
+    let target = audience.key();
+    let mut result = Vec::new();
+    for member in members {
+        // Filter by scope before limiting: the member's facts from other chats
+        // must not crowd out the ones stated here.
+        let mut taken = 0;
+        for candidate in memory::retrieve(db, guard, *member, query, 16, 4000)? {
+            if taken >= 2 {
+                break;
+            }
+            let (version, origin, active, expires): (i64, String, bool, Option<i64>) = db.query_row(
+                "SELECT m.version,c.scope,m.active,m.expires_at FROM ai_memories m JOIN ai_conversations c ON c.id=m.conversation_id WHERE m.id=?1",
+                [candidate.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            if origin != target
+                || !active
+                || expires.is_some_and(|value| value <= now())
+                || candidate.origin == "manual"
+            {
+                continue;
+            }
+            let mut sources = db
+                .prepare("SELECT source_key FROM ai_memory_provenance WHERE memory_id=?1")?
+                .query_map([candidate.id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for evidence in &candidate.evidence {
+                if !sources.contains(&evidence.source_key) {
+                    sources.push(evidence.source_key.clone());
+                }
+            }
+            // Every source must be a message in this very group.
+            if !policy::allows_sources(
+                db,
+                crate::config::CrossScenePolicy::SameScope,
+                &sources,
+                audience,
+                *member,
+            )? {
+                continue;
+            }
+            taken += 1;
+            result.push(Knowledge {
+                text: format!(
+                    "群成员 {} 在本群公开说过（仅限本群资料，不是当前提问者的信息）/ {:?}：{}",
+                    member, candidate.kind, candidate.text
+                ),
+                dependency: KnowledgeDependency::Memory(MemoryDependency {
+                    id: candidate.id,
+                    version,
+                }),
+                sources,
+            });
+        }
+    }
+    Ok(result)
 }
 
 pub async fn prepare(
@@ -517,10 +610,78 @@ pub async fn prepare(
             if !inherited.allows_audience(db, cross_scene, &audience, actor)? { continue; }
             let origin = match current.origin.as_str() { "manual" => "管理员补充（不代表本人自述）", "auto" => "原始消息提取", _ => "历史记录" };
             result.push(Knowledge { text: format!("记忆 #{} / 关于用户 {} / {:?} / {} / 记录来源范围 {}（群限定事实勿泛化）：{}", candidate.id,current.subject_id,current.kind,origin,scope,current.text),
-                dependency: MemoryDependency {id:candidate.id,version}, sources });
+                dependency: KnowledgeDependency::Memory(MemoryDependency {id:candidate.id,version}), sources });
         }
         Ok(result)
     }).await?;
+    let mut memories = memories;
+    let knowledge_config = host.config.plugins.ai.knowledge.clone();
+    let readable = request.settings.memory_read && !request.settings.paused;
+    // Facts a mentioned or quoted member stated in this same group. Only for
+    // shared group conversations; a person's private or other-group facts
+    // never qualify, and the current speaker still cannot become that member.
+    if readable
+        && knowledge_config.enabled
+        && knowledge_config.group_public_recall
+        && request.allow_continuity
+        && request.scope.scene == Scene::Group
+        && request.settings.mode == "group"
+    {
+        let mut members: Vec<i64> = request
+            .referenced
+            .iter()
+            .copied()
+            .filter(|m| *m > 0 && *m != actor && *m != request.scope.bot_id)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        members.truncate(2);
+        if !members.is_empty() {
+            let guard = request.guard.clone();
+            let audience = request.scope.clone();
+            let query = request.current.to_owned();
+            let public = host
+                .store
+                .call(move |db| group_public(db, &guard, &audience, &members, &query))
+                .await?;
+            memories.extend(public);
+        }
+    }
+    if readable && knowledge_config.enabled && knowledge_config.injection_budget > 0 {
+        let guard = request.guard.clone();
+        let audience = request.scope.clone();
+        let query = request.current.to_owned();
+        let budget = knowledge_config
+            .injection_budget
+            .min(request.settings.input_budget / 4);
+        let reference = request.received_at;
+        let personal = request.allow_continuity;
+        let items = host
+            .store
+            .call(move |db| {
+                crate::host::check_guard(db, &guard)?;
+                let domain = memory::scope::resolve(db, &guard.conversation_id)?;
+                super::knowledge::recall(
+                    db,
+                    &super::knowledge::RecallRequest {
+                        scope: &audience,
+                        actor,
+                        policy: cross_scene,
+                        domain: &domain,
+                        query: &query,
+                        budget,
+                        reference,
+                        personal,
+                    },
+                )
+            })
+            .await?;
+        memories.extend(items.into_iter().map(|item| Knowledge {
+            text: item.text,
+            dependency: KnowledgeDependency::Item(item.dependency),
+            sources: item.sources,
+        }));
+    }
     let mut learning = if request.settings.memory_read
         && !request.settings.paused
         && host.config.plugins.ai.learning.enabled

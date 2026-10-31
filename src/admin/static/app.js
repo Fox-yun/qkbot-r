@@ -22,6 +22,7 @@
     learning: { version: 0, loading: false, saving: false, snapshot: null, editing: null, dirty: false, conflict: false, message: "" },
     context: { version: 0, loading: false, snapshot: null, message: "" },
     personal: { version: 0, loading: false, saving: false, snapshot: null, selected: "", page: 1, editing: null, message: "" },
+    knowledge: { version: 0, loading: false, saving: false, snapshot: null, kind: "", status: "", page: 1, message: "" },
     configCategory: "all",
   };
   const inputs = new Map();
@@ -60,6 +61,23 @@
     field("plugins.ai.auto_reply.max_wait_ms", "最长合并等待（毫秒）", "number", "持续有新消息时，最迟在这段时间后判断是否接话；不能短于消息合并等待。", { min: 100, max: 30000 }),
     field("plugins.ai.auto_reply.max_messages", "每批最多新消息数", "number", "单批最多合并这么多条新消息，后续消息进入下一批。", { min: 1, max: 32 }),
     field("plugins.ai.auto_reply.max_age_seconds", "待接话消息有效期（秒）", "number", "超过有效期的批次不再主动回复；应覆盖最长合并等待。只限制待接话的新消息，不截断完整聊天上下文、摘要或长期记忆。", { min: 5, max: 600, full: true }),
+    field("plugins.ai.auto_reply.outcome_hints", "参考近期接话效果", "check", "默认开启。主动接话时附上本群近 24 小时主动接话后有人回应、被否定的次数，由模型把握分寸；只读取本地统计，不额外请求模型。", { full: true }),
+    field("plugins.ai.auto_reply.adaptive_cooldown", "冷场时自动延长冷却", "check", "默认关闭。近 24 小时至少 4 次主动接话且多数无人回应或常被否定时，把冷却延长 2–3 倍，不超过下方上限。", { full: true }),
+    field("plugins.ai.auto_reply.max_cooldown_seconds", "自适应冷却上限（秒）", "number", "低于基础冷却时不延长。", { min: 0, max: 3600 }),
+  ];
+  const knowledgeFields = [
+    field("plugins.ai.knowledge.enabled", "启用相处学习与共同经历", "check", "总开关。关闭后不再注入共同经历、机器人说过的话、人物印象和群内相处经验，也不再统计回复效果；已保存的内容保留。", { full: true }),
+    field("plugins.ai.knowledge.injection_budget", "每轮注入上限（估算）", "number", "计入普通输入预算，实际不超过普通输入的四分之一；0 暂停注入。", { min: 0, max: 8000 }),
+    field("plugins.ai.knowledge.outcome_window_seconds", "回复效果观察窗口（秒）", "number", "回复发出后在这段时间内统计引用、@ 和提问者的后续发言。", { min: 60, max: 1800 }),
+    field("plugins.ai.knowledge.episodes", "记录共同经历", "check", "从已有的后台记忆整理中提炼机器人答应过的事、约定和梗；须同时有机器人回复与本人原文为证，不额外请求模型。"),
+    field("plugins.ai.knowledge.self_memory", "记住机器人说过的观点", "check", "只以机器人已确认发送的原话为证，帮助前后一致；当前人设始终优先。"),
+    field("plugins.ai.knowledge.importance_ranking", "按重要度与使用情况排序记忆", "check", "整理时记录重要度，回复用到或本人再次提及时加分；只调整召回顺序，不改写记忆。"),
+    field("plugins.ai.knowledge.group_public_recall", "被提到的群成员公开资料", "check", "默认关闭。群共享会话中有人 @ 或引用某位成员时，召回该成员在本群公开说过的事实；不会读取其私聊或其他群的内容。", { full: true }),
+    field("plugins.ai.knowledge.impressions", "整理人物印象", "check", "默认关闭。把同一人的多条记忆归纳为 1–3 条低置信印象，占用后台记忆整理额度。"),
+    field("plugins.ai.knowledge.impression_interval_hours", "人物印象最短间隔（小时）", "number", "每人每个记忆范围的重新整理间隔。", { min: 1, max: 720 }),
+    field("plugins.ai.knowledge.behavior", "学习群内相处经验", "check", "默认关闭。根据真人对机器人回复的反应总结本群习惯、有效说法、梗和应避免的做法，占用学习笔记的请求额度。"),
+    field("plugins.ai.knowledge.behavior_require_review", "相处经验需管理员审核", "check", "开启后新经验先进入待审核，在「相处与经历」中启用后才会使用。"),
+    field("plugins.ai.knowledge.behavior_interval_seconds", "相处经验最短间隔（秒）", "number", "每个机器人账号的整理间隔。", { min: 60, max: 86400 }),
   ];
   const learningFields = [
     field("plugins.ai.learning.enabled", "启用学习笔记", "check", "默认关闭。开启后仅从同一机器人账号的群聊取材，在群聊间共享交流经验；保存并应用后生效。", { full: true }),
@@ -135,6 +153,7 @@
       field("plugins.ai.personal.character_id", "稳定角色 ID", "text", "默认 default。1–64 个字母、数字、下划线或连字符；只有独立角色才更换。"),
       field("plugins.ai.personal.injection_budget", "个人关系输入上限", "number", "计入普通输入预算；0 暂停注入。", { min: 0, max: 8000 }),
     ] },
+    { title: "相处学习与共同经历", description: "共同经历、机器人说过的话、人物印象、群内相处经验与回复效果。全部只作为资料，不改变人设、权限或帮助质量；撤回或遗忘来源后相关内容一并删除。", fields: knowledgeFields },
     { title: "学习笔记", description: "独立记录同一机器人账号的群聊交流经验，不替代个人记忆，也不从私聊取材。可在「学习笔记」页人工管理、锁定和查看历史；来源被遗忘的内容不能通过回滚复活。", fields: learningFields },
     { title: "人设", description: "从列表选择默认人设，也可编辑自定义内容。会话可单独选择已保存的人设。", personas: true, fields: [
       field("plugins.ai.defaults.persona", "默认人设", "persona", "选择后随配置一起保存；下方可预览模板和编辑自定义人设。", { full: true }),
@@ -866,7 +885,7 @@
     }
     if (errors.length) throw configFieldError(errors);
     readPluginConfig(config);
-    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config); validateLearning(config); validateContext(config); validateSearch(config);
+    validatePersonaMap(config.plugins.ai.personas); validateImmutable(config); validateAutoReply(config); validateKnowledge(config); validateLearning(config); validateContext(config); validateSearch(config);
     return config;
   }
 
@@ -909,7 +928,19 @@
     }
     if (policy.max_wait_ms < policy.debounce_ms) throw new Error("「最长合并等待」不能短于「消息合并等待」。");
     if (policy.max_age_seconds * 1000 < policy.max_wait_ms) throw new Error("「待接话消息有效期」不能短于「最长合并等待」，请注意秒与毫秒的单位。");
+    for (const def of autoReplyFields.filter((entry) => entry.type === "check")) {
+      if (typeof get(config, def.path) !== "boolean") throw new Error(`「${def.label}」需要填写 true 或 false。`);
+    }
     policy.prompt = policy.prompt.trim();
+  }
+  function validateKnowledge(config) {
+    const knowledge = get(config, "plugins.ai.knowledge");
+    if (!knowledge || typeof knowledge !== "object" || Array.isArray(knowledge)) throw new Error("相处学习配置不完整，请重新载入配置。");
+    for (const def of knowledgeFields) {
+      const value = get(config, def.path);
+      if (def.type === "check" && typeof value !== "boolean") throw new Error(`「${def.label}」需要填写 true 或 false。`);
+      if (def.type === "number" && (!Number.isSafeInteger(value) || value < def.min || value > def.max)) throw new Error(`「${def.label}」需要填写 ${def.min}–${def.max} 范围内的整数。`);
+    }
   }
   function validateLearning(config) {
     const learning = get(config, "plugins.ai.learning");
@@ -943,7 +974,7 @@
 
   function configGroupCategory(group) {
     if (group.fields === contextFields) return "context";
-    if (["学习笔记", "上下文与记忆", "人物与关系"].includes(group.title)) return "knowledge";
+    if (["学习笔记", "上下文与记忆", "人物与关系", "相处学习与共同经历"].includes(group.title)) return "knowledge";
     if (["人设", "会话与触发", "自动接话"].includes(group.title)) return "conversation";
     if (["模型接口", "向量接口（Embedding）", "Milky 消息接口", "QQ 登录管理"].includes(group.title)) return "connection";
     return "tools";
@@ -1022,7 +1053,7 @@
       if (!valid) throw new Error(`JSON 字段 ${def.path} 的类型不正确。`);
       if (def.type === "select" && !def.choices.some(([key]) => key === value)) throw new Error(`JSON 字段 ${def.path} 的选项无效。`);
     }
-    validateAutoReply(config); validateLearning(config); validateContext(config); validateSearch(config);
+    validateAutoReply(config); validateKnowledge(config); validateLearning(config); validateContext(config); validateSearch(config);
     const pending = secretSnapshot();
     state.draft = config; state.jsonDirty = false; state.formInvalid = false; state.dirty = true;
     renderFields(pending); syncJson();
@@ -1201,7 +1232,7 @@
       if (session !== state.session || !state.authenticated) return;
       validateConfigSnapshot(latest);
       const merged = mergeConfigDraft(state.config, local, latest.config);
-      validatePersonaMap(merged.plugins.ai.personas); validateAutoReply(merged); validateLearning(merged); validateContext(merged); validateSearch(merged);
+      validatePersonaMap(merged.plugins.ai.personas); validateAutoReply(merged); validateKnowledge(merged); validateLearning(merged); validateContext(merged); validateSearch(merged);
       requirePersona(merged, merged.plugins.ai.defaults.persona, "合并后的默认人设", latest.persona_templates || {});
       await loadConfig(latest, merged);
       if (session === state.session) configSaveFeedback("已取得最新版本，并保留本页修改。请核对后点击保存；尚未写入或应用。", "success");
@@ -1976,7 +2007,7 @@
       else notice("当前状态：" + String(state.status.phase) + "。请稍后再次查询。", "warning");
     }
   }
-  const knowledgeViews = ["context", "memory", "personal", "learning"];
+  const knowledgeViews = ["context", "memory", "personal", "knowledge", "learning"];
   function invalidateContextOverview() {
     const context = state.context;
     context.version++; context.loading = false; context.snapshot = null; context.message = "";
@@ -2163,9 +2194,93 @@
     } catch (error) { if (personalCurrent(version, session)) { p.message = (error.message || "保存结果未确认。") + " 请刷新核对后再操作。"; p.saving = false; renderPersonal(); } }
   }
 
+  const knowledgeKinds = { episode: "共同经历", self: "机器人说过的话", impression: "人物印象", norm: "本群习惯", style: "有效说法", joke: "本群的梗", avoid: "应避免" };
+  const knowledgeStatus = { active: "启用", pending: "待审核", rejected: "已拒绝" };
+  function invalidateKnowledge() {
+    const k = state.knowledge; k.version++; k.snapshot = null; k.loading = false; k.saving = false; k.message = ""; renderKnowledge();
+  }
+  const knowledgeCurrent = (version, session) => state.authenticated && state.view === "knowledge" && state.knowledge.version === version && state.session === session;
+  function validateKnowledgeSnapshot(value) {
+    const positive = (n) => Number.isSafeInteger(n) && n > 0;
+    if (!value || !/^[1-9][0-9]*$/u.test(value.bot_id) || typeof value.enabled !== "boolean" || !positive(value.page) || !positive(value.total_pages) || !Array.isArray(value.items) || value.items.length > 20 || !Array.isArray(value.counts)) throw new Error("相处与经历数据格式无效。");
+    if (state.status?.online && state.status.bot_id != null && String(state.status.bot_id) !== value.bot_id) throw new Error("机器人账号已变化，请刷新。");
+    const ids = new Set();
+    for (const row of value.items) {
+      const item = row?.item;
+      if (!item || !positive(item.id) || ids.has(item.id) || !positive(item.version) || !Object.hasOwn(knowledgeKinds, item.kind) || !Object.hasOwn(knowledgeStatus, item.status) || typeof item.text !== "string" || item.text.length > 640 || typeof item.locked !== "boolean" || !Array.isArray(row.sources) || typeof row.usable !== "boolean") throw new Error("相处与经历条目无效。");
+      ids.add(item.id);
+    }
+  }
+  async function loadKnowledge() {
+    const k = state.knowledge;
+    if (k.saving || !state.authenticated) return;
+    const version = ++k.version, session = state.session, bot = k.snapshot?.bot_id;
+    k.snapshot = null; k.loading = true; k.message = ""; renderKnowledge();
+    const query = new URLSearchParams({ page: String(k.page) });
+    if (k.kind) query.set("kind", k.kind); if (k.status) query.set("status", k.status); if (bot) query.set("bot_id", bot);
+    try {
+      const value = await api("/api/knowledge?" + query);
+      if (!knowledgeCurrent(version, session)) return;
+      validateKnowledgeSnapshot(value); k.snapshot = value;
+    } catch (error) { if (knowledgeCurrent(version, session)) k.message = error.message || "读取相处与经历失败。"; }
+    finally { if (knowledgeCurrent(version, session)) { k.loading = false; renderKnowledge(); } }
+  }
+  function outcomeSummary(snapshot) {
+    const lines = [];
+    for (const period of snapshot?.outcomes?.periods || []) {
+      for (const row of period.rows || []) {
+        const rate = row.replies ? Math.round(row.engaged * 100 / row.replies) : 0;
+        lines.push(`${period.period === "24h" ? "近 24 小时" : "近 7 天"} · ${row.automatic ? "主动接话" : "被提问回复"} ${row.replies} 次，有人回应 ${rate}%，被否定 ${row.corrected} 次，正面反应 ${row.positive} 次`);
+      }
+    }
+    return lines.length ? lines : ["暂无回复效果统计。回复发出后经过观察窗口才会计入。"];
+  }
+  function renderKnowledge() {
+    const k = state.knowledge, s = k.snapshot;
+    $("knowledge-account").textContent = s ? `机器人 ${s.bot_id} · ${s.enabled ? "已启用" : "已停用"}` : "读取服务器确认的机器人账号后显示。";
+    $("knowledge-message").textContent = k.loading ? "正在读取…" : k.message;
+    $("refresh-knowledge").disabled = k.loading || k.saving || !state.authenticated;
+    $("knowledge-prev").disabled = !s || s.page <= 1 || k.saving; $("knowledge-next").disabled = !s || s.page >= s.total_pages || k.saving;
+    $("knowledge-page").textContent = s ? `第 ${s.page} / ${s.total_pages} 页` : "";
+    $("knowledge-outcomes").replaceChildren(...(s ? outcomeSummary(s) : []).map((line) => element("p", "hint", line)));
+    $("knowledge-items").replaceChildren();
+    if (!s) return;
+    if (!s.items.length) $("knowledge-items").append(element("p", "hint", "暂无符合条件的条目。"));
+    for (const row of s.items) {
+      const item = row.item, card = element("div", "context-fragment");
+      card.append(element("p", "", `${knowledgeKinds[item.kind]} · ${knowledgeStatus[item.status]}${item.locked ? " · 已锁定" : ""}${row.usable ? "" : " · 当前不可用"}`), element("p", "", item.text));
+      card.append(element("p", "hint", `${item.scope || "多来源"} · 可信度 ${Number(item.confidence).toFixed(1)} · 重要度 ${item.importance} · ${new Date(item.updated_at * 1000).toLocaleString()}`));
+      for (const source of row.sources.slice(0, 6)) if (source.quote) card.append(element("p", "hint", `${source.role === "reply" ? "机器人原话" : "来源原文"}：“${source.quote}”`));
+      const actions = [];
+      if (item.status !== "active") actions.push(["启用", { op: "approve" }, "text-button accent"]);
+      if (item.status !== "rejected") actions.push(["拒绝", { op: "reject" }, "text-button"]);
+      actions.push([item.locked ? "解除锁定" : "锁定", { op: item.locked ? "unlock" : "lock" }, "text-button"]);
+      actions.push(["删除", { op: "delete" }, "text-button danger-text"]);
+      for (const [label, action, cls] of actions) {
+        const button = element("button", cls, label); button.type = "button"; button.disabled = k.saving;
+        button.addEventListener("click", () => { if (action.op !== "delete" || window.confirm("删除这条内容？删除后不能恢复。")) void mutateKnowledge(item, action); });
+        card.append(button);
+      }
+      $("knowledge-items").append(card);
+    }
+  }
+  async function mutateKnowledge(item, action) {
+    const k = state.knowledge, snapshot = k.snapshot;
+    if (!snapshot || k.saving) return;
+    const version = k.version, session = state.session;
+    k.saving = true; k.message = "正在保存…"; renderKnowledge();
+    try {
+      const result = await api("/api/knowledge/mutate", "POST", { bot_id: snapshot.bot_id, id: item.id, version: item.version, request_id: requestId(), action });
+      if (result.status !== "applied" || result.id !== item.id) throw new Error("修改响应不匹配。");
+      if (!knowledgeCurrent(version, session)) return;
+      k.saving = false; await loadKnowledge();
+    } catch (error) { if (knowledgeCurrent(version, session)) { k.message = (error.message || "保存结果未确认。") + " 请刷新核对后再操作。"; k.saving = false; renderKnowledge(); } }
+  }
+
   function showView(view) {
-    if (!["overview", "qq", "contacts", "config", "context", "memory", "personal", "learning", "stickers"].includes(view)) return;
+    if (!["overview", "qq", "contacts", "config", "context", "memory", "personal", "knowledge", "learning", "stickers"].includes(view)) return;
     if (state.view === "personal" && view !== "personal") invalidatePersonal();
+    if (state.view === "knowledge" && view !== "knowledge") invalidateKnowledge();
     if (state.view === "contacts" && view !== "contacts") invalidateContacts();
     if (state.view === "stickers" && view !== "stickers") invalidateStickers();
     if (state.view === "learning" && view !== "learning") invalidateLearning();
@@ -2175,7 +2290,7 @@
     document.querySelectorAll(".nav-item").forEach((node) => { const current = node.dataset.view === view || node.dataset.view === "context" && knowledgeViews.includes(view); node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
     document.querySelectorAll(".workspace-tab").forEach((node) => { const current = node.dataset.view === view; node.classList.toggle("active", current); if (current) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
     $("knowledge-header").hidden = !knowledgeViews.includes(view);
-    $("page-name").textContent = "工作空间 / " + ({ overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "设置与人设", context: "上下文与知识", memory: "上下文与知识", personal: "上下文与知识", learning: "上下文与知识", stickers: "图库管理" }[view]);
+    $("page-name").textContent = "工作空间 / " + ({ overview: "运行概览", qq: "QQ 登录", contacts: "群与好友", config: "设置与人设", context: "上下文与知识", memory: "上下文与知识", personal: "上下文与知识", knowledge: "上下文与知识", learning: "上下文与知识", stickers: "图库管理" }[view]);
     if (view === "memory" && !state.memory.list.length) void runAction(loadConversations);
     if (view === "qq") scheduleQq(0);
     if (view === "contacts" && state.contacts.phase !== "ready") void loadContacts();
@@ -2183,6 +2298,7 @@
     if (view === "learning") void loadLearning();
     if (view === "context") void loadContextOverview();
     if (view === "personal") void loadPersonal();
+    if (view === "knowledge") void loadKnowledge();
   }
   const hasEdits = () => state.dirty || state.jsonDirty || state.memory.settingsDirty || state.memory.editorDirty || state.learning.dirty || Boolean(state.personal.editing);
   function authView(result) {
@@ -2688,6 +2804,10 @@
   $("personal-edit-form").addEventListener("submit", (event) => { event.preventDefault(); const e = state.personal.editing; if (e) void mutatePersonal({ op: "correct", id: e.id, version: e.version, value: $("personal-edit-value").value.trim() }); });
   $("reset-personal").addEventListener("click", () => { if (window.confirm("重置此用户与当前角色的关系？称呼、边界和共同交流记录将清除，个人事实仍保留。")) void mutatePersonal({ op: "reset" }); });
   $("refresh-context-overview").addEventListener("click", () => { void loadContextOverview(); });
+  $("refresh-knowledge").addEventListener("click", () => { void loadKnowledge(); });
+  $("knowledge-filter").addEventListener("submit", (event) => { event.preventDefault(); state.knowledge.kind = $("knowledge-kind").value; state.knowledge.status = $("knowledge-status").value; state.knowledge.page = 1; void loadKnowledge(); });
+  $("knowledge-prev").addEventListener("click", () => { state.knowledge.page = Math.max(1, state.knowledge.page - 1); void loadKnowledge(); });
+  $("knowledge-next").addEventListener("click", () => { state.knowledge.page++; void loadKnowledge(); });
   document.querySelector(".brand").addEventListener("click", (event) => { event.preventDefault(); showView("overview"); });
   $("config-form").addEventListener("submit", (event) => event.preventDefault());
   $("persona-list").addEventListener("change", () => { state.personaSelected = $("persona-list").value; $("persona-error").textContent = ""; renderPersonaPreview(); });

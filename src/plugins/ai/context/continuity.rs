@@ -951,7 +951,7 @@ pub(super) fn invalidate_conversation_replies(db: &Connection, conversation: &st
 pub fn invalidate_sources(db: &Connection, keys: &[String]) -> Result<()> {
     super::super::personal::invalidate_sources(db, keys)?;
     if keys.is_empty() || !installed(db)? {
-        return Ok(());
+        return super::super::knowledge::invalidate_sources(db, keys);
     }
     let encoded = serde_json::to_string(keys)?;
     let affected = db
@@ -963,6 +963,8 @@ pub fn invalidate_sources(db: &Connection, keys: &[String]) -> Result<()> {
         )?
         .query_map([encoded], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Knowledge built on a derived reply goes with the original source.
+    super::super::knowledge::invalidate_sources(db, &affected)?;
     let mut bots = BTreeSet::new();
     for key in &affected {
         let changed = db.execute(

@@ -805,3 +805,37 @@ async fn invalid_policy_data_rolls_back_all_epoch_and_default_changes() {
         Ok(())
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn group_public_recall_only_uses_a_members_facts_from_this_group() {
+    let (store, _memories) = database().await;
+    store
+        .call(|db| {
+            let other = "1:group:21:v0:group";
+            let private = "1:friend:8:v0:user:8";
+            db.execute("INSERT INTO ai_conversations(id,scope,mode,epoch) VALUES(?1,'1:group:21','group',1),(?2,'1:friend:8','user',1)", params![other, private])?;
+            let insert = |id: i64, conversation: &str, scope: &str, seq: i64, text: &str, origin: &str| -> Result<()> {
+                let key = format!("{scope}:{seq}");
+                db.execute("INSERT INTO messages(key,scope,conversation_id,epoch,sender_id,role,content,received_at,learnable) VALUES(?1,?2,?3,1,8,'user',?4,?5,1)", params![key, scope, conversation, text, now()])?;
+                let evidence = serde_json::to_string(&serde_json::json!([{"source_key":key,"quote":text}]))?;
+                db.execute("INSERT INTO ai_memories(id,conversation_id,subject_id,kind,text,evidence,created_at,updated_at,origin) VALUES(?1,?2,8,'preference',?3,?4,?5,?5,?6)", params![id, conversation, text, evidence, now(), origin])?;
+                db.execute("INSERT INTO ai_memory_provenance(memory_id,source_key,quote) VALUES(?1,?2,?3)", params![id, key, text])?;
+                db.execute("INSERT INTO ai_memory_search(memory_id,terms) VALUES(?1,?2)", params![id, memory::lexical_terms(text).join(" ")])?;
+                Ok(())
+            };
+            insert(10, CONVERSATION, SOURCE_SCOPE, 100, "喜欢吃火锅", "auto")?;
+            insert(11, other, "1:group:21", 100, "喜欢吃火锅底料", "auto")?;
+            insert(12, private, "1:friend:8", 100, "喜欢吃火锅丸子", "auto")?;
+            insert(13, CONVERSATION, SOURCE_SCOPE, 101, "喜欢吃火锅蘸料", "manual")?;
+            let audience = Scope { bot_id: 1, scene: Scene::Group, peer_id: 20 };
+            let found = group_public(db, &conversation(), &audience, &[8], "火锅")?;
+            let texts: Vec<&str> = found.iter().map(|k| k.text.as_str()).collect();
+            assert_eq!(texts.len(), 1, "{texts:?}");
+            assert!(texts[0].contains("群成员 8 在本群公开说过") && texts[0].ends_with("喜欢吃火锅"));
+            assert!(matches!(found[0].dependency, KnowledgeDependency::Memory(MemoryDependency { id: 10, .. })));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.stop().await.unwrap();
+}

@@ -82,7 +82,7 @@ function harness() {
       return { status: result.status || 200, ok: !result.status || result.status < 400, async text() { if (result.bodyError) throw result.bodyError; return result.raw ?? JSON.stringify(result.body); } };
     },
   });
-  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning, loadContextOverview, renderContextOverview, invalidateContextOverview, loadPersonal, renderPersonal, mutatePersonal, invalidatePersonal, filterConfig, openConfigSection };";
+  const exports = "globalThis.frontend = { state, groups, api, authView, bootstrap, loadConfig, refreshQq, refreshStatus, getQr, performMemory, mutateMemory, checkOperation, clearOperation, selectConversation, loadMemories, loadEvidence, loadContext, openMemoryEditor, saveMemory, readSettings, readForm, adoptJson, syncJson, secretChanges, clearSession, runAction, updateControls, requestId, inputs, secretInputs, report, saveConfig, settingInputs, renderSettings, showView, loadContacts, toggleContact, renderContacts, invalidateContacts, renderStatus, personaChoices, fillPersonaSelect, refreshPersonaSelectors, renderPersonaLibrary, renderPersonaPreview, createPersona, deletePersona, applyGroupPersona, fetchModels, renderModels, invalidateModels, testEmbedding, invalidateEmbeddingTest, testSearch, invalidateSearchTest, openScopePlugins, loadScopePlugins, toggleScopePlugin, refreshExternalPlugins, loadStickerGroups, loadStickerItems, selectStickerGroup, changeStickerGroupPage, refreshStickers, openStickerPreview, mutateSticker, retryStickerOperation, invalidateStickers, loadBudget, loadLearning, renderLearning, openLearningEditor, cancelLearningEdit, saveLearning, mutateLearning, invalidateLearning, loadContextOverview, renderContextOverview, invalidateContextOverview, loadPersonal, renderPersonal, mutatePersonal, invalidatePersonal, loadKnowledge, renderKnowledge, mutateKnowledge, invalidateKnowledge, filterConfig, openConfigSection };";
   vm.runInContext(script.replace("  void bootstrap();\n})();", "  " + exports + "\n})();"), context);
   const app = context.frontend;
   assert.ok(app, "test injection found application bootstrap");
@@ -94,7 +94,7 @@ function harness() {
       obj[keys.at(-1)] = def.type === "check" ? true : def.type === "number" ? def.min ?? 1 : def.type === "nullableNumber" ? null : ["lines", "ids", "tools"].includes(def.type) ? [] : def.type === "select" ? def.choices[0][0] : def.type === "json" ? { "默认": "帮助群成员" } : "value";
     }
     result.plugins.ai.defaults = { ...result.plugins.ai.defaults, persona: "默认", paused: false, once: false, recent_messages: 24, input_budget: 6000, output_budget: 800 };
-    result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120 };
+    result.plugins.ai.auto_reply = { prompt: "服务端补齐的接话策略", cooldown_seconds: 30, debounce_ms: 1500, max_wait_ms: 5000, max_messages: 8, max_age_seconds: 120, outcome_hints: true, adaptive_cooldown: false, max_cooldown_seconds: 300 };
     result.plugins.ai.learning = { enabled: false, semantic_recall: true, recall_limit: 8, prompt: "服务端学习规则", min_interval_seconds: 900, max_batch_messages: 40, max_changes_per_run: 6, max_note_chars: 2000, injection_budget: 12000 };
     Object.assign(result.limits, { learning_requests_per_hour: 4, learning_requests_per_day: 24, learning_max_input_budget: 8000, learning_max_output_tokens: 1200 });
     result.plugins.ai.context = { enabled: true, include_unanswered: true, cross_scene: "private_followup", recent_seconds: 7200, max_turns: 3, neighbors_before: 10, neighbors_after: 5, neighbor_seconds: 120, recall_budget: 3000, neighbor_budget: 1500 };
@@ -112,14 +112,15 @@ function harness() {
 test("automatic reply has a separate configuration group and uses server-normalized legacy defaults", async () => {
   const h = harness(); await h.login();
   const group = h.app.groups.find((entry) => entry.title === "自动接话");
-  assert.ok(group); assert.equal(group.fields.length, 6);
+  assert.ok(group); assert.equal(group.fields.length, 9);
   assert.match(group.description, /群与好友.*单独开启/u);
   assert.match(group.description, /默认关闭.*保存并应用/u);
   assert.match(group.description, /@.*关键词.*引用.*优先/u);
   const policy = h.sample.plugins.ai.auto_reply;
   for (const def of group.fields) {
     const control = h.app.inputs.get(def.path).control;
-    assert.equal(control.value, String(policy[def.path.split(".").at(-1)]));
+    if (def.type === "check") assert.equal(control.checked, policy[def.path.split(".").at(-1)]);
+    else assert.equal(control.value, String(policy[def.path.split(".").at(-1)]));
     if (def.type === "number") {
       assert.equal(control.type, "number"); assert.equal(control.step, "1");
       assert.equal(control.min, String(def.min)); assert.equal(control.max, String(def.max));
@@ -154,7 +155,7 @@ test("automatic reply settings save typed integers and apply without changing pe
     return { body: { phase: "running", applied_revision: "r2", loaded_plugins: [] } };
   });
   await h.app.saveConfig(true);
-  assert.deepEqual(saved.config.plugins.ai.auto_reply, { prompt: values.prompt.trim(), cooldown_seconds: 0, debounce_ms: 250, max_wait_ms: 1500, max_messages: 4, max_age_seconds: 5 });
+  assert.deepEqual(saved.config.plugins.ai.auto_reply, { prompt: values.prompt.trim(), cooldown_seconds: 0, debounce_ms: 250, max_wait_ms: 1500, max_messages: 4, max_age_seconds: 5, outcome_hints: true, adaptive_cooldown: false, max_cooldown_seconds: 300 });
   assert.equal(saved.revision, "r1");
   assert.equal(h.calls.filter((call) => call.path === "/api/runtime/apply").length, 1);
   assert.equal(h.calls.some((call) => call.path.startsWith("/api/qq/contacts")), false);
@@ -2549,4 +2550,39 @@ test("personal reset conflicts keep the server revision and show a readback inst
   h.setHandler(async (path) => path.includes("mutate") ? { status: 409, body: { error: "版本变化", code: "personal_conflict" } } : { body: personalSnapshot() });
   await h.app.loadPersonal("7"); await h.app.mutatePersonal({ op: "reset" });
   assert.equal(h.app.state.personal.snapshot.profile.revision, 3); assert.match(h.app.state.personal.message, /刷新核对/u); assert.equal(h.app.state.personal.saving, false);
+});
+
+function knowledgeSnapshot() {
+  return { bot_id: "1", enabled: true, page: 1, total_pages: 1, counts: [{ kind: "joke", status: "pending", count: 1 }],
+    outcomes: { periods: [{ period: "24h", rows: [{ automatic: true, replies: 4, engaged: 1, corrected: 2, positive: 0, quoted: 1, avg_first_response_secs: 12 }] }] },
+    items: [{ item: { id: 5, bot_id: 1, kind: "joke", subject: "scope", subject_id: 0, scope: "1:group:50", character_id: "", domain: "", text: "<img src=x onerror=alert(1)>泡泡梗", origin: "auto", confidence: 0.8, importance: 3, status: "pending", locked: false, version: 2, created_at: 1, updated_at: 1, expires_at: null },
+      sources: [{ source_key: "1:group:50:3", role: "evidence", quote: "泡泡梗笑死", source_hash: "", memory_version: null }], stats: null, usable: false }] };
+}
+test("knowledge review renders literal items with outcomes and approves the exact version", async () => {
+  const h = harness(); await h.login(); h.app.state.view = "knowledge";
+  h.setHandler(async (path) => ({ body: path.startsWith("/api/knowledge?") ? knowledgeSnapshot() : { status: "applied", id: 5, version: 3 } }));
+  await h.app.loadKnowledge();
+  assert.match(h.ids.get("knowledge-items").textContent, /<img src=x onerror=alert\(1\)>泡泡梗/u);
+  assert.equal(h.document.querySelectorAll("#knowledge-items img").length, 0);
+  assert.match(h.ids.get("knowledge-items").textContent, /本群的梗 · 待审核/u);
+  assert.match(h.ids.get("knowledge-outcomes").textContent, /主动接话 4 次，有人回应 25%，被否定 2 次/u);
+  await h.app.mutateKnowledge(h.app.state.knowledge.snapshot.items[0].item, { op: "approve" });
+  const request = h.calls.find((c) => c.path === "/api/knowledge/mutate");
+  assert.equal(request.body.bot_id, "1"); assert.equal(request.body.id, 5); assert.equal(request.body.version, 2);
+  assert.deepEqual(request.body.action, { op: "approve" }); assert.ok(request.body.request_id);
+});
+test("knowledge review rejects malformed items and replaced accounts", async () => {
+  for (const change of [(v) => { v.items[0].item.kind = "secret"; }, (v) => { v.bot_id = "2"; }, (v) => { v.items[0].item.status = "deleted"; }]) {
+    const h = harness(); await h.login(); h.app.state.view = "knowledge"; h.app.state.status = { online: true, bot_id: 1 };
+    const value = knowledgeSnapshot(); change(value); h.setHandler(async () => ({ body: value })); await h.app.loadKnowledge();
+    assert.equal(h.app.state.knowledge.snapshot, null); assert.ok(h.app.state.knowledge.message);
+  }
+});
+test("knowledge settings validate switches and bounded numbers", async () => {
+  const h = harness(); await h.login();
+  const group = h.app.groups.find((entry) => entry.title === "相处学习与共同经历");
+  assert.ok(group); assert.equal(group.fields.length, 12);
+  const budget = h.app.inputs.get("plugins.ai.knowledge.injection_budget").control;
+  budget.value = "8001"; assert.throws(() => h.app.readForm(), /整数/u);
+  budget.value = "2000"; assert.equal(h.app.readForm().plugins.ai.knowledge.injection_budget, 2000);
 });

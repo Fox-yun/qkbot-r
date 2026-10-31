@@ -566,7 +566,10 @@ async fn automatic_reply_policy_roundtrips_through_admin_save_and_apply() {
         "debounce_ms": 250,
         "max_wait_ms": 1000,
         "max_messages": 3,
-        "max_age_seconds": 45
+        "max_age_seconds": 45,
+        "outcome_hints": true,
+        "adaptive_cooldown": true,
+        "max_cooldown_seconds": 120
     });
     snapshot["config"]["plugins"]["ai"]["auto_reply"] = policy.clone();
     let response = panel.save(&snapshot, json!({})).await;

@@ -671,12 +671,25 @@ fn semantic_candidates(
     Ok(best.into_iter().map(|(_, memory)| memory).collect())
 }
 
+#[cfg(test)]
 fn fuse(
     lexical: Vec<Memory>,
     semantic: Vec<Memory>,
     limit: usize,
     budget: usize,
     query: &str,
+) -> Vec<Memory> {
+    fuse_ranked(lexical, semantic, limit, budget, query, &HashMap::new())
+}
+
+/// Reciprocal-rank fusion plus the per-fact importance and use bonus.
+fn fuse_ranked(
+    lexical: Vec<Memory>,
+    semantic: Vec<Memory>,
+    limit: usize,
+    budget: usize,
+    query: &str,
+    boosts: &HashMap<i64, f64>,
 ) -> Vec<Memory> {
     let mut found: HashMap<i64, (f64, usize, Memory)> = HashMap::new();
     for (origin, list) in [lexical, semantic].into_iter().enumerate() {
@@ -689,6 +702,9 @@ fn fuse(
         }
     }
     let mut found: Vec<_> = found.into_values().collect();
+    for (score, _, memory) in &mut found {
+        *score += boosts.get(&memory.id).copied().unwrap_or(0.0);
+    }
     let location_query = memory::requests_personal_location(query);
     found.sort_by(|a, b| {
         let location = |m: &Memory| location_query && memory::is_personal_location(&m.text);
@@ -866,7 +882,11 @@ pub(crate) async fn retrieve_for_turn(
                 let lexical = lexical(db, &snapshot.request, &query, candidates, usize::MAX)?;
                 let semantic =
                     semantic_candidates(db, &snapshot, &namespace, &response.vector, candidates)?;
-                Ok(fuse(lexical, semantic, limit, budget, &query))
+                let ids: Vec<i64> = lexical.iter().chain(&semantic).map(|m| m.id).collect();
+                let boosts = super::knowledge::stats::memory_boosts(db, &ids)?;
+                Ok(fuse_ranked(
+                    lexical, semantic, limit, budget, &query, &boosts,
+                ))
             })
             .await;
         if let Ok(memories) = result {
@@ -1809,6 +1829,7 @@ mod tests {
             settings: &admitted.settings,
             once_query: permit,
             allow_continuity: false,
+            referenced: &[],
         };
         assert!(
             super::super::context::prepare(&host, context_request(None), &cancel)

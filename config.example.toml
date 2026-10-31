@@ -83,6 +83,9 @@ debounce_ms = 1500             # 100..10000；连续消息合并等待
 max_wait_ms = 5000             # 100..30000，且不小于 debounce_ms
 max_messages = 8              # 1..32；每批最多消息数
 max_age_seconds = 120         # 5..600；过期批次不发送，换算为毫秒后不小于 max_wait_ms
+outcome_hints = true          # 主动接话时附上本群近24小时的回应/被否定次数；只读本地统计
+adaptive_cooldown = false     # 多数主动接话无人回应或常被否定时把冷却延长2–3倍
+max_cooldown_seconds = 300    # 0..3600；低于 cooldown_seconds 时不延长
 
 [plugins.ai.learning]
 enabled = false               # 学习笔记独立开关；不改变已有长期记忆整理设置
@@ -106,6 +109,22 @@ min_interval_seconds = 180     # 摘要冷却；个人事实提炼不受此间�
 enabled = true
 character_id = "default"      # 稳定角色身份；修改人设文案不改变关系归属
 injection_budget = 2400       # 0–8000，计入普通输入预算；0 暂停关系注入
+
+[plugins.ai.knowledge]
+# 共同经历、机器人说过的话、人物印象、群内相处经验与回复效果统计，统一存储并带来源。
+# 只作为资料，不改变人设、权限或帮助质量；撤回或遗忘来源后相关内容一并删除。
+enabled = true
+injection_budget = 2000       # 0..8000，计入普通输入预算，实际不超过普通输入的1/4
+outcome_window_seconds = 300  # 60..1800；回复后统计引用、@和提问者后续发言的时间窗口
+episodes = true               # 共同经历：搭在原有记忆整理上，须有机器人回复与本人原文为证；memory_input_budget ≥ 9400 时才提议
+self_memory = true            # 机器人说过的观点：只以已确认发送的原话为证，当前人设优先
+importance_ranking = true     # 记忆按重要度、使用和再次提及加分排序，不改写记忆
+group_public_recall = false   # 群共享会话中被@或引用的成员，召回其在本群公开说过的事实
+impressions = false           # 人物印象：占用后台记忆整理额度
+impression_interval_hours = 24 # 1..720
+behavior = false              # 群内相处经验：从真人对回复的反应学习，占用学习笔记额度
+behavior_require_review = false # 开启后新经验需在管理页「相处与经历」启用
+behavior_interval_seconds = 1800 # 60..86400
 
 [plugins.ai.context]
 enabled = true                # 同机器人、同 QQ 的近期问答与话题接续

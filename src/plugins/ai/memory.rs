@@ -179,6 +179,9 @@ pub struct MemoryBatch {
     pub sources: Vec<MessageSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personal: Option<super::personal::BatchPolicy>,
+    /// Shared episodes and the bot's own statements; needs confirmed replies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<super::knowledge::extract::BatchPolicy>,
     #[serde(serialize_with = "serialize_allowed_memories")]
     pub allowed_memories: Vec<Memory>,
     pub memory_write: bool,
@@ -345,6 +348,7 @@ impl MemoryStore {
         super::learning::init(&self.store).await?;
         super::context::init(&self.store).await?;
         super::personal::init(&self.store).await?;
+        super::knowledge::init(&self.store).await?;
         let enabled = self.global_memory_shared;
         self.store
             .call(move |db| {
@@ -530,6 +534,17 @@ impl MemoryStore {
                 if max_input_tokens < MEMORY_PROMPT_RESERVE + RELATIONSHIP_PROMPT_RESERVE + 512 {
                     batch.personal = None;
                 }
+                // Episodes and statements are optional and come last. Offer them
+                // only when message space stays what it was without them.
+                if max_input_tokens
+                    < MEMORY_PROMPT_RESERVE
+                        + RELATIONSHIP_PROMPT_RESERVE
+                        + TOPIC_PROMPT_RESERVE
+                        + super::knowledge::extract::PROMPT_RESERVE
+                        + super::knowledge::extract::MIN_SOURCE_SPACE
+                {
+                    batch.knowledge = None;
+                }
                 let reserve = MEMORY_PROMPT_RESERVE
                     + if batch.structured_summary {
                         TOPIC_PROMPT_RESERVE
@@ -538,6 +553,11 @@ impl MemoryStore {
                     }
                     + if batch.personal.is_some() {
                         RELATIONSHIP_PROMPT_RESERVE
+                    } else {
+                        0
+                    }
+                    + if batch.knowledge.is_some() {
+                        super::knowledge::extract::PROMPT_RESERVE
                     } else {
                         0
                     };
@@ -650,7 +670,7 @@ fn is_revoked(db: &Connection, key: &str) -> Result<bool> {
     )?)
 }
 
-fn source_by_key(
+pub(crate) fn source_by_key(
     db: &Connection,
     guard: &ContextGuard,
     key: &str,
@@ -846,6 +866,8 @@ pub(crate) fn retrieve(
             found.push(memory);
         }
     }
+    // Importance and use only reorder candidates that already matched.
+    let mut found = super::knowledge::stats::rerank(db, found, |m| m.id)?;
     let mut used = 0;
     let mut result = Vec::new();
     if location_query {
@@ -1209,6 +1231,7 @@ fn prepare_batch_modes(
         expected_summary: summary,
         summary_start,
         personal: super::personal::batch_policy(db, &sources, memory_write)?,
+        knowledge: super::knowledge::extract::batch_policy(db, &sources, memory_write)?,
         sources,
         allowed_memories,
         memory_write: memory_write && through_position > memory_previous,
@@ -1277,6 +1300,7 @@ fn fit_batch(mut batch: MemoryBatch, max_bytes: usize) -> Result<MemoryBatch> {
                 batch.personal = None;
             }
         }
+        super::knowledge::extract::retain_sources(&mut batch);
         // Chat embeds this JSON as message content, which JSON-escapes it a second
         // time. Count that form so quotes/backslashes cannot defeat the input bound.
         let encoded = serde_json::to_string(&batch)?;

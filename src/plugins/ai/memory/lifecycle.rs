@@ -23,12 +23,56 @@ pub struct LearningUpdate {
     changes: Vec<Box<serde_json::value::RawValue>>,
     #[serde(default)]
     relationship_changes: Vec<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    knowledge_changes: Vec<Box<serde_json::value::RawValue>>,
+}
+
+/// A fact change with the optional importance hint. Kept as its own strict
+/// struct so duplicate or unknown fields are still rejected.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RankedChange {
+    op: RankedOp,
+    id: Option<i64>,
+    subject_id: i64,
+    kind: MemoryKind,
+    text: String,
+    evidence: Vec<Evidence>,
+    ttl_days: Option<u16>,
+    #[serde(default)]
+    importance: Option<u8>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RankedOp {
+    Upsert,
+}
+
+fn parse_change(raw: &str) -> (serde_json::Result<MemoryChange>, Option<u8>) {
+    match serde_json::from_str::<RankedChange>(raw) {
+        Ok(change) => {
+            let RankedOp::Upsert = change.op;
+            (
+                Ok(MemoryChange::Upsert {
+                    id: change.id,
+                    subject_id: change.subject_id,
+                    kind: change.kind,
+                    text: change.text,
+                    evidence: change.evidence,
+                    ttl_days: change.ttl_days,
+                }),
+                change.importance.filter(|i| (1..=5).contains(i)),
+            )
+        }
+        Err(error) => (Err(error), None),
+    }
 }
 
 impl From<BatchUpdate> for LearningUpdate {
     fn from(update: BatchUpdate) -> Self {
         Self {
             relationship_changes: vec![],
+            knowledge_changes: vec![],
             summary: update.summary,
             changes: update
                 .changes
@@ -42,7 +86,8 @@ impl From<BatchUpdate> for LearningUpdate {
 pub(crate) fn parse(content: &str) -> Result<LearningUpdate> {
     let update: LearningUpdate = parse_response(content)?;
     ensure!(
-        update.changes.len() + update.relationship_changes.len() <= MAX_CHANGES,
+        update.changes.len() + update.relationship_changes.len() <= MAX_CHANGES
+            && update.knowledge_changes.len() <= super::super::knowledge::extract::MAX_CHANGES,
         "too many memory changes"
     );
     Ok(update)
@@ -89,7 +134,8 @@ pub(super) fn commit(
     maximum: usize,
 ) -> Result<()> {
     ensure!(
-        update.changes.len() + update.relationship_changes.len() <= MAX_CHANGES,
+        update.changes.len() + update.relationship_changes.len() <= MAX_CHANGES
+            && update.knowledge_changes.len() <= super::super::knowledge::extract::MAX_CHANGES,
         "too many memory changes"
     );
     ensure!(
@@ -113,16 +159,16 @@ pub(super) fn commit(
         .map(memory_commit_failure_reason)
         .unwrap_or("");
     let summary_ok = batch.summary_enabled && summary_error.is_none();
-    let parsed: Vec<_> = update
+    let (parsed, importance): (Vec<_>, Vec<_>) = update
         .changes
         .iter()
-        .map(|raw| serde_json::from_str::<MemoryChange>(raw.get()))
-        .collect();
+        .map(|raw| parse_change(raw.get()))
+        .unzip();
     let mut inserted = 0;
     let mut updated = 0;
     let mut rejected = 0;
     let mut duplicates = 0;
-    for (raw, candidate) in update.changes.iter().zip(&parsed) {
+    for ((raw, candidate), importance) in update.changes.iter().zip(&parsed).zip(&importance) {
         // Canonical valid values make whitespace changes idempotent. Invalid
         // values are hashed without storing or logging their contents.
         let canonical = candidate
@@ -193,8 +239,13 @@ pub(super) fn commit(
                 )?;
                 if id.is_some() {
                     updated += 1;
+                    // Statistics live outside ai_memories and never bump its revision.
+                    super::super::knowledge::stats::reinforce_memory(&tx, saved)?;
                 } else {
                     inserted += 1;
+                }
+                if let Some(importance) = importance {
+                    super::super::knowledge::stats::set_memory_importance(&tx, saved, *importance)?;
                 }
                 ("applied", "", Some(saved))
             }
@@ -216,6 +267,29 @@ pub(super) fn commit(
         if reason.is_some() {
             rejected += 1;
         }
+        tx.execute("INSERT INTO ai_memory_candidate_results(conversation_id,epoch,fingerprint,through_position,status,reason,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(conversation_id,epoch,fingerprint) DO UPDATE SET through_position=excluded.through_position,status=excluded.status,reason=excluded.reason,updated_at=excluded.updated_at",
+            params![batch.guard.conversation_id,batch.guard.epoch,fingerprint,batch.through_position,if reason.is_some(){"rejected"}else{"applied"},reason.unwrap_or(""),now()])?;
+    }
+    for raw in &update.knowledge_changes {
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!("knowledge:{}", raw.get()).as_bytes())
+        );
+        let previous: Option<String> = tx.query_row("SELECT status FROM ai_memory_candidate_results WHERE conversation_id=?1 AND epoch=?2 AND fingerprint=?3",
+            params![batch.guard.conversation_id,batch.guard.epoch,fingerprint], |r| r.get(0)).optional()?;
+        if previous.as_deref() == Some("applied") {
+            duplicates += 1;
+            continue;
+        }
+        let reason =
+            match serde_json::from_str::<super::super::knowledge::extract::Candidate>(raw.get()) {
+                Ok(candidate) => {
+                    super::super::knowledge::extract::apply_candidate(&tx, batch, &candidate)?
+                }
+                Err(_) => Some("knowledge_schema"),
+            };
+        // Optional kinds never hold back the fact cursor: a rejected episode
+        // is recorded for diagnosis only.
         tx.execute("INSERT INTO ai_memory_candidate_results(conversation_id,epoch,fingerprint,through_position,status,reason,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(conversation_id,epoch,fingerprint) DO UPDATE SET through_position=excluded.through_position,status=excluded.status,reason=excluded.reason,updated_at=excluded.updated_at",
             params![batch.guard.conversation_id,batch.guard.epoch,fingerprint,batch.through_position,if reason.is_some(){"rejected"}else{"applied"},reason.unwrap_or(""),now()])?;
     }
@@ -276,4 +350,31 @@ pub fn overview(db: &Connection, bot: i64) -> Result<Value> {
         row["reasons"] = json!(reasons);
     }
     Ok(json!(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn importance_is_optional_and_the_fact_schema_stays_strict() {
+        let base = r#""op":"upsert","id":null,"subject_id":7,"kind":"fact","text":"x","evidence":[],"ttl_days":null"#;
+        let (change, importance) = parse_change(&format!("{{{base},\"importance\":4}}"));
+        assert!(change.is_ok());
+        assert_eq!(importance, Some(4));
+        let (change, importance) = parse_change(&format!("{{{base}}}"));
+        assert!(change.is_ok() && importance.is_none());
+        // Out-of-range hints are ignored rather than stored.
+        assert_eq!(
+            parse_change(&format!("{{{base},\"importance\":9}}")).1,
+            None
+        );
+        assert!(parse_change(&format!("{{{base},\"extra\":1}}")).0.is_err());
+        assert!(
+            parse_change(&format!("{{{base},\"text\":\"y\"}}"))
+                .0
+                .is_err()
+        );
+        assert!(parse_change(r#"{"op":"delete","subject_id":7}"#).0.is_err());
+    }
 }

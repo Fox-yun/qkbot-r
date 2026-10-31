@@ -3,6 +3,7 @@ pub mod auth;
 pub mod contacts;
 pub mod context;
 pub mod embedding;
+pub mod knowledge;
 pub mod learning;
 pub mod memory;
 pub mod models;
@@ -108,6 +109,8 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/api/context/overview", get(context::overview))
         .route("/api/personal", get(personal::snapshot))
         .route("/api/personal/mutate", post(personal::mutate))
+        .route("/api/knowledge", get(knowledge::snapshot))
+        .route("/api/knowledge/mutate", post(knowledge::mutate))
         .route("/api/learning", get(learning::snapshot))
         .route("/api/learning/mutate", post(learning::mutate))
         .route("/api/learning/operations/{id}", get(learning::operation))

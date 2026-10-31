@@ -1,0 +1,76 @@
+[
+  {
+    "name": "private_fact_stays_private",
+    "description": "私聊里说的事实，本人在群里提问也不能带出；回到私聊可以用。",
+    "memories": [{"subject": 789, "scene": "friend", "peer": 789, "kind": "fact", "text": "人物背景：住在杭州"}],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 789, "text": "小鱼我住哪来着", "forbid": ["住在杭州"]},
+      {"scene": "friend", "peer": 789, "sender": 789, "text": "我住哪来着", "expect": ["住在杭州"]}
+    ]
+  },
+  {
+    "name": "other_person_isolation",
+    "description": "一个人的记忆不会被另一个人的提问取到。",
+    "memories": [{"subject": 789, "scene": "group", "peer": 456, "kind": "fact", "text": "人物背景：在读研究生"}],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 790, "text": "小鱼我是做什么的", "forbid": ["在读研究生"]},
+      {"scene": "group", "peer": 456, "sender": 789, "text": "小鱼我是做什么的", "expect": ["在读研究生"]}
+    ]
+  },
+  {
+    "name": "group_public_recall_is_off_by_default",
+    "description": "默认不读取被提到的成员的资料。",
+    "memories": [{"subject": 789, "scene": "group", "peer": 456, "kind": "preference", "text": "喜欢吃火锅"}],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 790, "mentions": [789], "text": "小鱼他喜欢吃什么", "forbid": ["喜欢吃火锅"]}
+    ]
+  },
+  {
+    "name": "group_public_recall_uses_only_this_group",
+    "description": "开启后，被@的成员只召回其在本群公开说过的事实，不带出私聊或其他群。",
+    "config": {"group_public_recall": true},
+    "memories": [
+      {"subject": 789, "scene": "group", "peer": 456, "kind": "preference", "text": "喜欢吃火锅"},
+      {"subject": 789, "scene": "friend", "peer": 789, "kind": "preference", "text": "喜欢吃寿司"},
+      {"subject": 789, "scene": "group", "peer": 457, "kind": "preference", "text": "喜欢吃烧烤"}
+    ],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 790, "mentions": [789], "text": "小鱼他喜欢吃什么", "expect": ["群成员 789 在本群公开说过", "喜欢吃火锅"], "forbid": ["喜欢吃寿司", "喜欢吃烧烤"]}
+    ]
+  },
+  {
+    "name": "interaction_note_stays_in_its_group",
+    "description": "群内相处经验只用于学到它的群。",
+    "knowledge": [{"kind": "norm", "subject": "scope", "subject_id": 0, "scene": "group", "peer": 456, "text": "本群喜欢简短直接的回复"}],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 790, "text": "小鱼在吗", "expect": ["本群习惯", "简短直接"]},
+      {"scene": "group", "peer": 457, "sender": 790, "text": "小鱼在吗", "forbid": ["简短直接"]}
+    ]
+  },
+  {
+    "name": "episode_belongs_to_its_person",
+    "description": "共同经历只给当事人。",
+    "knowledge": [{"kind": "episode", "subject": "user", "subject_id": 789, "scene": "friend", "peer": 789, "text": "机器人答应用户考完科目二后请喝虚拟奶茶"}],
+    "turns": [
+      {"scene": "friend", "peer": 789, "sender": 789, "text": "我考完了", "expect": ["共同经历", "虚拟奶茶"]},
+      {"scene": "friend", "peer": 790, "sender": 790, "text": "我考完了", "forbid": ["虚拟奶茶"]}
+    ]
+  },
+  {
+    "name": "own_statement_for_consistency",
+    "description": "机器人说过的话用于前后一致，但不越出原群。",
+    "knowledge": [{"kind": "self", "subject": "bot", "subject_id": 123, "scene": "group", "peer": 456, "text": "机器人说过自己最喜欢下雨天"}],
+    "turns": [
+      {"scene": "group", "peer": 456, "sender": 790, "text": "小鱼你喜欢什么天气", "expect": ["你说过的话", "下雨天"]},
+      {"scene": "group", "peer": 457, "sender": 790, "text": "小鱼你喜欢什么天气", "forbid": ["下雨天"]}
+    ]
+  },
+  {
+    "name": "revoked_source_never_returns",
+    "description": "来源被撤回后，依据它的共同经历不再出现。",
+    "knowledge": [{"kind": "episode", "subject": "user", "subject_id": 789, "scene": "friend", "peer": 789, "text": "一起约好周六去看流星雨", "revoked": true}],
+    "turns": [
+      {"scene": "friend", "peer": 789, "sender": 789, "text": "周六的约定还记得吗", "forbid": ["流星雨"]}
+    ]
+  }
+]
