@@ -506,3 +506,134 @@ async fn interaction_days_are_capped_and_never_modify_fact_revisions() {
         .unwrap();
     host.store.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn familiarity_counts_retained_days_and_reports_recency() {
+    let host = setup().await;
+    host.store
+        .call(|db| {
+            let day = 86400;
+            let start = now();
+            for k in 0..12i64 {
+                let id = k + 1;
+                seed(db, Scene::Friend, 7, 7, id, "聊聊天", true)?;
+                let key = format!("1:friend:7:{id}");
+                let reply = format!("1:friend:7:{}", id + 100);
+                db.execute(
+                    "UPDATE messages SET received_at=?2 WHERE key=?1",
+                    params![key, start - (k + 2) * day],
+                )?;
+                db.execute("INSERT INTO ai_recent_turns(bot_id,actor_id,request_position,request_key,reply_key,completed_at,completed_position,dependencies) VALUES(1,7,?1,?2,?3,1,?4,'{}')",params![id,key,reply,id+1])?;
+                personal::record_interaction(db, &key, &reply)?;
+            }
+            let private = scope(Scene::Friend, 7);
+            let c = PersonalConfig::default();
+            // Twelve distinct days exceed the former seven-day ceiling.
+            let all = personal::recall(db, &private, 7, &c, CrossScenePolicy::PrivateFollowup, None)?
+                .unwrap();
+            assert!(all.text.contains("已经比较熟悉"), "{}", all.text);
+            assert!(all.text.contains("\"interaction_days\":12"));
+            assert!(all.text.contains("\"last_interaction\":\"约2天前\""));
+            assert!(all.text.contains("\"earliest_traceable_days_ago\":13"));
+            assert!(all.text.contains("久未交流不代表疏远"));
+            all.dependency.validate(db)?;
+            // Relative times use the request time, not when recall happens.
+            let earlier = personal::recall(
+                db,
+                &private,
+                7,
+                &c,
+                CrossScenePolicy::PrivateFollowup,
+                Some((i64::MAX, start - 5 * day)),
+            )?
+            .unwrap();
+            assert!(earlier.text.contains("已在多个日期持续交流"));
+            assert!(earlier.text.contains("\"interaction_days\":9"));
+            assert!(earlier.text.contains("\"last_interaction\":\"一天内\""));
+            assert!(earlier.text.contains("\"earliest_traceable_days_ago\":8"));
+            // Absence is described, never scored: an old ledger stays familiar.
+            let later = personal::recall(
+                db,
+                &private,
+                7,
+                &c,
+                CrossScenePolicy::PrivateFollowup,
+                Some((i64::MAX, start + 40 * day)),
+            )?
+            .unwrap();
+            assert!(later.text.contains("已经比较熟悉"));
+            assert!(later.text.contains("很久没有直接交流"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    host.store.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn several_recent_styles_are_recalled_with_only_the_newest_address() {
+    let host = setup().await;
+    const TEXTS: [&str; 7] = [
+        "偏好A：回复短一点",
+        "偏好B：少用感叹号",
+        "偏好C：多举例子",
+        "偏好D：别太正式",
+        "偏好E：可以开玩笑",
+        "请叫我阿云",
+        "以后请叫我小云",
+    ];
+    let guard = host
+        .store
+        .call(|db| {
+            let mut guard = None;
+            for (i, text) in TEXTS.iter().enumerate() {
+                guard = Some(seed(db, Scene::Friend, 7, 7, i as i64 + 1, text, true)?);
+            }
+            Ok(guard.unwrap())
+        })
+        .await
+        .unwrap();
+    let b = host.memory.prepare_batch(&guard, 7, true).await.unwrap();
+    let mut relations: Vec<Value> = ["A", "B", "C", "D", "E"]
+        .iter()
+        .enumerate()
+        .map(|(i, tag)| {
+            candidate(
+                &format!("1:friend:7:{}", i + 1),
+                "style",
+                &format!("风格{tag}"),
+                TEXTS[i],
+            )
+        })
+        .collect();
+    relations.push(candidate("1:friend:7:6", "address", "阿云", TEXTS[5]));
+    relations.push(candidate("1:friend:7:7", "address", "小云", TEXTS[6]));
+    commit(&host, b, relations).await;
+    host.store
+        .call(|db| {
+            let c = PersonalConfig {
+                injection_budget: 8000,
+                ..PersonalConfig::default()
+            };
+            let value = personal::recall(
+                db,
+                &scope(Scene::Friend, 7),
+                7,
+                &c,
+                CrossScenePolicy::PrivateFollowup,
+                None,
+            )?
+            .unwrap();
+            for tag in ["B", "C", "D", "E"] {
+                assert!(value.text.contains(&format!("风格{tag}")), "{}", value.text);
+            }
+            assert!(!value.text.contains("风格A"));
+            assert!(value.text.contains("小云") && !value.text.contains("阿云"));
+            assert!(value.text.contains("\"days_ago\":0"));
+            value.dependency.validate(db)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    host.store.stop().await.unwrap();
+}
